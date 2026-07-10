@@ -665,8 +665,16 @@ fn validateInboundFrame(fh: ParsedHeader, payload: []const u8) ?ErrorCode {
             if (fh.sid != 0) return .protocol_error;
             if (payload.len != 8) return .frame_size_error;
         },
-        .headers, .data, .priority, .rst_stream, .continuation => {
+        .headers, .data, .continuation => {
             if (fh.sid == 0) return .protocol_error;
+        },
+        .rst_stream => {
+            if (fh.sid == 0) return .protocol_error;
+            if (payload.len != 4) return .frame_size_error; // RFC 7540 §6.4
+        },
+        .priority => {
+            if (fh.sid == 0) return .protocol_error;
+            if (payload.len != 5) return .frame_size_error; // RFC 7540 §6.3
         },
         .goaway => {
             if (fh.sid != 0) return .protocol_error;
@@ -1204,7 +1212,9 @@ fn buildRequest(arena: std.mem.Allocator, decoded: []const hpack.Header) !types.
         if (isConnectionSpecificHeader(h.name)) return error.BadRequest;
         if (std.ascii.eqlIgnoreCase(h.name, "te") and !std.mem.eql(u8, h.value, "trailers")) return error.BadRequest;
         if (std.ascii.eqlIgnoreCase(h.name, "content-length")) {
-            content_length = std.fmt.parseInt(u64, h.value, 10) catch null;
+            // A content-length that isn't a valid integer makes the request
+            // malformed (RFC 7540 §8.1.2.6) — reject rather than silently drop.
+            content_length = std.fmt.parseInt(u64, h.value, 10) catch return error.BadRequest;
         }
         if (std.ascii.eqlIgnoreCase(h.name, "host")) {
             host = h.value;
@@ -1481,12 +1491,46 @@ test "validateInboundFrame rejects short GOAWAY" {
     );
 }
 
+test "validateInboundFrame rejects RST_STREAM with the wrong length" {
+    try testing.expectEqual(
+        @as(?ErrorCode, .frame_size_error),
+        validateInboundFrame(.{ .length = 5, .ftype = .rst_stream, .flags = 0, .sid = 1 }, &[_]u8{ 0, 0, 0, 0, 0 }),
+    );
+    // A correct 4-byte RST_STREAM is accepted.
+    try testing.expectEqual(
+        @as(?ErrorCode, null),
+        validateInboundFrame(.{ .length = 4, .ftype = .rst_stream, .flags = 0, .sid = 1 }, &[_]u8{ 0, 0, 0, 0 }),
+    );
+}
+
+test "validateInboundFrame rejects PRIORITY with the wrong length" {
+    try testing.expectEqual(
+        @as(?ErrorCode, .frame_size_error),
+        validateInboundFrame(.{ .length = 4, .ftype = .priority, .flags = 0, .sid = 1 }, &[_]u8{ 0, 0, 0, 0 }),
+    );
+}
+
 test "validateInboundFrame accepts normal client SETTINGS" {
     const payload = [_]u8{ 0, 4, 0, 0, 0xff, 0xff };
     try testing.expectEqual(
         @as(?ErrorCode, null),
         validateInboundFrame(.{ .length = payload.len, .ftype = .settings, .flags = 0, .sid = 0 }, &payload),
     );
+}
+
+test "buildRequest rejects a malformed content-length" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const decoded = [_]hpack.Header{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = "/upload" },
+        .{ .name = "content-length", .value = "not-a-number" },
+    };
+
+    try testing.expectError(error.BadRequest, buildRequest(arena, &decoded));
 }
 
 test "buildRequest rejects pseudo header after regular header" {
