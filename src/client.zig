@@ -54,6 +54,14 @@ const Queued = union(enum) {
 /// so `deinit` (which sets `dead`) stops the reader within this window.
 const reader_wake_ms: u64 = 50;
 
+/// Max inbound frame size we accept, advertised as SETTINGS_MAX_FRAME_SIZE.
+/// Equals the RFC default/minimum; we never advertise larger, so a larger frame
+/// is a peer error we reject rather than allocate for.
+const max_recv_frame: u32 = p2.our_max_frame_size; // 16384
+/// Hard cap on one response's accumulated header block across HEADERS +
+/// CONTINUATION (CVE-2024-27316 class); matches the server's bound.
+const max_header_block: usize = 256 * 1024;
+
 pub const Stream = struct {
     client: *Client,
     id: u31,
@@ -232,11 +240,11 @@ pub const Client = struct {
             .dec = hpack.Decoder.init(gpa, p2.our_header_table_size),
         };
         try self.w.writeAll(p2.preface);
-        // Advertise SETTINGS_ENABLE_PUSH=0. We do not implement PUSH_PROMISE
-        // (and never decode its header block), so a push would desync the HPACK
-        // decoder for the whole connection — disable it up front.
-        var settings: [6]u8 = undefined;
-        p2.putSetting(&settings, p2.set_enable_push, 0);
+        // Advertise SETTINGS_ENABLE_PUSH=0 (we don't implement PUSH_PROMISE) and
+        // SETTINGS_MAX_FRAME_SIZE=16384 (the largest inbound frame we accept).
+        var settings: [12]u8 = undefined;
+        p2.putSetting(settings[0..6], p2.set_enable_push, 0);
+        p2.putSetting(settings[6..12], p2.set_max_frame_size, max_recv_frame);
         try self.writeFrame(.settings, 0, 0, &settings);
         self.reader_thread = std.Thread.spawn(.{}, readerLoop, .{self}) catch null;
     }
@@ -278,6 +286,15 @@ pub const Client = struct {
     fn writeData(self: *Client, sid: u31, data: []const u8, end_stream: bool) !void {
         const flags: u8 = if (end_stream) p2.flag_end_stream else 0;
         try self.writeFrame(.data, flags, sid, data);
+    }
+
+    /// Best-effort GOAWAY(last_stream_id=0, code). The client only observes
+    /// peer-initiated (even/push) streams — disabled — so the last id is 0.
+    fn sendGoaway(self: *Client, code: p2.ErrorCode) void {
+        var p: [8]u8 = undefined;
+        std.mem.writeInt(u32, p[0..4], 0, .big);
+        std.mem.writeInt(u32, p[4..8], @intFromEnum(code), .big);
+        self.writeFrame(.goaway, 0, 0, &p) catch {};
     }
 
     /// Opens a new stream, sending the request HEADERS. Returns a handle for
@@ -351,6 +368,11 @@ pub const Client = struct {
                 return;
             };
             const fh = p2.parseHeader(&hb);
+            if (fh.length > max_recv_frame) {
+                self.sendGoaway(.frame_size_error);
+                self.kill();
+                return;
+            }
             const payload = self.gpa.alloc(u8, fh.length) catch {
                 self.kill();
                 return;
@@ -542,6 +564,14 @@ pub const Client = struct {
             try self.r.readSliceAll(&hb);
             const cf = p2.parseHeader(&hb);
             if (cf.ftype != .continuation or cf.sid != sid) return error.ProtocolError;
+            if (cf.length > max_recv_frame) {
+                self.sendGoaway(.frame_size_error);
+                return error.FrameSizeError;
+            }
+            if (block.items.len + cf.length > max_header_block) {
+                self.sendGoaway(.enhance_your_calm);
+                return error.ProtocolError;
+            }
             const cp = try self.gpa.alloc(u8, cf.length);
             defer self.gpa.free(cp);
             if (cp.len > 0) try self.r.readSliceAll(cp);
@@ -662,6 +692,177 @@ const SilentServer = struct {
         }
     }
 };
+
+const CtFrame = struct {
+    hdr: p2.ParsedHeader,
+    payload: []u8,
+    fn deinit(self: *CtFrame, a: std.mem.Allocator) void {
+        a.free(self.payload);
+    }
+};
+fn ctRead(a: std.mem.Allocator, r: *Io.Reader) !CtFrame {
+    var hb: [9]u8 = undefined;
+    try r.readSliceAll(&hb);
+    const hdr = p2.parseHeader(&hb);
+    const payload = try a.alloc(u8, hdr.length);
+    errdefer a.free(payload);
+    if (payload.len > 0) try r.readSliceAll(payload);
+    return .{ .hdr = hdr, .payload = payload };
+}
+/// Reads frames until a GOAWAY, returns its error code (payload[4..8]).
+fn ctReadGoawayCode(a: std.mem.Allocator, r: *Io.Reader) !u32 {
+    while (true) {
+        var f = try ctRead(a, r);
+        defer f.deinit(a);
+        if (f.hdr.ftype == .goaway) return std.mem.readInt(u32, f.payload[0..][4..8], .big);
+    }
+}
+fn ctWrite(w: *Io.Writer, ftype: p2.FrameType, flags: u8, sid: u31, payload: []const u8) !void {
+    var hb: [9]u8 = undefined;
+    p2.putHeader(&hb, payload.len, ftype, flags, sid);
+    try w.writeAll(&hb);
+    if (payload.len > 0) try w.writeAll(payload);
+    try w.flush();
+}
+/// Writes only a 9-byte frame header declaring `length` (no payload) — used to
+/// trigger the client's size check before it allocates/reads the body.
+fn ctWriteHeaderOnly(w: *Io.Writer, ftype: p2.FrameType, sid: u31, length: usize) !void {
+    var hb: [9]u8 = undefined;
+    p2.putHeader(&hb, length, ftype, 0, sid);
+    try w.writeAll(&hb);
+    try w.flush();
+}
+// Common setup: loopback client + raw "server" side; consumes the client's
+// preface+SETTINGS and sends SETTINGS+ack. Returns nothing; caller uses the
+// captured streams. (Kept inline in each test for clarity — see below.)
+
+test "client rejects an oversized inbound frame with GOAWAY(FRAME_SIZE_ERROR)" {
+    const io = testing.io;
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var srv = try addr.listen(io, .{ .mode = .stream, .reuse_address = true });
+    defer srv.deinit(io);
+    const port = srv.socket.address.ip4.port;
+    const caddr = try net.IpAddress.parse("127.0.0.1", port);
+    const cstream = try caddr.connect(io, .{ .mode = .stream });
+    defer cstream.close(io);
+    var accepted = try srv.accept(io);
+    defer accepted.close(io);
+
+    var crbuf: [4096]u8 = undefined;
+    var cwbuf: [4096]u8 = undefined;
+    var csr = cstream.reader(io, &crbuf);
+    var csw = cstream.writer(io, &cwbuf);
+    var client: Client = undefined;
+    try client.init(io, testing.allocator, &csr.interface, &csw.interface);
+    defer client.deinit();
+
+    var arbuf: [4096]u8 = undefined;
+    var awbuf: [20000]u8 = undefined;
+    var asr = accepted.reader(io, &arbuf);
+    var asw = accepted.writer(io, &awbuf);
+    var pf: [p2.preface.len]u8 = undefined;
+    try asr.interface.readSliceAll(&pf);
+    var cs = try ctRead(testing.allocator, &asr.interface); // client SETTINGS
+    cs.deinit(testing.allocator);
+    try ctWrite(&asw.interface, .settings, 0, 0, "");
+    try ctWrite(&asw.interface, .settings, p2.flag_ack, 0, "");
+
+    const s = try client.openStream(.{ .path = "/x" }, false);
+    // A DATA frame declaring length 20000 (> 16384). Header only; the client
+    // must reject on the header, before allocating/reading the body.
+    try ctWriteHeaderOnly(&asw.interface, .data, 1, 20000);
+
+    const code = try ctReadGoawayCode(testing.allocator, &asr.interface);
+    try testing.expectEqual(@as(u32, @intFromEnum(p2.ErrorCode.frame_size_error)), code);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectError(error.ConnectionClosed, s.readEvent(arena.allocator()));
+}
+
+test "client rejects a CONTINUATION flood with GOAWAY(ENHANCE_YOUR_CALM)" {
+    const io = testing.io;
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var srv = try addr.listen(io, .{ .mode = .stream, .reuse_address = true });
+    defer srv.deinit(io);
+    const port = srv.socket.address.ip4.port;
+    const caddr = try net.IpAddress.parse("127.0.0.1", port);
+    const cstream = try caddr.connect(io, .{ .mode = .stream });
+    defer cstream.close(io);
+    var accepted = try srv.accept(io);
+    defer accepted.close(io);
+
+    var crbuf: [4096]u8 = undefined;
+    var cwbuf: [4096]u8 = undefined;
+    var csr = cstream.reader(io, &crbuf);
+    var csw = cstream.writer(io, &cwbuf);
+    var client: Client = undefined;
+    try client.init(io, testing.allocator, &csr.interface, &csw.interface);
+    defer client.deinit();
+
+    var arbuf: [4096]u8 = undefined;
+    var awbuf: [20000]u8 = undefined;
+    var asr = accepted.reader(io, &arbuf);
+    var asw = accepted.writer(io, &awbuf);
+    var pf: [p2.preface.len]u8 = undefined;
+    try asr.interface.readSliceAll(&pf);
+    var cs = try ctRead(testing.allocator, &asr.interface);
+    cs.deinit(testing.allocator);
+    try ctWrite(&asw.interface, .settings, 0, 0, "");
+    try ctWrite(&asw.interface, .settings, p2.flag_ack, 0, "");
+
+    // HEADERS (sid 1, END_HEADERS clear) + CONTINUATION frames of 16384 filler
+    // bytes each until the accumulated block crosses 256 KiB. 100 + 16*16384 =
+    // 262244 > 262144, so the 16th CONTINUATION trips the cap. Content is never
+    // decoded (we hit the cap first), so filler is fine.
+    var filler: [16384]u8 = @splat('x');
+    try ctWrite(&asw.interface, .headers, 0, 1, filler[0..100]);
+    var i: usize = 0;
+    while (i < 16) : (i += 1) try ctWrite(&asw.interface, .continuation, 0, 1, &filler);
+
+    const code = try ctReadGoawayCode(testing.allocator, &asr.interface);
+    try testing.expectEqual(@as(u32, @intFromEnum(p2.ErrorCode.enhance_your_calm)), code);
+}
+
+test "client rejects an oversized CONTINUATION with GOAWAY(FRAME_SIZE_ERROR)" {
+    const io = testing.io;
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var srv = try addr.listen(io, .{ .mode = .stream, .reuse_address = true });
+    defer srv.deinit(io);
+    const port = srv.socket.address.ip4.port;
+    const caddr = try net.IpAddress.parse("127.0.0.1", port);
+    const cstream = try caddr.connect(io, .{ .mode = .stream });
+    defer cstream.close(io);
+    var accepted = try srv.accept(io);
+    defer accepted.close(io);
+
+    var crbuf: [4096]u8 = undefined;
+    var cwbuf: [4096]u8 = undefined;
+    var csr = cstream.reader(io, &crbuf);
+    var csw = cstream.writer(io, &cwbuf);
+    var client: Client = undefined;
+    try client.init(io, testing.allocator, &csr.interface, &csw.interface);
+    defer client.deinit();
+
+    var arbuf: [4096]u8 = undefined;
+    var awbuf: [4096]u8 = undefined;
+    var asr = accepted.reader(io, &arbuf);
+    var asw = accepted.writer(io, &awbuf);
+    var pf: [p2.preface.len]u8 = undefined;
+    try asr.interface.readSliceAll(&pf);
+    var cs = try ctRead(testing.allocator, &asr.interface);
+    cs.deinit(testing.allocator);
+    try ctWrite(&asw.interface, .settings, 0, 0, "");
+    try ctWrite(&asw.interface, .settings, p2.flag_ack, 0, "");
+
+    var filler: [100]u8 = @splat('x');
+    try ctWrite(&asw.interface, .headers, 0, 1, &filler); // no END_HEADERS
+    // A CONTINUATION declaring length 20000 (> 16384). Header only.
+    try ctWriteHeaderOnly(&asw.interface, .continuation, 1, 20000);
+
+    const code = try ctReadGoawayCode(testing.allocator, &asr.interface);
+    try testing.expectEqual(@as(u32, @intFromEnum(p2.ErrorCode.frame_size_error)), code);
+}
 
 test "client advertises SETTINGS_ENABLE_PUSH=0 in its initial SETTINGS" {
     const io = testing.io;
