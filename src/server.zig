@@ -480,6 +480,9 @@ const Connection = struct {
     streams_mu: Io.Mutex = .init,
     streams: std.AutoHashMapUnmanaged(u31, *H2Stream) = .empty,
     last_stream_id: u31 = 0,
+    // Rapid-reset accounting (CVE-2023-44487), guarded by streams_mu.
+    streams_opened: u32 = 0,
+    streams_reset: u32 = 0,
 
     // Worker accounting (for graceful drain).
     workers_mu: Io.Mutex = .init,
@@ -640,7 +643,7 @@ fn readLoop(conn: *Connection, r: *Io.Reader) void {
             },
             .headers => handleHeaders(conn, r, fh, payload) catch return,
             .data => if (!handleData(conn, fh, payload)) return,
-            .rst_stream => resetStream(conn, fh.sid),
+            .rst_stream => if (!resetStream(conn, fh.sid)) return,
             .goaway => return, // peer is leaving; stop reading, drain workers
             .priority, .continuation => {}, // stray CONTINUATION ignored; PRIORITY no-op
             else => {},
@@ -695,7 +698,17 @@ fn handleSettings(conn: *Connection, fh: ParsedHeader, payload: []const u8) bool
                 }
                 new_iw = val;
             },
-            set_max_frame_size => conn.peer.max_frame_size = val,
+            set_max_frame_size => {
+                // RFC 7540 §6.5.2: a value outside [2^14, 2^24-1] MUST be a
+                // connection error of type PROTOCOL_ERROR. Left unchecked, a 0
+                // (or any tiny value) also drove sendBody/writeHeaders into a
+                // zero-length-frame busy loop.
+                if (val < our_max_frame_size or val > 16777215) {
+                    sendGoaway(conn, .protocol_error);
+                    return false;
+                }
+                conn.peer.max_frame_size = val;
+            },
             else => {}, // header_table_size/enable_push/max_concurrent_streams: irrelevant to us
         }
     }
@@ -763,6 +776,21 @@ fn handleWindowUpdate(conn: *Connection, fh: ParsedHeader, payload: []const u8) 
 /// Hard cap on one request's accumulated header block across HEADERS +
 /// CONTINUATION frames; past it the connection gets GOAWAY ENHANCE_YOUR_CALM.
 const max_header_block_bytes: usize = 256 * 1024;
+
+/// Cap on CONTINUATION frames per header block. Bytes are already bounded by
+/// max_header_block_bytes, but zero-length CONTINUATION frames make no byte
+/// progress, so a peer could stream them forever (CVE-2024-27316 class); this
+/// bounds the frame count independently. A legitimate block needs only a
+/// handful (256KiB / 16KiB max frame ⇒ ~16), so this is generous.
+const max_continuation_frames: usize = 256;
+
+/// Rapid-reset mitigation (CVE-2023-44487): a peer that streams HEADERS→
+/// RST_STREAM pairs keeps `streams.count()` near zero so the concurrency cap
+/// never fires, yet forces unbounded decode/dispatch/teardown work. Once a
+/// connection has reset more than this many streams AND resets exceed half the
+/// streams it opened, we GOAWAY ENHANCE_YOUR_CALM. The floor tolerates the
+/// occasional legitimate cancel; the ratio catches a flood.
+const rapid_reset_floor: u32 = 100;
 
 /// Returns false on a connection-fatal framing error (GOAWAY already sent).
 fn handleData(conn: *Connection, fh: ParsedHeader, payload: []const u8) bool {
@@ -863,7 +891,9 @@ fn handleData(conn: *Connection, fh: ParsedHeader, payload: []const u8) bool {
     return true;
 }
 
-fn resetStream(conn: *Connection, sid: u31) void {
+/// Handles a peer RST_STREAM. Returns false (after sending GOAWAY) when the
+/// connection has crossed the rapid-reset threshold and must be torn down.
+fn resetStream(conn: *Connection, sid: u31) bool {
     conn.streams_mu.lockUncancelable(conn.io);
     if (conn.streams.get(sid)) |st| {
         st.reset.store(true, .release);
@@ -872,8 +902,19 @@ fn resetStream(conn: *Connection, sid: u31) void {
         st.rx_cond.broadcast(conn.io);
         st.rx_mu.unlock(conn.io);
     }
+    // Count every peer reset, even one racing the stream's own teardown — a
+    // rapid-reset attacker's RST often lands after the worker already removed
+    // the stream, so gating on `streams.get` would miss the flood entirely.
+    conn.streams_reset +%= 1;
+    const flood = conn.streams_reset > rapid_reset_floor and
+        conn.streams_reset > conn.streams_opened / 2;
     conn.streams_mu.unlock(conn.io);
     conn.wakeSenders();
+    if (flood) {
+        sendGoaway(conn, .enhance_your_calm);
+        return false;
+    }
+    return true;
 }
 
 fn sendGoaway(conn: *Connection, code: ErrorCode) void {
@@ -910,11 +951,19 @@ fn handleHeaders(conn: *Connection, r: *Io.Reader, fh: ParsedHeader, first: []co
     // The accumulated block is hard-capped: an attacker streaming CONTINUATION
     // frames forever must not grow `block` without bound (CVE-2024-27316 class).
     if (fh.flags & flag_end_headers == 0) {
+        var cont_frames: usize = 0;
         while (true) {
             var hb: [9]u8 = undefined;
             try readSliceTimed(conn, r, &hb, conn.srv.config.head_timeout_ms);
             const cf = parseHeader(&hb);
             if (cf.ftype != .continuation or cf.sid != fh.sid or cf.length > effectiveMaxFrameSize(conn.srv.config)) return error.ProtocolError;
+            cont_frames += 1;
+            if (cont_frames > max_continuation_frames) {
+                // Zero-length CONTINUATION frames never grow `block`, so the byte
+                // cap below can't stop an endless stream of them; cap the count.
+                sendGoaway(conn, .enhance_your_calm);
+                return error.ProtocolError;
+            }
             if (block.items.len + cf.length > max_header_block_bytes) {
                 sendGoaway(conn, .enhance_your_calm);
                 return error.ProtocolError;
@@ -1006,6 +1055,7 @@ fn handleHeaders(conn: *Connection, r: *Io.Reader, fh: ParsedHeader, first: []co
         gpa.destroy(st);
         return;
     };
+    conn.streams_opened +%= 1;
     conn.streams_mu.unlock(conn.io);
 
     // Dispatch the worker as soon as headers decode. The request body (if any)
@@ -1902,6 +1952,50 @@ test "h2: CONTINUATION flood is capped with GOAWAY ENHANCE_YOUR_CALM (B-4)" {
     try testing.expectEqual(@intFromEnum(ErrorCode.enhance_your_calm), code);
 }
 
+test "h2: zero-length CONTINUATION flood is capped with GOAWAY ENHANCE_YOUR_CALM" {
+    const fds = try newSocketPair();
+    errdefer _ = c.close(fds[1]); // reap the client end if the spawn below fails
+
+    var srv: Server = .{
+        .io = testing.io,
+        .gpa = testing.allocator,
+        .handler = h2TestHandler,
+        // Short head timeout so, before the fix, the reader blocking on the next
+        // (never-arriving) frame surfaces fast instead of after the 30s default.
+        .config = .{ .head_timeout_ms = 1_000 },
+    };
+    const t = try std.Thread.spawn(.{}, serveRawH2OnFd, .{ &srv, fds[0] });
+    defer t.join();
+    defer _ = c.close(fds[1]);
+
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [8192]u8 = undefined;
+    var reader = peerStream(fds[1]).reader(testing.io, &rbuf);
+    var writer = peerStream(fds[1]).writer(testing.io, &wbuf);
+
+    try writer.interface.writeAll(preface);
+    try writer.interface.flush();
+    try writeFrame(&writer.interface, .settings, 0, 0, "");
+
+    // HEADERS without END_HEADERS, then a stream of *empty* CONTINUATION frames.
+    // Each adds zero bytes, so max_header_block_bytes never trips; only a
+    // frame-count cap stops them (CVE-2024-27316 class). Send well over the cap.
+    const req_block = [_]u8{
+        0x82, 0x86, 0x84, 0x41, 0x0f, 0x77, 0x77, 0x77, 0x2e, 0x65,
+        0x78, 0x61, 0x6d, 0x70, 0x6c, 0x65, 0x2e, 0x63, 0x6f, 0x6d,
+    };
+    try writeFrame(&writer.interface, .headers, 0, 1, &req_block);
+    var sent: usize = 0;
+    while (sent < 400) : (sent += 1) {
+        writeFrame(&writer.interface, .continuation, 0, 1, "") catch break;
+    }
+
+    var goaway = try readFrameOfType(testing.allocator, &reader.interface, .goaway);
+    defer goaway.deinit(testing.allocator);
+    try testing.expect(goaway.payload.len >= 8);
+    try testing.expectEqual(@intFromEnum(ErrorCode.enhance_your_calm), std.mem.readInt(u32, goaway.payload[4..8], .big));
+}
+
 test "h2: SETTINGS_INITIAL_WINDOW_SIZE over 2^31-1 is a connection FLOW_CONTROL_ERROR (B-9)" {
     const fds = try newSocketPair();
     errdefer _ = c.close(fds[1]); // reap the client end if the spawn below fails
@@ -1937,6 +2031,106 @@ test "h2: SETTINGS_INITIAL_WINDOW_SIZE over 2^31-1 is a connection FLOW_CONTROL_
     defer goaway.deinit(testing.allocator);
     try testing.expect(goaway.payload.len >= 8);
     try testing.expectEqual(@intFromEnum(ErrorCode.flow_control_error), std.mem.readInt(u32, goaway.payload[4..8], .big));
+}
+
+fn rapidResetFlood(w: *Io.Writer) void {
+    const req_block = [_]u8{
+        0x82, 0x86, 0x84, 0x41, 0x0f, 0x77, 0x77, 0x77, 0x2e, 0x65,
+        0x78, 0x61, 0x6d, 0x70, 0x6c, 0x65, 0x2e, 0x63, 0x6f, 0x6d,
+    };
+    var sid: u31 = 1;
+    var i: usize = 0;
+    while (i < 400) : (i += 1) {
+        writeFrame(w, .headers, flag_end_headers | flag_end_stream, sid, &req_block) catch return;
+        var code: [4]u8 = undefined;
+        std.mem.writeInt(u32, &code, @intFromEnum(ErrorCode.cancel), .big);
+        writeFrame(w, .rst_stream, 0, sid, &code) catch return;
+        sid += 2;
+    }
+}
+
+test "h2: rapid-reset flood (CVE-2023-44487) is cut off with GOAWAY ENHANCE_YOUR_CALM" {
+    const fds = try newSocketPair();
+    errdefer _ = c.close(fds[1]); // reap the client end if a spawn below fails
+
+    var srv: Server = .{
+        .io = testing.io,
+        .gpa = testing.allocator,
+        .handler = h2TestHandler,
+        // Short idle timeout so, before the fix, the drainer blocking after the
+        // flood surfaces fast instead of after the 180s default.
+        .config = .{ .idle_timeout_ms = 2_000 },
+    };
+    const t = try std.Thread.spawn(.{}, serveRawH2OnFd, .{ &srv, fds[0] });
+
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [8192]u8 = undefined;
+    var reader = peerStream(fds[1]).reader(testing.io, &rbuf);
+    var writer = peerStream(fds[1]).writer(testing.io, &wbuf);
+
+    try writer.interface.writeAll(preface);
+    try writer.interface.flush();
+    try writeFrame(&writer.interface, .settings, 0, 0, "");
+
+    // Flood HEADERS→RST_STREAM pairs from a second thread while the main thread
+    // drains responses, so the server's writes never block the connection.
+    const sender = try std.Thread.spawn(.{}, rapidResetFlood, .{&writer.interface});
+    // Teardown (LIFO): join the server (it closes its fd on return, which errors
+    // the sender's in-flight write), then join the sender, then close our end.
+    defer _ = c.close(fds[1]);
+    defer sender.join();
+    defer t.join();
+
+    var goaway = try readFrameOfType(testing.allocator, &reader.interface, .goaway);
+    try testing.expect(goaway.payload.len >= 8);
+    const code = std.mem.readInt(u32, goaway.payload[4..8], .big);
+    goaway.deinit(testing.allocator);
+    try testing.expectEqual(@intFromEnum(ErrorCode.enhance_your_calm), code);
+
+    // Drain until EOF: lets any worker blocked writing a response flush, so the
+    // server can finish draining workers, return, and close its fd — which in
+    // turn errors the sender's write so it (and the joins above) complete.
+    while (true) {
+        var f = readFrameAlloc(testing.allocator, &reader.interface) catch break;
+        f.deinit(testing.allocator);
+    }
+}
+
+test "h2: SETTINGS_MAX_FRAME_SIZE out of range is a connection PROTOCOL_ERROR" {
+    const fds = try newSocketPair();
+    errdefer _ = c.close(fds[1]);
+
+    var srv: Server = .{
+        .io = testing.io,
+        .gpa = testing.allocator,
+        .handler = h2TestHandler,
+        // Short idle timeout so, before the fix, the server closing on idle
+        // surfaces as a fast EOF instead of hanging the test for 180s.
+        .config = .{ .idle_timeout_ms = 1_000 },
+    };
+    const t = try std.Thread.spawn(.{}, serveRawH2OnFd, .{ &srv, fds[0] });
+    defer t.join();
+    defer _ = c.close(fds[1]);
+
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [4096]u8 = undefined;
+    var reader = peerStream(fds[1]).reader(testing.io, &rbuf);
+    var writer = peerStream(fds[1]).writer(testing.io, &wbuf);
+
+    try writer.interface.writeAll(preface);
+    try writer.interface.flush();
+    // SETTINGS_MAX_FRAME_SIZE = 0 is below the RFC 7540 §6.5.2 minimum (2^14);
+    // values outside [16384, 16777215] MUST be a connection PROTOCOL_ERROR.
+    // (0 also drove the DATA/HEADERS writers into a zero-length busy loop.)
+    var s: [6]u8 = undefined;
+    std.mem.writeInt(u16, s[0..2], set_max_frame_size, .big);
+    std.mem.writeInt(u32, s[2..6], 0, .big);
+    try writeFrame(&writer.interface, .settings, 0, 0, &s);
+
+    var goaway = try readFrameOfType(testing.allocator, &reader.interface, .goaway);
+    defer goaway.deinit(testing.allocator);
+    try testing.expect(goaway.payload.len >= 8);
+    try testing.expectEqual(@intFromEnum(ErrorCode.protocol_error), std.mem.readInt(u32, goaway.payload[4..8], .big));
 }
 
 // A gRPC-style handler: echoes the (already framed) request body and closes with
