@@ -475,7 +475,17 @@ pub const HuffmanCodec = struct {
                     }
                     if (matched) break;
                 }
-                if (!matched) break;
+                if (!matched) {
+                    // With a full longest-code window (30 bits, the max in the
+                    // table) available and still no match, the leading bits can
+                    // start no valid code — malformed input, or an in-stream EOS
+                    // symbol, which RFC 7541 §5.2 forbids. Reject it. This also
+                    // bounds bit_count: we only fall through to read another
+                    // byte while bit_count < 30, so it never grows past ~37 and
+                    // can no longer overflow the u6 on adversarial all-ones runs.
+                    if (bit_count >= 30) return error.InvalidHuffmanCode;
+                    break;
+                }
             }
         }
 

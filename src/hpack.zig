@@ -29,10 +29,20 @@ pub const Error = error{
     InvalidZeroIndex,
     TableSizeExceeded,
     Truncated,
+    /// Decoded header list exceeded `Decoder.max_list_size` — an HPACK
+    /// decompression bomb (RFC 7540 §6.5.2 SETTINGS_MAX_HEADER_LIST_SIZE).
+    HeaderListTooLarge,
     /// From the codec's integer coder; unreachable in practice (our buffers are
     /// sized for 64-bit values) but part of its return type, so we admit it.
     BufferTooSmall,
 } || std.mem.Allocator.Error;
+
+/// Default cap on the *decoded* header-list size — the RFC 7540 §6.5.2 metric:
+/// sum over fields of (name.len + value.len + 32). Bounds HPACK decompression
+/// bombs, where a small block of 1-byte indexed references to a large dynamic
+/// table entry expands to gigabytes. Sized above any legitimate header set that
+/// fits the wire-side block cap, so it never rejects real traffic.
+pub const default_max_header_list_size: usize = 512 * 1024;
 
 /// Decodes a request header block. Holds the connection's request-side dynamic
 /// table; single-threaded use (connection reader) only.
@@ -41,6 +51,9 @@ pub const Decoder = struct {
     /// Upper bound the peer may set via a dynamic-table-size-update; equals the
     /// `SETTINGS_HEADER_TABLE_SIZE` we advertised.
     max_table_size: usize,
+    /// Cap on the decoded header-list size for a single block; 0 disables it.
+    /// Defaults to `default_max_header_list_size`; callers may lower it.
+    max_list_size: usize = default_max_header_list_size,
 
     pub fn init(gpa: std.mem.Allocator, max_table_size: usize) Decoder {
         return .{
@@ -66,6 +79,7 @@ pub const Decoder = struct {
     /// evicts entries on a later block (safe to hand to a worker thread).
     pub fn decode(self: *Decoder, arena: std.mem.Allocator, block: []const u8) Error![]Header {
         var out: std.ArrayList(Header) = .empty;
+        var list_size: usize = 0;
         var i: usize = 0;
         while (i < block.len) {
             const b = block[i];
@@ -74,11 +88,13 @@ pub const Decoder = struct {
                 const n = try decInt(block[i..], 7);
                 i += n.len;
                 const e = try self.lookup(@intCast(n.value));
+                try self.account(&list_size, e.name, e.value);
                 try out.append(arena, .{ .name = try arena.dupe(u8, e.name), .value = try arena.dupe(u8, e.value) });
             } else if (b & 0xC0 == 0x40) {
                 // 6.2.1 Literal with Incremental Indexing (6-bit prefix).
                 const h = try self.literal(arena, block[i..], 6);
                 i += h.consumed;
+                try self.account(&list_size, h.name, h.value);
                 try self.dyn.add(h.name, h.value);
                 try out.append(arena, .{ .name = h.name, .value = h.value });
             } else if (b & 0xE0 == 0x20) {
@@ -93,10 +109,19 @@ pub const Decoder = struct {
                 // a server doesn't do for inbound headers; either way: not indexed.
                 const h = try self.literal(arena, block[i..], 4);
                 i += h.consumed;
+                try self.account(&list_size, h.name, h.value);
                 try out.append(arena, .{ .name = h.name, .value = h.value });
             }
         }
         return out.toOwnedSlice(arena);
+    }
+
+    /// Adds one field's RFC 7540 §6.5.2 size (name + value + 32) to the running
+    /// decoded-list total and rejects the block once it exceeds `max_list_size`
+    /// — the guard against HPACK decompression bombs.
+    fn account(self: *const Decoder, list_size: *usize, name: []const u8, value: []const u8) Error!void {
+        list_size.* += name.len + value.len + 32;
+        if (self.max_list_size != 0 and list_size.* > self.max_list_size) return Error.HeaderListTooLarge;
     }
 
     const Literal = struct { name: []const u8, value: []const u8, consumed: usize };
@@ -421,6 +446,27 @@ test "dynamic table size update beyond max errors" {
     try testing.expectError(Error.TableSizeExceeded, dec.decode(arena_state.allocator(), &block));
 }
 
+test "decode rejects an HPACK decompression bomb (bounded header-list size)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var block = std.ArrayList(u8).empty;
+    defer block.deinit(testing.allocator);
+    // Seed the dynamic table with a ~4KB entry: literal with incremental
+    // indexing, name = static index 1 (":authority"), value = 4000 'a' bytes
+    // (length 4000 as a 7-bit-prefix integer is 0x7f,0xA1,0x1E).
+    try block.appendSlice(testing.allocator, &.{ 0x41, 0x7f, 0xA1, 0x1E });
+    try block.appendNTimes(testing.allocator, 'a', 4000);
+    // Then 140 one-byte indexed references (0x80|62) to that entry: ~570KB
+    // decoded from 140 bytes on the wire — above the 512KB cap.
+    try block.appendNTimes(testing.allocator, 0x80 | 62, 140);
+
+    var dec = Decoder.init(testing.allocator, 4096);
+    defer dec.deinit();
+    try testing.expectError(Error.HeaderListTooLarge, dec.decode(arena, block.items));
+}
+
 test "hpack integer decode rejects overflow instead of panicking" {
     // A prefix byte at max plus continuation bytes that push the accumulator
     // past 2^64. Before the fix this panicked (integer overflow) in safe
@@ -449,6 +495,15 @@ test "Huffman round trip over short and long codes" {
     const dec = try hp.HuffmanCodec.decode(enc, testing.allocator);
     defer testing.allocator.free(dec);
     try testing.expectEqualSlices(u8, &input, dec);
+}
+
+test "Huffman decode rejects an unmatchable bit run instead of overflowing" {
+    // Eight 0xFF bytes are 64 all-ones bits. No non-EOS code (and EOS itself)
+    // ever matches, so the decoder would keep accumulating bits; bit_count is a
+    // u6, so the 8th byte's `+= 8` overflowed 63→panic. It must now be rejected
+    // as a decode error. Single unauthenticated HEADERS frame, remote crash.
+    const bomb = [_]u8{0xFF} ** 8;
+    try testing.expectError(error.InvalidHuffmanCode, hp.HuffmanCodec.decode(&bomb, testing.allocator));
 }
 
 test "huffmanLen computes the Huffman-encoded byte length" {
