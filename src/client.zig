@@ -83,11 +83,17 @@ pub const Stream = struct {
     reset: ?u32 = null,
     rst_delivered: bool = false,
     remote_closed: bool = false,
+    /// Set when the stream is reset (peer RST_STREAM). Read by `send` without
+    /// holding `recv_mu`, so it is atomic; lets a send blocked on the flow
+    /// window bail out instead of deadlocking after a reset.
+    aborted: std.atomic.Value(bool) = .init(false),
 
     /// Sends `data` as flow-controlled DATA frames; `end_stream` half-closes.
     /// Blocks while the send window is empty; errors on reset/teardown.
     pub fn send(self: *Stream, data: []const u8, end_stream: bool) !void {
         const c = self.client;
+        c.beginOp();
+        defer c.endOp();
         if (data.len == 0) {
             if (end_stream) try c.writeData(self.id, "", true);
             return;
@@ -99,6 +105,10 @@ pub const Stream = struct {
                 if (c.dead.load(.acquire)) {
                     c.send_mu.unlock(c.io);
                     return error.ConnectionClosed;
+                }
+                if (self.aborted.load(.acquire)) {
+                    c.send_mu.unlock(c.io);
+                    return error.StreamReset;
                 }
                 if (self.send_window <= 0) {
                     c.send_cond.waitUncancelable(c.io, &c.send_mu);
@@ -127,6 +137,8 @@ pub const Stream = struct {
     /// `error.ConnectionClosed` when the connection tears down.
     pub fn readEvent(self: *Stream, arena: std.mem.Allocator) !Event {
         const c = self.client;
+        c.beginOp();
+        defer c.endOp();
         self.recv_mu.lockUncancelable(c.io);
         defer self.recv_mu.unlock(c.io);
         while (true) {
@@ -156,9 +168,15 @@ pub const Stream = struct {
                     return .{ .data = .{ .sid = self.id, .payload = out, .end_stream = end_stream } };
                 }
             }
-            if (self.reset != null and !self.rst_delivered) {
-                self.rst_delivered = true;
-                return .{ .rst = .{ .sid = self.id, .code = self.reset.? } };
+            if (self.reset != null) {
+                // Surface the reset once as an event; any later call ends the
+                // stream so a "readEvent until EndOfStream" loop terminates
+                // instead of blocking forever.
+                if (!self.rst_delivered) {
+                    self.rst_delivered = true;
+                    return .{ .rst = .{ .sid = self.id, .code = self.reset.? } };
+                }
+                return error.EndOfStream;
             }
             if (c.dead.load(.acquire)) return error.ConnectionClosed;
             if (self.remote_closed) return error.EndOfStream;
@@ -238,6 +256,13 @@ pub const Client = struct {
     streams_mu: Io.Mutex = .init,
     streams: std.AutoHashMapUnmanaged(u31, *Stream) = .empty,
 
+    // In-flight readEvent/send accounting. `deinit` waits for this to drain so
+    // it never frees a *Stream while a user thread (e.g. a bidi send/receive
+    // thread) is still inside readEvent/send on it (use-after-free).
+    op_mu: Io.Mutex = .init,
+    op_cond: Io.Condition = .init,
+    active_ops: u32 = 0,
+
     keepalive_time_ms: u64 = 0,
     keepalive_timeout_ms: u64 = 0,
     ping_outstanding: bool = false,
@@ -278,6 +303,13 @@ pub const Client = struct {
         self.streams_mu.unlock(self.io);
         if (self.reader_thread) |t| t.join();
 
+        // Wait for any user thread still inside readEvent/send (which we just
+        // woke) to release its *Stream before we free them. Callers must not
+        // start new readEvent/send calls once deinit has begun.
+        self.op_mu.lockUncancelable(self.io);
+        while (self.active_ops != 0) self.op_cond.waitUncancelable(self.io, &self.op_mu);
+        self.op_mu.unlock(self.io);
+
         self.dec.deinit();
         var it2 = self.streams.valueIterator();
         while (it2.next()) |s| {
@@ -285,6 +317,21 @@ pub const Client = struct {
             self.gpa.destroy(s.*);
         }
         self.streams.deinit(self.gpa);
+    }
+
+    /// Registers entry into a user-facing stream op (readEvent/send). Paired
+    /// with `endOp`; `deinit` blocks until the count returns to zero.
+    fn beginOp(self: *Client) void {
+        self.op_mu.lockUncancelable(self.io);
+        self.active_ops += 1;
+        self.op_mu.unlock(self.io);
+    }
+
+    fn endOp(self: *Client) void {
+        self.op_mu.lockUncancelable(self.io);
+        self.active_ops -= 1;
+        if (self.active_ops == 0) self.op_cond.broadcast(self.io);
+        self.op_mu.unlock(self.io);
     }
 
     fn writeFrameLocked(self: *Client, ftype: p2.FrameType, flags: u8, sid: u31, payload: []const u8) !void {
@@ -435,12 +482,16 @@ pub const Client = struct {
                 const code: u32 = if (payload.len >= 4) std.mem.readInt(u32, payload[0..4], .big) else 0;
                 self.streams_mu.lockUncancelable(self.io);
                 if (self.streams.get(fh.sid)) |st| {
+                    st.aborted.store(true, .release);
                     st.recv_mu.lockUncancelable(self.io);
                     st.reset = code;
                     st.recv_cond.broadcast(self.io);
                     st.recv_mu.unlock(self.io);
                 }
                 self.streams_mu.unlock(self.io);
+                // Wake any sender blocked on this stream's flow-control window;
+                // it checks `aborted` and returns error.StreamReset.
+                self.send_cond.broadcast(self.io);
             },
             .headers => {
                 var block: std.ArrayList(u8) = .empty;
@@ -451,8 +502,15 @@ pub const Client = struct {
                 try self.deliver(fh.sid, true, hs, &[_]u8{}, fh.flags & p2.flag_end_stream != 0);
             },
             .data => {
+                // Flow control counts the whole frame (pad octet + data + pad);
+                // credit it before stripping padding for delivery.
                 if (payload.len > 0) self.replenish(fh.sid, @intCast(payload.len));
-                const copy = try self.gpa.dupe(u8, payload);
+                const body = stripDataPadding(fh, payload) orelse {
+                    self.sendGoaway(.protocol_error);
+                    self.kill();
+                    return error.ProtocolError;
+                };
+                const copy = try self.gpa.dupe(u8, body);
                 try self.deliver(fh.sid, false, &[_]hpack.Header{}, copy, fh.flags & p2.flag_end_stream != 0);
             },
             .push_promise => {
@@ -674,6 +732,19 @@ fn freeHeaders(gpa: std.mem.Allocator, hs: []const Header) void {
     gpa.free(hs);
 }
 
+/// Strips a DATA frame's PADDED prefix/suffix (RFC 7540 §6.1). Returns null if
+/// the pad-length octet is missing or exceeds the remaining payload — a
+/// connection PROTOCOL_ERROR — so the caller can tear down instead of
+/// delivering a corrupt body.
+fn stripDataPadding(fh: p2.ParsedHeader, payload: []const u8) ?[]const u8 {
+    if (fh.flags & p2.flag_padded == 0) return payload;
+    if (payload.len == 0) return null; // PADDED set but no pad-length octet
+    const pad = payload[0];
+    const rest = payload[1..];
+    if (pad > rest.len) return null; // padding longer than what remains
+    return rest[0 .. rest.len - pad];
+}
+
 /// HEADERS frames may carry PADDED/PRIORITY prefixes; strip them for decoding.
 fn stripHeaderPadding(fh: p2.ParsedHeader, payload: []const u8) []const u8 {
     var frag = payload;
@@ -710,6 +781,33 @@ const SilentServer = struct {
         }
     }
 };
+
+const ReaderCtx = struct {
+    s: *Stream,
+    err: ?anyerror = null,
+    done: std.atomic.Value(bool) = .init(false),
+};
+fn blockedReader(ctx: *ReaderCtx) void {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    if (ctx.s.readEvent(arena.allocator())) |_| {} else |e| {
+        ctx.err = e;
+    }
+    ctx.done.store(true, .release);
+}
+
+const SenderCtx = struct {
+    s: *Stream,
+    err: ?anyerror = null,
+    done: std.atomic.Value(bool) = .init(false),
+};
+fn blockedSender(ctx: *SenderCtx) void {
+    const payload = [_]u8{'x'} ** 200;
+    if (ctx.s.send(&payload, false)) |_| {} else |e| {
+        ctx.err = e;
+    }
+    ctx.done.store(true, .release);
+}
 
 const CtFrame = struct {
     hdr: p2.ParsedHeader,
@@ -753,6 +851,220 @@ fn ctWriteHeaderOnly(w: *Io.Writer, ftype: p2.FrameType, sid: u31, length: usize
 // Common setup: loopback client + raw "server" side; consumes the client's
 // preface+SETTINGS and sends SETTINGS+ack. Returns nothing; caller uses the
 // captured streams. (Kept inline in each test for clarity — see below.)
+
+test "deinit waits for an in-flight readEvent before freeing the stream (no UAF)" {
+    const io = testing.io;
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var srv = try addr.listen(io, .{ .mode = .stream, .reuse_address = true });
+    defer srv.deinit(io);
+    const port = srv.socket.address.ip4.port;
+    const caddr = try net.IpAddress.parse("127.0.0.1", port);
+    const cstream = try caddr.connect(io, .{ .mode = .stream });
+    defer cstream.close(io);
+    var accepted = try srv.accept(io);
+    defer accepted.close(io);
+
+    var crbuf: [4096]u8 = undefined;
+    var cwbuf: [4096]u8 = undefined;
+    var csr = cstream.reader(io, &crbuf);
+    var csw = cstream.writer(io, &cwbuf);
+    var client: Client = undefined;
+    try client.init(io, testing.allocator, &csr.interface, &csw.interface);
+
+    var arbuf: [4096]u8 = undefined;
+    var awbuf: [4096]u8 = undefined;
+    var asr = accepted.reader(io, &arbuf);
+    var asw = accepted.writer(io, &awbuf);
+    var pf: [p2.preface.len]u8 = undefined;
+    try asr.interface.readSliceAll(&pf);
+    var cs = try ctRead(testing.allocator, &asr.interface);
+    cs.deinit(testing.allocator);
+    try ctWrite(&asw.interface, .settings, 0, 0, "");
+    try ctWrite(&asw.interface, .settings, p2.flag_ack, 0, "");
+
+    // A receive thread blocks in readEvent (the peer sends no stream frames).
+    const s = try client.openStream(.{ .path = "/x" }, true);
+    var ctx = ReaderCtx{ .s = s };
+    const rt = try std.Thread.spawn(.{}, blockedReader, .{&ctx});
+    // Let it get inside readEvent (past beginOp) and block on recv_cond.
+    Io.sleep(io, .{ .nanoseconds = 50 * std.time.ns_per_ms }, .awake) catch {};
+
+    // deinit must wake the blocked reader and wait for it to return before
+    // freeing `s`; otherwise the reader touches freed memory. Driven inline
+    // (not deferred) so we can join the reader after it returns.
+    client.deinit();
+    rt.join();
+
+    try testing.expect(ctx.done.load(.acquire));
+    try testing.expectEqual(error.ConnectionClosed, ctx.err.?);
+}
+
+test "a blocked send() is released with error when the stream is reset" {
+    const io = testing.io;
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var srv = try addr.listen(io, .{ .mode = .stream, .reuse_address = true });
+    defer srv.deinit(io);
+    const port = srv.socket.address.ip4.port;
+    const caddr = try net.IpAddress.parse("127.0.0.1", port);
+    const cstream = try caddr.connect(io, .{ .mode = .stream });
+    defer cstream.close(io);
+    var accepted = try srv.accept(io);
+    defer accepted.close(io);
+
+    var crbuf: [4096]u8 = undefined;
+    var cwbuf: [4096]u8 = undefined;
+    var csr = cstream.reader(io, &crbuf);
+    var csw = cstream.writer(io, &cwbuf);
+    var client: Client = undefined;
+    try client.init(io, testing.allocator, &csr.interface, &csw.interface);
+
+    var arbuf: [4096]u8 = undefined;
+    var awbuf: [4096]u8 = undefined;
+    var asr = accepted.reader(io, &arbuf);
+    var asw = accepted.writer(io, &awbuf);
+    var pf: [p2.preface.len]u8 = undefined;
+    try asr.interface.readSliceAll(&pf);
+    var cs = try ctRead(testing.allocator, &asr.interface);
+    cs.deinit(testing.allocator);
+    // Advertise SETTINGS_INITIAL_WINDOW_SIZE=0, then wait for the client's ack
+    // so we know it is applied before we open a stream — the stream is then
+    // born with a 0 send window and any send() blocks immediately.
+    var iw0: [6]u8 = undefined;
+    p2.putSetting(&iw0, p2.set_initial_window_size, 0);
+    try ctWrite(&asw.interface, .settings, 0, 0, &iw0);
+    while (true) {
+        var f = try ctRead(testing.allocator, &asr.interface);
+        const is_ack = f.hdr.ftype == .settings and (f.hdr.flags & p2.flag_ack != 0);
+        f.deinit(testing.allocator);
+        if (is_ack) break;
+    }
+
+    const s = try client.openStream(.{ .path = "/x" }, false);
+
+    // A send now blocks on the empty window. Reset the stream; the sender must
+    // be released with an error rather than deadlocking forever.
+    var ctx = SenderCtx{ .s = s };
+    const sender = try std.Thread.spawn(.{}, blockedSender, .{&ctx});
+    var rst: [4]u8 = undefined;
+    std.mem.writeInt(u32, &rst, @intFromEnum(p2.ErrorCode.cancel), .big);
+    ctWrite(&asw.interface, .rst_stream, 0, 1, &rst) catch {};
+
+    var signaled = false;
+    var waited: u64 = 0;
+    while (waited < 2000) : (waited += 20) {
+        if (ctx.done.load(.acquire)) {
+            signaled = true;
+            break;
+        }
+        Io.sleep(io, .{ .nanoseconds = 20 * std.time.ns_per_ms }, .awake) catch {};
+    }
+
+    // Cleanup: deinit releases the sender if the reset did not (and, via op
+    // draining, only frees the stream once the sender has left send()).
+    client.deinit();
+    sender.join();
+
+    try testing.expect(signaled); // fails (deadlock) before the fix
+    try testing.expectEqual(error.StreamReset, ctx.err.?);
+}
+
+test "readEvent surfaces a reset once, then ends the stream" {
+    const io = testing.io;
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var srv = try addr.listen(io, .{ .mode = .stream, .reuse_address = true });
+    defer srv.deinit(io);
+    const port = srv.socket.address.ip4.port;
+    const caddr = try net.IpAddress.parse("127.0.0.1", port);
+    const cstream = try caddr.connect(io, .{ .mode = .stream });
+    defer cstream.close(io);
+    var accepted = try srv.accept(io);
+    defer accepted.close(io);
+
+    var crbuf: [4096]u8 = undefined;
+    var cwbuf: [4096]u8 = undefined;
+    var csr = cstream.reader(io, &crbuf);
+    var csw = cstream.writer(io, &cwbuf);
+    var client: Client = undefined;
+    try client.init(io, testing.allocator, &csr.interface, &csw.interface);
+    defer client.deinit();
+
+    var arbuf: [4096]u8 = undefined;
+    var awbuf: [4096]u8 = undefined;
+    var asr = accepted.reader(io, &arbuf);
+    var asw = accepted.writer(io, &awbuf);
+    var pf: [p2.preface.len]u8 = undefined;
+    try asr.interface.readSliceAll(&pf);
+    var cs = try ctRead(testing.allocator, &asr.interface);
+    cs.deinit(testing.allocator);
+    try ctWrite(&asw.interface, .settings, 0, 0, "");
+    try ctWrite(&asw.interface, .settings, p2.flag_ack, 0, "");
+
+    const s = try client.openStream(.{ .path = "/x" }, true);
+    var rst: [4]u8 = undefined;
+    std.mem.writeInt(u32, &rst, @intFromEnum(p2.ErrorCode.cancel), .big);
+    try ctWrite(&asw.interface, .rst_stream, 0, 1, &rst);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const e1 = try s.readEvent(arena.allocator());
+    try testing.expect(e1 == .rst);
+    try testing.expectEqual(@as(u32, @intFromEnum(p2.ErrorCode.cancel)), e1.rst.code);
+    // Second call must terminate the drain loop, not block forever.
+    try testing.expectError(error.EndOfStream, s.readEvent(arena.allocator()));
+}
+
+test "client strips padding from a PADDED DATA frame" {
+    const io = testing.io;
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var srv = try addr.listen(io, .{ .mode = .stream, .reuse_address = true });
+    defer srv.deinit(io);
+    const port = srv.socket.address.ip4.port;
+    const caddr = try net.IpAddress.parse("127.0.0.1", port);
+    const cstream = try caddr.connect(io, .{ .mode = .stream });
+    defer cstream.close(io);
+    var accepted = try srv.accept(io);
+    defer accepted.close(io);
+
+    var crbuf: [4096]u8 = undefined;
+    var cwbuf: [4096]u8 = undefined;
+    var csr = cstream.reader(io, &crbuf);
+    var csw = cstream.writer(io, &cwbuf);
+    var client: Client = undefined;
+    try client.init(io, testing.allocator, &csr.interface, &csw.interface);
+    defer client.deinit();
+
+    var arbuf: [4096]u8 = undefined;
+    var awbuf: [4096]u8 = undefined;
+    var asr = accepted.reader(io, &arbuf);
+    var asw = accepted.writer(io, &awbuf);
+    var pf: [p2.preface.len]u8 = undefined;
+    try asr.interface.readSliceAll(&pf);
+    var cs = try ctRead(testing.allocator, &asr.interface);
+    cs.deinit(testing.allocator);
+    try ctWrite(&asw.interface, .settings, 0, 0, "");
+    try ctWrite(&asw.interface, .settings, p2.flag_ack, 0, "");
+
+    const s = try client.openStream(.{ .path = "/x" }, true);
+
+    // Response: HEADERS(:status 200), then a PADDED DATA frame carrying "hello"
+    // plus a 1-byte pad-length octet (3) and 3 pad bytes.
+    var henc = std.heap.ArenaAllocator.init(testing.allocator);
+    defer henc.deinit();
+    var blk: std.ArrayList(u8) = .empty;
+    try hpack.Encoder.encodeResponse(henc.allocator(), &blk, 200, &.{});
+    try ctWrite(&asw.interface, .headers, p2.flag_end_headers, 1, blk.items);
+    const padded = [_]u8{3} ++ "hello".* ++ [_]u8{ 0, 0, 0 };
+    try ctWrite(&asw.interface, .data, p2.flag_padded | p2.flag_end_stream, 1, &padded);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const e1 = try s.readEvent(arena.allocator());
+    try testing.expect(e1 == .headers);
+    const e2 = try s.readEvent(arena.allocator());
+    try testing.expect(e2 == .data);
+    try testing.expectEqualStrings("hello", e2.data.payload);
+    try testing.expect(e2.data.end_stream);
+}
 
 test "client rejects an oversized inbound frame with GOAWAY(FRAME_SIZE_ERROR)" {
     const io = testing.io;
