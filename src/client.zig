@@ -94,6 +94,12 @@ pub const Stream = struct {
     /// one Event.goaway, then the stream ends. Guarded by recv_mu.
     goaway_refused: bool = false,
     goaway_delivered: bool = false,
+    /// Concurrency-slot accounting (peer MAX_CONCURRENT_STREAMS), guarded by
+    /// client.admit_mu. The slot is freed once both half-close directions are
+    /// seen (or the stream is reset/abandoned), exactly once.
+    adm_local_end: bool = false,
+    adm_remote_end: bool = false,
+    admit_released: bool = false,
 
     /// Sends `data` as flow-controlled DATA frames; `end_stream` half-closes.
     /// Blocks while the send window is empty; errors on reset/teardown.
@@ -102,7 +108,10 @@ pub const Stream = struct {
         c.beginOp();
         defer c.endOp();
         if (data.len == 0) {
-            if (end_stream) try c.writeData(self.id, "", true);
+            if (end_stream) {
+                try c.writeData(self.id, "", true);
+                c.noteEnd(self, true, false); // local half-closed
+            }
             return;
         }
         var off: usize = 0;
@@ -136,6 +145,7 @@ pub const Stream = struct {
             try c.writeData(self.id, data[off .. off + n], end_stream and last);
             off += n;
         }
+        if (end_stream) c.noteEnd(self, true, false); // local half-closed
     }
 
     /// Reads the next event on this stream, blocking until one is available.
@@ -213,6 +223,7 @@ pub const Stream = struct {
         var p: [4]u8 = undefined;
         std.mem.writeInt(u32, &p, @intFromEnum(p2.ErrorCode.cancel), .big);
         try self.client.writeFrame(.rst_stream, 0, self.id, &p);
+        self.client.noteEnd(self, true, true); // reset closes both directions
     }
 
     /// Releases the stream: deregisters it from the client and frees it.
@@ -297,6 +308,13 @@ pub const Client = struct {
     op_cond: Io.Condition = .init,
     active_ops: u32 = 0,
 
+    // Outbound-stream admission (peer SETTINGS_MAX_CONCURRENT_STREAMS). openStream
+    // blocks here until a slot frees. Both fields are guarded by admit_mu.
+    admit_mu: Io.Mutex = .init,
+    admit_cond: Io.Condition = .init,
+    peer_max_streams: u32 = std.math.maxInt(u32), // "unlimited" until advertised
+    active_streams: u32 = 0,
+
     keepalive_time_ms: u64 = 0,
     keepalive_timeout_ms: u64 = 0,
     ping_outstanding: bool = false,
@@ -345,6 +363,7 @@ pub const Client = struct {
         // observe `dead` and return. The reader wakes within `reader_wake_ms`.
         self.dead.store(true, .release);
         self.send_cond.broadcast(self.io);
+        self.admit_cond.broadcast(self.io); // release a blocked openStream
         self.streams_mu.lockUncancelable(self.io);
         var it = self.streams.valueIterator();
         while (it.next()) |s| s.*.shutdown(self.io);
@@ -365,6 +384,32 @@ pub const Client = struct {
             self.gpa.destroy(s.*);
         }
         self.streams.deinit(self.gpa);
+    }
+
+    /// Records that a stream reached one/both half-close directions and frees
+    /// its concurrency slot once both are seen (RFC 7540 §5.1.2). Idempotent.
+    fn noteEnd(self: *Client, s: *Stream, local: bool, remote: bool) void {
+        self.admit_mu.lockUncancelable(self.io);
+        if (local) s.adm_local_end = true;
+        if (remote) s.adm_remote_end = true;
+        if (!s.admit_released and s.adm_local_end and s.adm_remote_end) {
+            s.admit_released = true;
+            self.active_streams -= 1;
+            self.admit_cond.broadcast(self.io);
+        }
+        self.admit_mu.unlock(self.io);
+    }
+
+    /// Frees a stream's slot unconditionally (backstop for a stream removed
+    /// before it reached the closed state). Idempotent via `admit_released`.
+    fn releaseSlot(self: *Client, s: *Stream) void {
+        self.admit_mu.lockUncancelable(self.io);
+        if (!s.admit_released) {
+            s.admit_released = true;
+            self.active_streams -= 1;
+            self.admit_cond.broadcast(self.io);
+        }
+        self.admit_mu.unlock(self.io);
     }
 
     /// Registers entry into a user-facing stream op (readEvent/send). Paired
@@ -417,23 +462,40 @@ pub const Client = struct {
     /// §5.1.1); the stream is registered before HEADERS is sent so the reader
     /// can deliver the response.
     pub fn openStream(self: *Client, head: RequestHead, end_stream: bool) !*Stream {
-        if (self.dead.load(.acquire)) return error.ConnectionClosed;
-        if (self.goaway_seen.load(.acquire)) return error.GoingAway;
-
         var tmp = std.heap.ArenaAllocator.init(self.gpa);
         defer tmp.deinit();
         var block: std.ArrayList(u8) = .empty;
         try hpack.Encoder.encodeRequest(tmp.allocator(), &block, head.method, head.scheme, head.path, head.authority, head.headers);
 
+        // Admission: block until a concurrency slot is free (peer
+        // MAX_CONCURRENT_STREAMS), or bail if the connection is closing.
+        self.admit_mu.lockUncancelable(self.io);
+        while (true) {
+            if (self.dead.load(.acquire)) {
+                self.admit_mu.unlock(self.io);
+                return error.ConnectionClosed;
+            }
+            if (self.goaway_seen.load(.acquire)) {
+                self.admit_mu.unlock(self.io);
+                return error.GoingAway;
+            }
+            if (self.active_streams < self.peer_max_streams) break;
+            self.admit_cond.waitUncancelable(self.io, &self.admit_mu);
+        }
+        self.active_streams += 1;
+        self.admit_mu.unlock(self.io);
+
         self.write_mu.lockUncancelable(self.io);
         const sid = self.next_id;
         self.next_id = std.math.add(u31, sid, 2) catch {
             self.write_mu.unlock(self.io);
+            self.admitCancel();
             return error.StreamIdsExhausted;
         };
 
         const st = self.gpa.create(Stream) catch {
             self.write_mu.unlock(self.io);
+            self.admitCancel();
             return error.OutOfMemory;
         };
         st.* = .{ .client = self, .id = sid, .send_window = self.peer_initial_window.load(.acquire) };
@@ -441,6 +503,7 @@ pub const Client = struct {
         self.streams.put(self.gpa, sid, st) catch {
             self.streams_mu.unlock(self.io);
             self.write_mu.unlock(self.io);
+            self.releaseSlot(st);
             self.gpa.destroy(st);
             return error.OutOfMemory;
         };
@@ -449,7 +512,7 @@ pub const Client = struct {
         const flags: u8 = p2.flag_end_headers | (if (end_stream) p2.flag_end_stream else 0);
         self.writeFrameLocked(.headers, flags, sid, block.items) catch {
             self.write_mu.unlock(self.io);
-            self.removeStream(sid);
+            self.removeStream(sid); // releases the slot
             return error.ConnectionClosed;
         };
         self.w.flush() catch {
@@ -458,7 +521,18 @@ pub const Client = struct {
             return error.ConnectionClosed;
         };
         self.write_mu.unlock(self.io);
+        // A bodyless request half-closes our side immediately.
+        if (end_stream) self.noteEnd(st, true, false);
         return st;
+    }
+
+    /// Undoes an admission reservation on an openStream failure that happens
+    /// before a *Stream exists to carry the `admit_released` flag.
+    fn admitCancel(self: *Client) void {
+        self.admit_mu.lockUncancelable(self.io);
+        self.active_streams -= 1;
+        self.admit_cond.broadcast(self.io);
+        self.admit_mu.unlock(self.io);
     }
 
     fn removeStream(self: *Client, sid: u31) void {
@@ -469,6 +543,7 @@ pub const Client = struct {
             // consumed, so tearing streams down doesn't leak it (only while the
             // connection is still live — a dead peer needs no credit).
             const owed = kv.value.unconsumedFcCost();
+            self.releaseSlot(kv.value); // backstop: free the slot if not already
             kv.value.freeQueued(self.gpa);
             self.gpa.destroy(kv.value);
             if (!self.dead.load(.acquire)) self.windowUpdate(0, owed);
@@ -514,6 +589,7 @@ pub const Client = struct {
     fn kill(self: *Client) void {
         self.dead.store(true, .release);
         self.send_cond.broadcast(self.io);
+        self.admit_cond.broadcast(self.io); // release a blocked openStream
         self.streams_mu.lockUncancelable(self.io);
         var it = self.streams.valueIterator();
         while (it.next()) |s| s.*.shutdown(self.io);
@@ -552,10 +628,12 @@ pub const Client = struct {
                         s.goaway_refused = true;
                         s.recv_cond.broadcast(self.io);
                         s.recv_mu.unlock(self.io);
+                        self.noteEnd(s, true, true); // refused: frees its slot
                     }
                 }
                 self.streams_mu.unlock(self.io);
                 self.send_cond.broadcast(self.io); // release refused senders
+                self.admit_cond.broadcast(self.io); // and a blocked openStream
             },
             .rst_stream => {
                 const code: u32 = if (payload.len >= 4) std.mem.readInt(u32, payload[0..4], .big) else 0;
@@ -566,11 +644,13 @@ pub const Client = struct {
                     st.reset = code;
                     st.recv_cond.broadcast(self.io);
                     st.recv_mu.unlock(self.io);
+                    self.noteEnd(st, true, true); // reset frees its slot
                 }
                 self.streams_mu.unlock(self.io);
                 // Wake any sender blocked on this stream's flow-control window;
                 // it checks `aborted` and returns error.StreamReset.
                 self.send_cond.broadcast(self.io);
+                self.admit_cond.broadcast(self.io);
             },
             .headers => {
                 var block: std.ArrayList(u8) = .empty;
@@ -636,6 +716,7 @@ pub const Client = struct {
             if (end_stream) s.remote_closed = true;
             s.recv_cond.broadcast(self.io);
             s.recv_mu.unlock(self.io);
+            if (end_stream) self.noteEnd(s, false, true); // remote half-closed
             self.streams_mu.unlock(self.io);
         } else {
             self.streams_mu.unlock(self.io);
@@ -717,6 +798,12 @@ pub const Client = struct {
                         return;
                     }
                     new_iw = val;
+                },
+                p2.set_max_concurrent_streams => {
+                    self.admit_mu.lockUncancelable(self.io);
+                    self.peer_max_streams = val;
+                    self.admit_cond.broadcast(self.io); // a raised limit wakes waiters
+                    self.admit_mu.unlock(self.io);
                 },
                 else => {},
             }
@@ -886,6 +973,21 @@ const SilentServer = struct {
         }
     }
 };
+
+const OpenCtx = struct {
+    client: *Client,
+    ok: bool = false,
+    err: ?anyerror = null,
+    done: std.atomic.Value(bool) = .init(false),
+};
+fn openThread(ctx: *OpenCtx) void {
+    if (ctx.client.openStream(.{ .path = "/2" }, true)) |_| {
+        ctx.ok = true;
+    } else |e| {
+        ctx.err = e;
+    }
+    ctx.done.store(true, .release);
+}
 
 const ReaderCtx = struct {
     s: *Stream,
@@ -1150,6 +1252,81 @@ test "client defers WINDOW_UPDATE until DATA is consumed (backpressure)" {
             if (f.hdr.sid == 0) saw_conn_wu = true else if (f.hdr.sid == 1) saw_stream_wu = true;
         }
     }
+}
+
+test "openStream blocks at MAX_CONCURRENT_STREAMS until a slot frees" {
+    const io = testing.io;
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var srv = try addr.listen(io, .{ .mode = .stream, .reuse_address = true });
+    defer srv.deinit(io);
+    const port = srv.socket.address.ip4.port;
+    const caddr = try net.IpAddress.parse("127.0.0.1", port);
+    const cstream = try caddr.connect(io, .{ .mode = .stream });
+    defer cstream.close(io);
+    var accepted = try srv.accept(io);
+    defer accepted.close(io);
+
+    var crbuf: [4096]u8 = undefined;
+    var cwbuf: [4096]u8 = undefined;
+    var csr = cstream.reader(io, &crbuf);
+    var csw = cstream.writer(io, &cwbuf);
+    var client: Client = undefined;
+    try client.init(io, testing.allocator, &csr.interface, &csw.interface);
+    defer client.deinit();
+
+    var arbuf: [4096]u8 = undefined;
+    var awbuf: [4096]u8 = undefined;
+    var asr = accepted.reader(io, &arbuf);
+    var asw = accepted.writer(io, &awbuf);
+    var pf: [p2.preface.len]u8 = undefined;
+    try asr.interface.readSliceAll(&pf);
+    var cs = try ctRead(testing.allocator, &asr.interface);
+    cs.deinit(testing.allocator);
+    // Advertise MAX_CONCURRENT_STREAMS = 1, then wait for the client's ack so
+    // it is applied before we open streams.
+    var mcs: [6]u8 = undefined;
+    p2.putSetting(&mcs, p2.set_max_concurrent_streams, 1);
+    try ctWrite(&asw.interface, .settings, 0, 0, &mcs);
+    while (true) {
+        var f = try ctRead(testing.allocator, &asr.interface);
+        const is_ack = f.hdr.ftype == .settings and (f.hdr.flags & p2.flag_ack != 0);
+        f.deinit(testing.allocator);
+        if (is_ack) break;
+    }
+
+    const s1 = try client.openStream(.{ .path = "/1" }, true); // fills the one slot
+
+    // A second open must block on admission.
+    var ctx = OpenCtx{ .client = &client };
+    const opener = try std.Thread.spawn(.{}, openThread, .{&ctx});
+
+    var waited: u64 = 0;
+    while (waited < 500) : (waited += 20) {
+        Io.sleep(io, .{ .nanoseconds = 20 * std.time.ns_per_ms }, .awake) catch {};
+    }
+    try testing.expect(!ctx.done.load(.acquire)); // still blocked (fails before the feature)
+
+    // Free the slot: end s1 with a Trailers-Only (END_STREAM) response. Slot is
+    // released on arrival, not on consume, so s2 can now be admitted.
+    var henc = std.heap.ArenaAllocator.init(testing.allocator);
+    defer henc.deinit();
+    var blk: std.ArrayList(u8) = .empty;
+    try hpack.Encoder.encodeResponse(henc.allocator(), &blk, 200, &.{});
+    try ctWrite(&asw.interface, .headers, p2.flag_end_headers | p2.flag_end_stream, 1, blk.items);
+
+    var signaled = false;
+    waited = 0;
+    while (waited < 2000) : (waited += 20) {
+        if (ctx.done.load(.acquire)) {
+            signaled = true;
+            break;
+        }
+        Io.sleep(io, .{ .nanoseconds = 20 * std.time.ns_per_ms }, .awake) catch {};
+    }
+    opener.join();
+    try testing.expect(signaled);
+    try testing.expect(ctx.ok);
+    _ = s1;
 }
 
 test "graceful GOAWAY: streams <= last_id survive, higher ones are refused" {
