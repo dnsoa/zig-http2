@@ -927,10 +927,30 @@ fn handleHeaders(conn: *Connection, r: *Io.Reader, fh: ParsedHeader, first: []co
         }
     }
 
-    // New stream id must be odd and strictly increasing.
-    if (fh.sid <= conn.last_stream_id or fh.sid % 2 == 0) {
+    // Classify this HEADERS by stream id. An id that is already open means this is
+    // a second HEADERS on that stream — request trailers (RFC 7540 §8.1) — not a
+    // new stream. Used only for routing; handleTrailingHeaders re-checks under
+    // streams_mu because the worker may remove the stream in the meantime.
+    conn.streams_mu.lockUncancelable(conn.io);
+    const already_open = conn.streams.contains(fh.sid);
+    conn.streams_mu.unlock(conn.io);
+    if (already_open) return handleTrailingHeaders(conn, fh, block.items);
+
+    // Client-initiated streams use odd ids.
+    if (fh.sid % 2 == 0) {
         sendGoaway(conn, .protocol_error);
         return error.ProtocolError;
+    }
+    // An odd id at or below the highest we've opened but not currently open is a
+    // closed (or idle) stream. Decode the block to keep the HPACK decoder synced
+    // (we keep the connection alive), then RST rather than GOAWAY.
+    if (fh.sid <= conn.last_stream_id) {
+        decodeDiscard(conn, block.items) catch {
+            sendGoaway(conn, .protocol_error);
+            return error.ProtocolError;
+        };
+        rstStreamCode(conn, fh.sid, .stream_closed);
+        return;
     }
     conn.last_stream_id = fh.sid;
 
@@ -995,6 +1015,66 @@ fn handleHeaders(conn: *Connection, r: *Io.Reader, fh: ParsedHeader, first: []co
     // has not been spawned yet, so this thread owns `st`.
     if (fh.flags & flag_end_stream != 0) st.rx_eof = true else st.has_body = true;
     spawnWorker(conn, st);
+}
+
+/// Decodes a header block into a throwaway arena purely to advance the HPACK
+/// dynamic table (keeping the decoder in sync), discarding the result. Used on
+/// paths that keep the connection alive but do not deliver the headers.
+fn decodeDiscard(conn: *Connection, block: []const u8) !void {
+    var tmp = std.heap.ArenaAllocator.init(conn.gpa);
+    defer tmp.deinit();
+    _ = try conn.decoder.decode(tmp.allocator(), block);
+}
+
+/// Handles a second HEADERS frame on an already-open stream: HTTP/2 request
+/// trailers (RFC 7540 §8.1). The block is HPACK-decoded on this (reader) thread
+/// into a throwaway arena — never st.arena(), which the worker owns concurrently.
+/// Valid trailers (END_STREAM set, no pseudo-headers) end the request body; any
+/// other case is a stream error that also tears down the local worker.
+fn handleTrailingHeaders(conn: *Connection, fh: ParsedHeader, block: []const u8) !void {
+    var tmp = std.heap.ArenaAllocator.init(conn.gpa);
+    defer tmp.deinit();
+    const decoded = conn.decoder.decode(tmp.allocator(), block) catch {
+        sendGoaway(conn, .protocol_error); // HPACK failure is connection-fatal
+        return error.ProtocolError;
+    };
+
+    // Trailers must carry END_STREAM and must not contain pseudo-headers.
+    var invalid_code: ?ErrorCode = null;
+    if (fh.flags & flag_end_stream == 0) {
+        invalid_code = .protocol_error;
+    } else for (decoded) |h| {
+        if (h.name.len > 0 and h.name[0] == ':') {
+            invalid_code = .protocol_error;
+            break;
+        }
+    }
+
+    conn.streams_mu.lockUncancelable(conn.io);
+    const s = conn.streams.get(fh.sid) orelse {
+        conn.streams_mu.unlock(conn.io);
+        rstStreamCode(conn, fh.sid, .stream_closed); // worker already finished/removed
+        return;
+    };
+    s.rx_mu.lockUncancelable(conn.io);
+    // Already half-closed (END_STREAM seen) → HEADERS after end is STREAM_CLOSED;
+    // otherwise bad trailers → invalid_code. Either way it's a stream error that
+    // must also terminate the local worker.
+    const rst_code: ?ErrorCode = if (s.rx_eof) .stream_closed else invalid_code;
+    if (rst_code) |code| {
+        s.reset.store(true, .release);
+        s.rx_cond.broadcast(conn.io);
+        s.rx_mu.unlock(conn.io);
+        conn.streams_mu.unlock(conn.io);
+        conn.wakeSenders(); // rx_cond can't wake a worker blocked on the send window
+        rstStreamCode(conn, fh.sid, code);
+        return;
+    }
+    // Valid trailers: end the request body; drop the fields.
+    s.rx_eof = true;
+    s.rx_cond.broadcast(conn.io);
+    s.rx_mu.unlock(conn.io);
+    conn.streams_mu.unlock(conn.io);
 }
 
 /// Launches a connection task: prefers the Io backend (Io.Group.concurrent) to let
@@ -2661,4 +2741,166 @@ test "h2: connection window is returned when a handler skips the body (no leak)"
         }
         s.close();
     }
+}
+
+// Canonical request block: :method GET, :scheme http, :path /, :authority www.example.com
+const trailers_req_block = [_]u8{
+    0x82, 0x86, 0x84, 0x41, 0x0f, 0x77, 0x77, 0x77, 0x2e, 0x65,
+    0x78, 0x61, 0x6d, 0x70, 0x6c, 0x65, 0x2e, 0x63, 0x6f, 0x6d,
+};
+
+fn readFrameWith(alloc: std.mem.Allocator, r: *Io.Reader, want: FrameType, sid: u31) !TestFrame {
+    while (true) {
+        var f = try readFrameAlloc(alloc, r);
+        if (f.header.ftype == want and f.header.sid == sid) return f;
+        f.deinit(alloc);
+    }
+}
+
+test "h2: request trailers are accepted; connection survives for later streams" {
+    const fds = try newSocketPair();
+    errdefer _ = c.close(fds[1]);
+    var srv: Server = .{ .io = testing.io, .gpa = testing.allocator, .handler = flowEchoHandler, .config = .{} };
+    const t = try std.Thread.spawn(.{}, serveRawH2OnFd, .{ &srv, fds[0] });
+    defer t.join();
+    defer _ = c.close(fds[1]);
+
+    var rbuf: [8192]u8 = undefined;
+    var wbuf: [8192]u8 = undefined;
+    var reader = peerStream(fds[1]).reader(testing.io, &rbuf);
+    var writer = peerStream(fds[1]).writer(testing.io, &wbuf);
+    try writer.interface.writeAll(preface);
+    try writer.interface.flush();
+    var settings = try readFrameOfType(testing.allocator, &reader.interface, .settings);
+    settings.deinit(testing.allocator);
+    try writeFrame(&writer.interface, .settings, 0, 0, "");
+    try writeFrame(&writer.interface, .settings, flag_ack, 0, "");
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Stream 1: HEADERS (no END_STREAM) + DATA + trailing HEADERS (END_STREAM + a field).
+    try writeFrame(&writer.interface, .headers, flag_end_headers, 1, &trailers_req_block);
+    try writeFrame(&writer.interface, .data, 0, 1, "body");
+    var tblock: std.ArrayList(u8) = .empty;
+    try hpack.Encoder.encodeTrailers(arena, &tblock, &[_]hpack.Header{.{ .name = "x-sum", .value = "1" }});
+    try writeFrame(&writer.interface, .headers, flag_end_headers | flag_end_stream, 1, tblock.items);
+
+    // Stream 3: a later, independent bodyless request. On the pre-fix code the
+    // trailing HEADERS above GOAWAYs the connection, so stream 3 never gets a
+    // response and the read below hits EOF. On the fixed code the connection
+    // survives and stream 3 is answered.
+    try writeFrame(&writer.interface, .headers, flag_end_headers | flag_end_stream, 3, &trailers_req_block);
+
+    var resp3 = try readFrameWith(testing.allocator, &reader.interface, .headers, 3);
+    defer resp3.deinit(testing.allocator);
+    var dec = hpack.Decoder.init(testing.allocator, our_header_table_size);
+    defer dec.deinit();
+    const hs = try dec.decode(arena, resp3.payload);
+    try testing.expectEqualStrings("200", findHeaderValue(hs, ":status").?);
+}
+
+test "h2: trailing HEADERS without END_STREAM resets the stream (protocol_error)" {
+    const fds = try newSocketPair();
+    errdefer _ = c.close(fds[1]);
+    var srv: Server = .{ .io = testing.io, .gpa = testing.allocator, .handler = flowEchoHandler, .config = .{} };
+    const t = try std.Thread.spawn(.{}, serveRawH2OnFd, .{ &srv, fds[0] });
+    defer t.join();
+    defer _ = c.close(fds[1]);
+
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [4096]u8 = undefined;
+    var reader = peerStream(fds[1]).reader(testing.io, &rbuf);
+    var writer = peerStream(fds[1]).writer(testing.io, &wbuf);
+    try writer.interface.writeAll(preface);
+    try writer.interface.flush();
+    var settings = try readFrameOfType(testing.allocator, &reader.interface, .settings);
+    settings.deinit(testing.allocator);
+    try writeFrame(&writer.interface, .settings, 0, 0, "");
+    try writeFrame(&writer.interface, .settings, flag_ack, 0, "");
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    try writeFrame(&writer.interface, .headers, flag_end_headers, 1, &trailers_req_block);
+    try writeFrame(&writer.interface, .data, 0, 1, "body");
+    var tblock: std.ArrayList(u8) = .empty;
+    try hpack.Encoder.encodeTrailers(arena_state.allocator(), &tblock, &[_]hpack.Header{.{ .name = "x-sum", .value = "1" }});
+    // Second HEADERS WITHOUT END_STREAM → not valid trailers.
+    try writeFrame(&writer.interface, .headers, flag_end_headers, 1, tblock.items);
+
+    var rst = try readFrameOfType(testing.allocator, &reader.interface, .rst_stream);
+    defer rst.deinit(testing.allocator);
+    try testing.expectEqual(@as(u31, 1), rst.header.sid);
+    try testing.expectEqual(@as(u32, @intFromEnum(ErrorCode.protocol_error)), std.mem.readInt(u32, rst.payload[0..4], .big));
+}
+
+test "h2: trailers containing a pseudo-header reset the stream (protocol_error)" {
+    const fds = try newSocketPair();
+    errdefer _ = c.close(fds[1]);
+    var srv: Server = .{ .io = testing.io, .gpa = testing.allocator, .handler = flowEchoHandler, .config = .{} };
+    const t = try std.Thread.spawn(.{}, serveRawH2OnFd, .{ &srv, fds[0] });
+    defer t.join();
+    defer _ = c.close(fds[1]);
+
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [4096]u8 = undefined;
+    var reader = peerStream(fds[1]).reader(testing.io, &rbuf);
+    var writer = peerStream(fds[1]).writer(testing.io, &wbuf);
+    try writer.interface.writeAll(preface);
+    try writer.interface.flush();
+    var settings = try readFrameOfType(testing.allocator, &reader.interface, .settings);
+    settings.deinit(testing.allocator);
+    try writeFrame(&writer.interface, .settings, 0, 0, "");
+    try writeFrame(&writer.interface, .settings, flag_ack, 0, "");
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    try writeFrame(&writer.interface, .headers, flag_end_headers, 1, &trailers_req_block);
+    try writeFrame(&writer.interface, .data, 0, 1, "body");
+    // Trailers must not contain pseudo-headers; include ":method" to violate that.
+    var tblock: std.ArrayList(u8) = .empty;
+    try hpack.Encoder.encodeTrailers(arena_state.allocator(), &tblock, &[_]hpack.Header{.{ .name = ":method", .value = "GET" }});
+    try writeFrame(&writer.interface, .headers, flag_end_headers | flag_end_stream, 1, tblock.items);
+
+    var rst = try readFrameOfType(testing.allocator, &reader.interface, .rst_stream);
+    defer rst.deinit(testing.allocator);
+    try testing.expectEqual(@as(u31, 1), rst.header.sid);
+    try testing.expectEqual(@as(u32, @intFromEnum(ErrorCode.protocol_error)), std.mem.readInt(u32, rst.payload[0..4], .big));
+}
+
+test "h2: HEADERS on a closed stream is RST(STREAM_CLOSED), not GOAWAY" {
+    const fds = try newSocketPair();
+    errdefer _ = c.close(fds[1]);
+    var srv: Server = .{ .io = testing.io, .gpa = testing.allocator, .handler = h2TestHandler, .config = .{} };
+    const t = try std.Thread.spawn(.{}, serveRawH2OnFd, .{ &srv, fds[0] });
+    defer t.join();
+    defer _ = c.close(fds[1]);
+
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [4096]u8 = undefined;
+    var reader = peerStream(fds[1]).reader(testing.io, &rbuf);
+    var writer = peerStream(fds[1]).writer(testing.io, &wbuf);
+    try writer.interface.writeAll(preface);
+    try writer.interface.flush();
+    var settings = try readFrameOfType(testing.allocator, &reader.interface, .settings);
+    settings.deinit(testing.allocator);
+    try writeFrame(&writer.interface, .settings, 0, 0, "");
+    try writeFrame(&writer.interface, .settings, flag_ack, 0, "");
+
+    // Stream 1: complete a bodyless request and drain its response to END_STREAM,
+    // so the handler has finished (stream closing/closed).
+    try writeFrame(&writer.interface, .headers, flag_end_headers | flag_end_stream, 1, &trailers_req_block);
+    while (true) {
+        var f = try readFrameAlloc(testing.allocator, &reader.interface);
+        const es = f.header.flags & flag_end_stream != 0 and (f.header.ftype == .data or f.header.ftype == .headers);
+        f.deinit(testing.allocator);
+        if (es) break;
+    }
+    // A fresh HEADERS on the now-closed stream 1: RST(STREAM_CLOSED), connection alive.
+    try writeFrame(&writer.interface, .headers, flag_end_headers | flag_end_stream, 1, &trailers_req_block);
+    var rst = try readFrameOfType(testing.allocator, &reader.interface, .rst_stream);
+    defer rst.deinit(testing.allocator);
+    try testing.expectEqual(@as(u31, 1), rst.header.sid);
+    try testing.expectEqual(@as(u32, @intFromEnum(ErrorCode.stream_closed)), std.mem.readInt(u32, rst.payload[0..4], .big));
 }

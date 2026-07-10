@@ -32,6 +32,7 @@ pub const ErrorCode = enum(u32) {
     protocol_error = 0x1,
     internal_error = 0x2,
     flow_control_error = 0x3,
+    stream_closed = 0x5,
     frame_size_error = 0x6,
     refused_stream = 0x7,
     cancel = 0x8,
