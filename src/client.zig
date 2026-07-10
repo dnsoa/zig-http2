@@ -670,25 +670,35 @@ pub const Client = struct {
         if (payload.len < 4) return;
         const incr: i64 = @intCast(std.mem.readInt(u32, payload[0..4], .big) & 0x7fff_ffff);
         if (incr == 0) return error.ProtocolError;
-        self.streams_mu.lockUncancelable(self.io);
-        defer self.streams_mu.unlock(self.io);
-        self.send_mu.lockUncancelable(self.io);
-        defer self.send_mu.unlock(self.io);
-        if (sid == 0) {
-            if (self.conn_send_window + incr > 0x7fff_ffff) return error.FlowControlError;
-            self.conn_send_window += incr;
-        } else if (self.streams.get(sid)) |st| {
-            if (st.send_window + incr > 0x7fff_ffff) {
-                // Stream overflow: reset just that stream (RFC 7540 §6.9.1).
-                st.send_window = 0;
-                var p: [4]u8 = undefined;
-                std.mem.writeInt(u32, &p, @intFromEnum(p2.ErrorCode.flow_control_error), .big);
-                self.writeFrame(.rst_stream, 0, sid, &p) catch {};
-            } else {
-                st.send_window += incr;
+        var overflow_sid: ?u31 = null;
+        {
+            self.streams_mu.lockUncancelable(self.io);
+            defer self.streams_mu.unlock(self.io);
+            self.send_mu.lockUncancelable(self.io);
+            defer self.send_mu.unlock(self.io);
+            if (sid == 0) {
+                if (self.conn_send_window + incr > 0x7fff_ffff) return error.FlowControlError;
+                self.conn_send_window += incr;
+            } else if (self.streams.get(sid)) |st| {
+                if (st.send_window + incr > 0x7fff_ffff) {
+                    // Stream overflow: reset just that stream (RFC 7540 §6.9.1).
+                    // Defer the RST_STREAM write until the locks are released.
+                    st.send_window = 0;
+                    overflow_sid = sid;
+                } else {
+                    st.send_window += incr;
+                }
             }
+            self.send_cond.broadcast(self.io);
         }
-        self.send_cond.broadcast(self.io);
+        // Send the reset outside streams_mu/send_mu: writeFrame takes write_mu,
+        // and openStream takes write_mu -> streams_mu, so holding streams_mu
+        // across write_mu here would be a lock-order inversion (deadlock).
+        if (overflow_sid) |osid| {
+            var p: [4]u8 = undefined;
+            std.mem.writeInt(u32, &p, @intFromEnum(p2.ErrorCode.flow_control_error), .big);
+            self.writeFrame(.rst_stream, 0, osid, &p) catch {};
+        }
     }
 
     fn applyPeerSettings(self: *Client, payload: []const u8) void {

@@ -14,11 +14,12 @@
 //!   h2.serveConn(&srv, &reader, &writer, null, "https");
 //!
 //!   // Client: wrap a transport, open a stream, send + read.
-//!   var c = try h2.Client.init(io, gpa, &reader, &writer);
+//!   var c: h2.Client = undefined;
+//!   try c.init(io, gpa, &reader, &writer);
 //!   defer c.deinit();
-//!   const sid = try c.openStream(.{ .path = "/svc/Echo" }, false);
-//!   try c.sendData(sid, "ping", true);
-//!   // ... c.readEvent(arena) yields headers / data / trailers
+//!   const s = try c.openStream(.{ .path = "/svc/Echo" }, false);
+//!   try s.send("ping", true);
+//!   // s.readEvent(arena) yields .headers / .data / .rst / .goaway
 //!   ```
 //!
 //! gRPC readiness: trailers, streaming request bodies (`ctx.body_reader`), and
