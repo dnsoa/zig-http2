@@ -192,20 +192,35 @@ const H2Stream = struct {
     rx_off: usize = 0,
     rx_eof: bool = false,
 
-    /// Per-RPC deadline (absolute awake-clock timestamp). When set, a watchdog
-    /// thread aborts blocking body/response I/O past it with DeadlineExceeded.
+    /// Per-RPC deadline (absolute awake-clock timestamp), guarded by `deadline_mu`.
     deadline: ?Io.Timestamp = null,
+    deadline_mu: Io.Mutex = .init,
     timed_out: std.atomic.Value(bool) = .init(false),
-    /// Set by the worker as it exits so the watchdog stops early (it's joined
-    /// before the stream is freed, so its `*H2Stream` stays valid until then).
+    /// Set by the worker as it exits (one-way, never cleared); the watchdog
+    /// uses it to distinguish "worker finished" from "re-armed".
     done: std.atomic.Value(bool) = .init(false),
-    deadline_thread: ?std.Thread = null,
+    /// Whether the watchdog has been started (worker-thread-only; no lock needed).
+    armed: bool = false,
+    /// Merged wakeup: set when the worker finishes (after setting `done`) or
+    /// when `armDeadline` re-arms; the watchdog `reset`s it after handling.
+    wake_event: Io.Event = .unset,
+    /// Set by the watchdog just before it exits; the worker waits on this
+    /// before freeing `self` (replaces the old `deadline_thread.join()`).
+    watchdog_done: Io.Event = .unset,
 
-    /// Arms (or tightens) the per-RPC deadline, spawning the watchdog once.
+    /// Sets/tightens/extends the per-RPC deadline; the first call starts the
+    /// watchdog, subsequent calls wake it up to re-read the new deadline.
+    /// Only called from this stream's worker thread (handler → ctx.setDeadline).
     fn armDeadline(self: *H2Stream, deadline: Io.Timestamp) void {
-        self.deadline = deadline;
-        if (self.deadline_thread == null) {
-            self.deadline_thread = std.Thread.spawn(.{}, deadlineWatchdog, .{self}) catch null;
+        const conn = self.conn;
+        self.deadline_mu.lockUncancelable(conn.io);
+        self.deadline = deadline; // write the deadline (source of truth) first
+        self.deadline_mu.unlock(conn.io);
+        if (!self.armed) {
+            self.armed = true;
+            if (!spawnTask(conn, deadlineWaiter, .{self})) self.armed = false;
+        } else {
+            self.wake_event.set(conn.io); // wake the existing watchdog to re-read the (possibly earlier) deadline
         }
     }
 
@@ -285,27 +300,59 @@ fn h2SetDeadline(opaque_ctx: *anyopaque, deadline: Io.Timestamp) void {
     st.armDeadline(deadline);
 }
 
-/// Polls the stream's deadline; on expiry flips `timed_out`+`reset` and wakes
-/// any body/response I/O blocked on `rx_cond`/`send_cond`. Runs only while the
-/// worker owns the stream — it sets `done` and joins us before freeing it.
-fn deadlineWatchdog(st: *H2Stream) void {
+/// Fires the timeout: flips `timed_out`+`reset` and wakes any body/response
+/// I/O blocked on `rx_cond`/`send_cond` (same effect as the old watchdog).
+fn fireDeadline(st: *H2Stream) void {
     const conn = st.conn;
-    while (!st.done.load(.acquire)) {
-        if (st.deadline) |dl| {
-            if (Io.Timestamp.now(conn.io, .awake).nanoseconds >= dl.nanoseconds) {
-                st.timed_out.store(true, .release);
-                st.reset.store(true, .release);
-                st.rx_mu.lockUncancelable(conn.io);
-                st.rx_cond.broadcast(conn.io);
-                st.rx_mu.unlock(conn.io);
-                conn.send_mu.lockUncancelable(conn.io);
-                conn.send_cond.broadcast(conn.io);
-                conn.send_mu.unlock(conn.io);
-                return;
-            }
-        } else return;
-        Io.sleep(conn.io, .{ .nanoseconds = 10 * std.time.ns_per_ms }, .awake) catch {};
+    st.timed_out.store(true, .release);
+    st.reset.store(true, .release);
+    st.rx_mu.lockUncancelable(conn.io);
+    st.rx_cond.broadcast(conn.io);
+    st.rx_mu.unlock(conn.io);
+    conn.send_mu.lockUncancelable(conn.io);
+    conn.send_cond.broadcast(conn.io);
+    conn.send_mu.unlock(conn.io);
+}
+
+/// Watchdog task: blocks on a single `wake_event` until the deadline arrives,
+/// the worker finishes, or the deadline is re-armed. No polling, no nested
+/// task spawning (`waitTimeout` is a single underlying `futexWaitTimeout`).
+fn deadlineWaiter(st: *H2Stream) void {
+    const conn = st.conn;
+    while (true) {
+        st.deadline_mu.lockUncancelable(conn.io);
+        const dl = st.deadline.?;
+        st.deadline_mu.unlock(conn.io);
+
+        st.wake_event.waitTimeout(conn.io, .{ .deadline = dl.withClock(.awake) }) catch |err| switch (err) {
+            error.Timeout => {
+                // Timer fired or spurious wakeup: re-check against the current deadline.
+                const now = Io.Timestamp.now(conn.io, .awake);
+                st.deadline_mu.lockUncancelable(conn.io);
+                const cur = st.deadline.?;
+                st.deadline_mu.unlock(conn.io);
+                if (now.nanoseconds >= cur.nanoseconds) {
+                    fireDeadline(st);
+                    break;
+                }
+                continue; // spurious wakeup / deadline extended → re-wait with the latest dl
+            },
+            else => break, // error.Canceled → exit without firing
+        };
+
+        // wake_event was set: worker finished, or we were re-armed.
+        if (st.done.load(.acquire)) break; // worker finished → do not fire
+        st.wake_event.reset(); // claim this wakeup (not currently waiting, so reset's precondition holds)
+        if (st.done.load(.acquire)) break; // re-check: don't lose a `done` racing the reset
+        // otherwise this was a re-arm (tighten/extend) → loop back with the new dl
     }
+    st.watchdog_done.set(conn.io); // the watchdog's last touch of `st`
+    // The watchdog is also a spawnTask-counted task; give back the count on exit
+    // (touches only `conn`):
+    conn.workers_mu.lockUncancelable(conn.io);
+    conn.active_workers -= 1;
+    conn.workers_cond.signal(conn.io);
+    conn.workers_mu.unlock(conn.io);
 }
 
 /// Response sink that frames a handler's output onto an HTTP/2 stream.
@@ -989,8 +1036,14 @@ fn runStream(st: *H2Stream) void {
     const conn = st.conn;
     defer {
         // Stop the deadline watchdog first and reap it before freeing `st`.
-        st.done.store(true, .release);
-        if (st.deadline_thread) |w| w.join();
+        st.done.store(true, .release); // one-way set, before the wakeup
+        if (st.armed) {
+            st.wake_event.set(conn.io); // wake the watchdog so it observes `done`
+            // Must be uncancelable: if `wait` returned early due to cancellation,
+            // the watchdog could still be touching `st`, and freeing it afterward
+            // would be a use-after-free. Equivalent to the old `thread.join()`.
+            st.watchdog_done.waitUncancelable(conn.io);
+        }
         removeStream(conn, st.id);
         st.rx_buf.deinit(conn.gpa);
         st.arena_state.deinit();
@@ -1313,6 +1366,60 @@ fn deadlineReadHandler(ctx: *types.Context) anyerror!void {
         }
     }
     return error.TestUnexpectedResult;
+}
+
+var tighten_fired = std.atomic.Value(bool).init(false);
+var extend_fired = std.atomic.Value(bool).init(false);
+
+/// Sets a far deadline, then tightens it to a near one, then blocks reading
+/// the body. A correct implementation must fire at the "nearer" deadline,
+/// not wait for the original far one.
+fn tightenDeadlineHandler(ctx: *types.Context) anyerror!void {
+    ctx.setDeadlineIn(10 * std.time.ns_per_s); // far
+    ctx.setDeadlineIn(80 * std.time.ns_per_ms); // tighten to near
+    if (ctx.body_reader) |br| {
+        var tmp: [64]u8 = undefined;
+        while (true) {
+            const n = br.read(&tmp) catch |err| switch (err) {
+                error.DeadlineExceeded => {
+                    tighten_fired.store(true, .release);
+                    return err;
+                },
+                else => return err,
+            };
+            if (n == 0) break;
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
+/// Sets a near deadline, then extends it to a far one, then blocks reading
+/// the body. A correct implementation must defer to the "farther" deadline:
+/// it must not fire within the short window.
+fn extendDeadlineHandler(ctx: *types.Context) anyerror!void {
+    ctx.setDeadlineIn(80 * std.time.ns_per_ms); // near
+    ctx.setDeadlineIn(10 * std.time.ns_per_s); // extend to far
+    if (ctx.body_reader) |br| {
+        var tmp: [64]u8 = undefined;
+        while (true) {
+            const n = br.read(&tmp) catch |err| switch (err) {
+                error.DeadlineExceeded => {
+                    extend_fired.store(true, .release);
+                    return err;
+                },
+                else => return err,
+            };
+            if (n == 0) break;
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
+/// Sets a far deadline then finishes immediately — the watchdog must be
+/// reclaimed promptly, not left idling until the deadline.
+fn armLongDeadlineHandler(ctx: *types.Context) anyerror!void {
+    ctx.setDeadlineIn(10 * std.time.ns_per_s);
+    try ctx.res.send(200, "text/plain", "ok");
 }
 
 /// Wraps `fd` as a stream and drives one h2 connection over it (plain, no TLS).
@@ -2053,4 +2160,133 @@ test "h2: server serves many concurrent streams via group workers and drains cle
     for (0..N) |i| threads[i] = std.Thread.spawn(.{}, Worker.run, .{ &client, i, &success }) catch return;
     for (threads) |th| th.join();
     try testing.expectEqual(@as(u32, N), success.load(.acquire));
+}
+
+test "h2: tightening a deadline fires at the earlier time (no regression)" {
+    const fds = try newSocketPair();
+    errdefer _ = c.close(fds[1]);
+    var srv: Server = .{
+        .io = testing.io,
+        .gpa = testing.allocator,
+        .handler = tightenDeadlineHandler,
+        .config = .{},
+    };
+    const t = try std.Thread.spawn(.{}, serveRawH2OnFd, .{ &srv, fds[0] });
+    defer t.join();
+    defer _ = c.close(fds[1]);
+
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [4096]u8 = undefined;
+    var reader = peerStream(fds[1]).reader(testing.io, &rbuf);
+    var writer = peerStream(fds[1]).writer(testing.io, &wbuf);
+    try writer.interface.writeAll(preface);
+    try writer.interface.flush();
+    var settings = try readFrameAlloc(testing.allocator, &reader.interface);
+    settings.deinit(testing.allocator);
+    try writeFrame(&writer.interface, .settings, 0, 0, "");
+    try writeFrame(&writer.interface, .settings, flag_ack, 0, "");
+    // No END_STREAM → the handler blocks on body_reader until the (tightened) deadline fires.
+    const req_block = [_]u8{
+        0x82, 0x86, 0x84, 0x41, 0x0f, 0x77, 0x77, 0x77, 0x2e, 0x65,
+        0x78, 0x61, 0x6d, 0x70, 0x6c, 0x65, 0x2e, 0x63, 0x6f, 0x6d,
+    };
+    try writeFrame(&writer.interface, .headers, flag_end_headers, 1, &req_block);
+
+    // The tightened deadline is 80ms; wait well past it but well below 10s.
+    // If the implementation degenerates to only honoring the first (10s)
+    // deadline, it will not have fired yet here → test fails.
+    Io.sleep(testing.io, .{ .nanoseconds = 400 * std.time.ns_per_ms }, .awake) catch {};
+    try testing.expect(tighten_fired.load(.acquire));
+}
+
+test "h2: extending a deadline pushes the timeout later (no regression)" {
+    const fds = try newSocketPair();
+    errdefer _ = c.close(fds[1]);
+    var srv: Server = .{
+        .io = testing.io,
+        .gpa = testing.allocator,
+        .handler = extendDeadlineHandler,
+        .config = .{},
+    };
+    const t = try std.Thread.spawn(.{}, serveRawH2OnFd, .{ &srv, fds[0] });
+    defer t.join();
+    defer _ = c.close(fds[1]);
+
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [4096]u8 = undefined;
+    var reader = peerStream(fds[1]).reader(testing.io, &rbuf);
+    var writer = peerStream(fds[1]).writer(testing.io, &wbuf);
+    try writer.interface.writeAll(preface);
+    try writer.interface.flush();
+    var settings = try readFrameAlloc(testing.allocator, &reader.interface);
+    settings.deinit(testing.allocator);
+    try writeFrame(&writer.interface, .settings, 0, 0, "");
+    try writeFrame(&writer.interface, .settings, flag_ack, 0, "");
+    const req_block = [_]u8{
+        0x82, 0x86, 0x84, 0x41, 0x0f, 0x77, 0x77, 0x77, 0x2e, 0x65,
+        0x78, 0x61, 0x6d, 0x70, 0x6c, 0x65, 0x2e, 0x63, 0x6f, 0x6d,
+    };
+    try writeFrame(&writer.interface, .headers, flag_end_headers, 1, &req_block);
+
+    // The extended deadline is 10s; wait well past the original 80ms but well
+    // below 10s. A correct implementation must NOT have fired yet here (the
+    // watchdog re-waits on the later deadline); if it degenerates to only
+    // honoring the first (80ms) deadline, it will have fired already → fails.
+    Io.sleep(testing.io, .{ .nanoseconds = 400 * std.time.ns_per_ms }, .awake) catch {};
+    try testing.expect(!extend_fired.load(.acquire));
+}
+
+test "h2: deadline watchdog is reclaimed promptly when the handler finishes early" {
+    const fds = try newSocketPair();
+    var srv: Server = .{
+        .io = testing.io,
+        .gpa = testing.allocator,
+        .handler = armLongDeadlineHandler,
+        .config = .{},
+    };
+    const t = try std.Thread.spawn(.{}, serveRawH2OnFd, .{ &srv, fds[0] });
+
+    // `shut` guard: if any `try` fails, the defer performs close+join;
+    // the success path closes+joins explicitly and sets it true first.
+    var shut = false;
+    defer if (!shut) {
+        _ = c.close(fds[1]);
+        t.join();
+    };
+
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [4096]u8 = undefined;
+    var reader = peerStream(fds[1]).reader(testing.io, &rbuf);
+    var writer = peerStream(fds[1]).writer(testing.io, &wbuf);
+    try writer.interface.writeAll(preface);
+    try writer.interface.flush();
+    var settings = try readFrameAlloc(testing.allocator, &reader.interface);
+    settings.deinit(testing.allocator);
+    try writeFrame(&writer.interface, .settings, 0, 0, "");
+    try writeFrame(&writer.interface, .settings, flag_ack, 0, "");
+    // END_STREAM: no body, so the handler returns immediately.
+    const req_block = [_]u8{
+        0x82, 0x86, 0x84, 0x41, 0x0f, 0x77, 0x77, 0x77, 0x2e, 0x65,
+        0x78, 0x61, 0x6d, 0x70, 0x6c, 0x65, 0x2e, 0x63, 0x6f, 0x6d,
+    };
+    try writeFrame(&writer.interface, .headers, flag_end_headers | flag_end_stream, 1, &req_block);
+
+    // Read the response's END_STREAM to confirm the handler has finished.
+    var saw_end = false;
+    while (!saw_end) {
+        var f = try readFrameAlloc(testing.allocator, &reader.interface);
+        defer f.deinit(testing.allocator);
+        if ((f.header.flags & flag_end_stream) != 0 and
+            (f.header.ftype == .data or f.header.ftype == .headers)) saw_end = true;
+    }
+
+    // Close the client side → server readLoop sees EOF → drainWorkers. Time the close+join.
+    // If the watchdog can only sleep until the 10s deadline, the worker would be
+    // stuck in its cleanup defer for ~10s, and join would be dragged along with it.
+    const start = Io.Timestamp.now(testing.io, .awake).nanoseconds;
+    shut = true;
+    _ = c.close(fds[1]);
+    t.join();
+    const elapsed_ms = @divFloor(Io.Timestamp.now(testing.io, .awake).nanoseconds - start, std.time.ns_per_ms);
+    try testing.expect(elapsed_ms < 2000);
 }
