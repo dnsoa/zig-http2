@@ -79,6 +79,16 @@ pub const Decoder = struct {
     /// evicts entries on a later block (safe to hand to a worker thread).
     pub fn decode(self: *Decoder, arena: std.mem.Allocator, block: []const u8) Error![]Header {
         var out: std.ArrayList(Header) = .empty;
+        // On any decode error (e.g. a malformed/hostile block), free everything
+        // already duped so a caller passing a real allocator (the client uses
+        // gpa, not an arena) does not leak on every rejected block.
+        errdefer {
+            for (out.items) |h| {
+                arena.free(h.name);
+                arena.free(h.value);
+            }
+            out.deinit(arena);
+        }
         var list_size: usize = 0;
         var i: usize = 0;
         while (i < block.len) {
@@ -140,6 +150,8 @@ pub const Decoder = struct {
             name = s.value;
             i += s.len;
         }
+        // `name` is duped; if the value decode fails, free it so it doesn't leak.
+        errdefer arena.free(name);
         const v = decStr(data[i..], arena) catch return Error.Truncated;
         i += v.len;
         return .{ .name = name, .value = v.value, .consumed = i };
@@ -465,6 +477,17 @@ test "decode rejects an HPACK decompression bomb (bounded header-list size)" {
     var dec = Decoder.init(testing.allocator, 4096);
     defer dec.deinit();
     try testing.expectError(Error.HeaderListTooLarge, dec.decode(arena, block.items));
+}
+
+test "decode frees partial allocations when a block is malformed (no leak)" {
+    var dec = Decoder.init(testing.allocator, 4096);
+    defer dec.deinit();
+    // A valid indexed field (:method GET, both duped) followed by a literal
+    // whose value string is truncated. The decoder allocated ":method", "GET",
+    // and the literal name "a" before failing; all must be freed on the error
+    // path or testing.allocator flags a leak.
+    const block = [_]u8{ 0x82, 0x40, 0x01, 'a' };
+    try testing.expectError(Error.Truncated, dec.decode(testing.allocator, &block));
 }
 
 test "hpack integer decode rejects overflow instead of panicking" {
