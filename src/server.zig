@@ -2240,65 +2240,38 @@ test "h2: per-RPC deadline aborts a blocked body read" {
     try testing.expect(saw_deadline.load(.acquire));
 }
 
-test "h2 client: multiplexes concurrent streams over one connection" {
-    const client_mod = @import("client.zig");
-    const fds = try newSocketPair();
-    errdefer _ = c.close(fds[1]);
-    var srv: Server = .{
-        .io = testing.io,
-        .gpa = testing.allocator,
-        .handler = h2EchoHandler,
-        .config = .{},
-    };
-    const t = try std.Thread.spawn(.{}, serveRawH2OnFd, .{ &srv, fds[0] });
-    defer t.join();
-    defer _ = c.close(fds[1]);
-
-    var rbuf: [8192]u8 = undefined;
-    var wbuf: [8192]u8 = undefined;
-    var reader = peerStream(fds[1]).reader(testing.io, &rbuf);
-    var writer = peerStream(fds[1]).writer(testing.io, &wbuf);
-    var client: client_mod.Client = undefined;
-    try client.init(testing.io, testing.allocator, &reader.interface, &writer.interface);
-    defer client.deinit(); // must stop the client reader before fds[1] closes
-
-    const N = 4;
-    const Worker = struct {
-        fn run(cli: *client_mod.Client, idx: usize, ok: *std.atomic.Value(u32)) void {
-            var body_buf: [40]u8 = undefined;
-            const body = std.fmt.bufPrint(&body_buf, "hello from stream {d}", .{idx}) catch return;
-            const s = cli.openStream(.{ .path = "/echo", .method = "POST" }, false) catch return;
-            s.send(body, true) catch return;
-            var arena_state = std.heap.ArenaAllocator.init(cli.gpa);
-            defer arena_state.deinit();
-            const arena = arena_state.allocator();
-            var got = std.ArrayList(u8).empty;
-            defer got.deinit(cli.gpa);
-            while (true) {
-                const ev = s.readEvent(arena) catch return;
-                switch (ev) {
-                    .data => |d| {
-                        got.appendSlice(cli.gpa, d.payload) catch return;
-                        if (d.end_stream) break;
-                    },
-                    .headers => |h| if (h.end_stream) {
-                        break;
-                    },
-                    .rst, .goaway => return,
-                }
-            }
-            if (std.mem.eql(u8, got.items, body)) _ = ok.fetchAdd(1, .acq_rel);
+/// Shared body for the concurrent-streams tests: open a stream, send a body,
+/// read the echo to end-of-stream, and bump `ok` if it round-tripped. `cli` is
+/// `anytype` so this stays a module-level helper without importing client.zig
+/// at module scope — the type resolves at each test's call site.
+fn echoStreamWorker(cli: anytype, idx: usize, ok: *std.atomic.Value(u32)) void {
+    var body_buf: [40]u8 = undefined;
+    const body = std.fmt.bufPrint(&body_buf, "stream {d}", .{idx}) catch return;
+    const s = cli.openStream(.{ .path = "/echo", .method = "POST" }, false) catch return;
+    s.send(body, true) catch return;
+    var arena_state = std.heap.ArenaAllocator.init(cli.gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var got = std.ArrayList(u8).empty;
+    defer got.deinit(cli.gpa);
+    while (true) {
+        const ev = s.readEvent(arena) catch return;
+        switch (ev) {
+            .data => |d| {
+                got.appendSlice(cli.gpa, d.payload) catch return;
+                if (d.end_stream) break;
+            },
+            .headers => |h| if (h.end_stream) break,
+            .rst, .goaway => return,
         }
-    };
-
-    var success = std.atomic.Value(u32).init(0);
-    var threads: [N]std.Thread = undefined;
-    for (0..N) |i| threads[i] = std.Thread.spawn(.{}, Worker.run, .{ &client, i, &success }) catch return;
-    for (threads) |th| th.join();
-    try testing.expectEqual(@as(u32, N), success.load(.acquire));
+    }
+    if (std.mem.eql(u8, got.items, body)) {
+        _ = ok.fetchAdd(1, .acq_rel);
+        s.close();
+    }
 }
 
-test "h2: server serves many concurrent streams via group workers and drains cleanly" {
+fn runConcurrentEchoStreams(comptime N: usize) !void {
     const client_mod = @import("client.zig");
     const fds = try newSocketPair();
     errdefer _ = c.close(fds[1]);
@@ -2312,49 +2285,69 @@ test "h2: server serves many concurrent streams via group workers and drains cle
     defer t.join();
     defer _ = c.close(fds[1]);
 
+    // Sized to comfortably hold N concurrent streams' frames.
     var rbuf: [16384]u8 = undefined;
     var wbuf: [16384]u8 = undefined;
     var reader = peerStream(fds[1]).reader(testing.io, &rbuf);
     var writer = peerStream(fds[1]).writer(testing.io, &wbuf);
     var client: client_mod.Client = undefined;
     try client.init(testing.io, testing.allocator, &reader.interface, &writer.interface);
-    defer client.deinit();
-
-    const N = 16;
-    const Worker = struct {
-        fn run(cli: *client_mod.Client, idx: usize, ok: *std.atomic.Value(u32)) void {
-            var body_buf: [40]u8 = undefined;
-            const body = std.fmt.bufPrint(&body_buf, "stream {d}", .{idx}) catch return;
-            const s = cli.openStream(.{ .path = "/echo", .method = "POST" }, false) catch return;
-            s.send(body, true) catch return;
-            var arena_state = std.heap.ArenaAllocator.init(cli.gpa);
-            defer arena_state.deinit();
-            const arena = arena_state.allocator();
-            var got = std.ArrayList(u8).empty;
-            defer got.deinit(cli.gpa);
-            while (true) {
-                const ev = s.readEvent(arena) catch return;
-                switch (ev) {
-                    .data => |d| {
-                        got.appendSlice(cli.gpa, d.payload) catch return;
-                        if (d.end_stream) break;
-                    },
-                    .headers => |h| if (h.end_stream) break,
-                    .rst, .goaway => return,
-                }
-            }
-            if (std.mem.eql(u8, got.items, body)) {
-                _ = ok.fetchAdd(1, .acq_rel);
-                s.close();
-            }
-        }
-    };
+    defer client.deinit(); // must stop the client reader before fds[1] closes
 
     var success = std.atomic.Value(u32).init(0);
     var threads: [N]std.Thread = undefined;
-    for (0..N) |i| threads[i] = std.Thread.spawn(.{}, Worker.run, .{ &client, i, &success }) catch return;
+    for (0..N) |i| threads[i] = std.Thread.spawn(.{}, echoStreamWorker, .{ &client, i, &success }) catch return;
     for (threads) |th| th.join();
     try testing.expectEqual(@as(u32, N), success.load(.acquire));
+}
+
+test "h2 client: multiplexes concurrent streams over one connection" {
+    try runConcurrentEchoStreams(4);
+}
+
+test "h2: server serves many concurrent streams via group workers and drains cleanly" {
+    try runConcurrentEchoStreams(16);
+}
+
+test "h2: worker spawn falls back to a thread when the Io backend has no concurrency" {
+    // A backend whose `concurrent`/`groupConcurrent` always return
+    // ConcurrencyUnavailable, forcing spawnTask down its std.Thread fallback.
+    var threaded = std.Io.Threaded.init(testing.allocator, .{ .concurrent_limit = .nothing });
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const fds = try newSocketPair();
+    errdefer _ = c.close(fds[1]);
+    var srv: Server = .{ .io = io, .gpa = testing.allocator, .handler = h2TestHandler, .config = .{} };
+    const t = try std.Thread.spawn(.{}, serveRawH2OnFd, .{ &srv, fds[0] });
+    defer t.join();
+    defer _ = c.close(fds[1]);
+
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [4096]u8 = undefined;
+    var reader = peerStream(fds[1]).reader(io, &rbuf);
+    var writer = peerStream(fds[1]).writer(io, &wbuf);
+    try writer.interface.writeAll(preface);
+    try writer.interface.flush();
+    var settings = try readFrameOfType(testing.allocator, &reader.interface, .settings);
+    settings.deinit(testing.allocator);
+    try writeFrame(&writer.interface, .settings, 0, 0, "");
+    try writeFrame(&writer.interface, .settings, flag_ack, 0, "");
+    const req_block = [_]u8{
+        0x82, 0x86, 0x84, 0x41, 0x0f, 0x77, 0x77, 0x77, 0x2e, 0x65,
+        0x78, 0x61, 0x6d, 0x70, 0x6c, 0x65, 0x2e, 0x63, 0x6f, 0x6d,
+    };
+    try writeFrame(&writer.interface, .headers, flag_end_headers | flag_end_stream, 1, &req_block);
+
+    // The worker ran via the fallback thread, so the response still arrives.
+    var resp = try readFrameOfType(testing.allocator, &reader.interface, .headers);
+    defer resp.deinit(testing.allocator);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var dec = hpack.Decoder.init(testing.allocator, our_header_table_size);
+    defer dec.deinit();
+    const hs = try dec.decode(arena.allocator(), resp.payload);
+    try testing.expectEqualStrings("200", findHeaderValue(hs, ":status").?);
 }
 
 test "h2: tightening a deadline fires at the earlier time (no regression)" {
