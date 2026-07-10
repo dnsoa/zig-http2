@@ -70,6 +70,10 @@ pub const Config = struct {
     max_frame_size: u32 = our_max_frame_size,
     /// SETTINGS_INITIAL_WINDOW_SIZE we advertise for stream-level flow control
     /// on DATA we receive — the peer's initial send window into us (0..2^31-1).
+    /// NOTE: values below 65535 can cause a spec-compliant client to be reset:
+    /// until it processes our SETTINGS it uses the RFC default 65535-byte stream
+    /// window and may overshoot the smaller value we advertise. Keep >= 65535
+    /// unless clients are known to wait for SETTINGS before sending body DATA.
     initial_window_size: u32 = @intCast(default_window),
     /// Connection-level inbound flow-control window (aggregate across streams).
     /// RFC's fixed initial is 65535; if larger, we enlarge via a stream-0
@@ -1183,6 +1187,9 @@ fn rstStreamCode(conn: *Connection, sid: u31, code: ErrorCode) void {
 /// Emits a single WINDOW_UPDATE frame (increment > 0). Best-effort; window
 /// values are <= 2^31-1 so `incr` fits in the 31-bit field.
 fn sendWindowUpdate(conn: *Connection, sid: u31, incr: i64) void {
+    // Increment must fit the 31-bit WINDOW_UPDATE field; a single credit never
+    // exceeds the connection/stream window, which is <= 2^31-1.
+    std.debug.assert(incr > 0 and incr <= 0x7fff_ffff);
     var wu: [4]u8 = undefined;
     std.mem.writeInt(u32, &wu, @intCast(incr & 0x7fff_ffff), .big);
     conn.cw.frame(.window_update, 0, sid, &wu) catch {};
