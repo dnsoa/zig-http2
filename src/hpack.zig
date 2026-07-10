@@ -126,8 +126,8 @@ pub const Decoder = struct {
 /// (h2 requires it) and connection-specific headers are dropped.
 pub const Encoder = struct {
     /// Appends a complete response header block (`:status` first, then `headers`)
-    /// to `out`. `headers` names may be any case; values are emitted raw (no
-    /// Huffman — valid and easy to inspect; compression is a later optimization).
+    /// to `out`. `headers` names may be any case; names/values are Huffman-encoded
+    /// via `emitLiteral`'s shorter-of-two choice (RFC 7541 §5.2), raw otherwise.
     pub fn encodeResponse(
         arena: std.mem.Allocator,
         out: *std.ArrayList(u8),
@@ -154,8 +154,9 @@ pub const Encoder = struct {
 
     /// Appends a complete **request** header block: the pseudo-headers
     /// `:method`/`:scheme`/`:path`/`:authority` (in order) followed by
-    /// `headers`. Used by the HTTP/2 client (e.g. a gRPC client). Values are
-    /// emitted raw (no Huffman); names are lowercased.
+    /// `headers`. Used by the HTTP/2 client (e.g. a gRPC client). Names are
+    /// lowercased; names/values are Huffman-encoded via `emitLiteral`'s
+    /// shorter-of-two choice (RFC 7541 §5.2), raw otherwise.
     pub fn encodeRequest(
         arena: std.mem.Allocator,
         out: *std.ArrayList(u8),
@@ -223,8 +224,10 @@ pub const Encoder = struct {
         const n = hp.encodeInteger(name_idx, 4, &buf) catch unreachable;
         // High nibble already 0x0 ⇒ "literal without indexing"; nothing to OR in.
         try out.appendSlice(arena, buf[0..n]);
-        if (name_idx == 0) try hp.encodeString(name, false, arena, out);
-        try hp.encodeString(value, false, arena, out);
+        // Shorter-of-two: Huffman-encode only when it is strictly smaller than
+        // the raw octets (RFC 7541 §5.2); never larger than raw.
+        if (name_idx == 0) try hp.encodeString(name, hp.huffmanLen(name) < name.len, arena, out);
+        try hp.encodeString(value, hp.huffmanLen(value) < value.len, arena, out);
     }
 };
 
@@ -315,7 +318,8 @@ test "decode literal with incremental indexing populates dynamic table (C.2.1)" 
     // 0x40 (literal+index, new name) "custom-key": "custom-header"
     const block = [_]u8{
         0x40, 0x0a, 'c', 'u', 's', 't', 'o', 'm', '-', 'k', 'e', 'y',
-        0x0d, 'c', 'u', 's', 't', 'o', 'm', '-', 'h', 'e', 'a', 'd', 'e', 'r',
+        0x0d, 'c',  'u', 's', 't', 'o', 'm', '-', 'h', 'e', 'a', 'd',
+        'e',  'r',
     };
     const hs = try dec.decode(arena, &block);
     try testing.expectEqualStrings("custom-header", findHeader(hs, "custom-key").?);
@@ -445,4 +449,73 @@ test "Huffman round trip over short and long codes" {
     const dec = try hp.HuffmanCodec.decode(enc, testing.allocator);
     defer testing.allocator.free(dec);
     try testing.expectEqualSlices(u8, &input, dec);
+}
+
+test "huffmanLen computes the Huffman-encoded byte length" {
+    try testing.expectEqual(@as(usize, 0), hp.huffmanLen(""));
+    // 'a' is a 5-bit code: 4*5 = 20 bits → 3 bytes.
+    try testing.expectEqual(@as(usize, 3), hp.huffmanLen("aaaa"));
+    // 0x00 is a 13-bit code: → 2 bytes.
+    try testing.expectEqual(@as(usize, 2), hp.huffmanLen("\x00"));
+}
+
+test "encode uses Huffman for a value when it is shorter" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var out: std.ArrayList(u8) = .empty;
+    const headers = [_]Header{.{ .name = "x-test", .value = "aaaaaaaaaaaaaaaa" }};
+    try Encoder.encodeResponse(arena, &out, 200, &headers);
+
+    // The value's full HPACK string representation, Huffman-encoded (H-bit set).
+    var exp: std.ArrayList(u8) = .empty;
+    try hp.encodeString("aaaaaaaaaaaaaaaa", true, arena, &exp);
+    try testing.expect(std.mem.indexOf(u8, out.items, exp.items) != null);
+
+    var dec = Decoder.init(testing.allocator, 4096);
+    defer dec.deinit();
+    const hs = try dec.decode(arena, out.items);
+    try testing.expectEqualStrings("aaaaaaaaaaaaaaaa", findHeader(hs, "x-test").?);
+}
+
+test "encode keeps a value raw when Huffman would not be shorter" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var out: std.ArrayList(u8) = .empty;
+    // 0x00 Huffman-encodes to 2 bytes vs 1 raw → shorter-of-two keeps it raw.
+    const headers = [_]Header{.{ .name = "x-test", .value = "\x00" }};
+    try Encoder.encodeResponse(arena, &out, 200, &headers);
+
+    var exp_raw: std.ArrayList(u8) = .empty;
+    try hp.encodeString("\x00", false, arena, &exp_raw);
+    try testing.expect(std.mem.indexOf(u8, out.items, exp_raw.items) != null);
+
+    var dec = Decoder.init(testing.allocator, 4096);
+    defer dec.deinit();
+    const hs = try dec.decode(arena, out.items);
+    try testing.expectEqualStrings("\x00", findHeader(hs, "x-test").?);
+}
+
+test "encode uses Huffman for a literal header name when it is shorter" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var out: std.ArrayList(u8) = .empty;
+    // Name not in the static table → literal-name path (name_idx == 0).
+    // Value is a single char that stays raw, isolating the name.
+    const headers = [_]Header{.{ .name = "x-custom-long-header-name", .value = "1" }};
+    try Encoder.encodeResponse(arena, &out, 200, &headers);
+
+    var exp_name: std.ArrayList(u8) = .empty;
+    try hp.encodeString("x-custom-long-header-name", true, arena, &exp_name);
+    try testing.expect(std.mem.indexOf(u8, out.items, exp_name.items) != null);
+
+    var dec = Decoder.init(testing.allocator, 4096);
+    defer dec.deinit();
+    const hs = try dec.decode(arena, out.items);
+    try testing.expectEqualStrings("1", findHeader(hs, "x-custom-long-header-name").?);
 }

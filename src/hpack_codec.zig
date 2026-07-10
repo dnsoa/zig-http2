@@ -489,3 +489,13 @@ pub const HuffmanCodec = struct {
         return result.toOwnedSlice(allocator);
     }
 };
+
+/// Byte length `str` would occupy Huffman-encoded (RFC 7541 §5.2): the sum of
+/// per-symbol code lengths in bits, rounded up to whole bytes (the EOS padding
+/// fills the final partial byte). Cheap O(n) scan, no allocation — used to
+/// decide whether Huffman is shorter than the raw string before encoding.
+pub fn huffmanLen(str: []const u8) usize {
+    var bits: usize = 0;
+    for (str) |b| bits += HuffmanCodec.lengths[b];
+    return (bits + 7) / 8;
+}
