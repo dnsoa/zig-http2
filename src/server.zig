@@ -394,6 +394,8 @@ const Connection = struct {
     workers_mu: Io.Mutex = .init,
     workers_cond: Io.Condition = .init,
     active_workers: u32 = 0,
+    // Worker 任务组:worker/看门狗都作为任务加入,drain 时统一 await。
+    worker_group: Io.Group = .init,
 
     closing: std.atomic.Value(bool) = .init(false),
 
@@ -466,6 +468,8 @@ const Connection = struct {
         self.workers_mu.lockUncancelable(self.io);
         while (self.active_workers > 0) self.workers_cond.waitUncancelable(self.io, &self.workers_mu);
         self.workers_mu.unlock(self.io);
+        // 所有任务已退出(计数归零);await 释放 group 自身资源,立即返回。
+        self.worker_group.await(self.io) catch {};
     }
 };
 
@@ -874,20 +878,36 @@ fn handleHeaders(conn: *Connection, r: *Io.Reader, fh: ParsedHeader, first: []co
     spawnWorker(conn, st);
 }
 
-/// Registers worker accounting and spawns the per-stream worker thread.
-fn spawnWorker(conn: *Connection, st: *H2Stream) void {
+/// 启动一个连接任务:优先交给调用方 Io 后端(Io.Group.concurrent),从而把
+/// "线程 vs 纤程" 留给后端决定;后端无并发能力时回退到 detach 的 OS 线程。
+/// 成功计入 active_workers(任务自己在退出时归还);两条路径都起不来才返回 false。
+/// `f` 的返回类型须可强转 Io.Cancelable!void(void 满足);`args` 显式声明为
+/// `f` 的 ArgsTuple,与 Io.Group.concurrent / std.Thread.spawn 的入参要求一致。
+fn spawnTask(conn: *Connection, comptime f: anytype, args: std.meta.ArgsTuple(@TypeOf(f))) bool {
     conn.workers_mu.lockUncancelable(conn.io);
     conn.active_workers += 1;
     conn.workers_mu.unlock(conn.io);
-
-    const t = std.Thread.spawn(.{}, runStream, .{st}) catch {
-        conn.workers_mu.lockUncancelable(conn.io);
-        conn.active_workers -= 1;
-        conn.workers_mu.unlock(conn.io);
-        removeStream(conn, st.id);
-        return;
+    conn.worker_group.concurrent(conn.io, f, args) catch |err| switch (err) {
+        error.ConcurrencyUnavailable => {
+            const t = std.Thread.spawn(.{}, f, args) catch {
+                conn.workers_mu.lockUncancelable(conn.io);
+                conn.active_workers -= 1;
+                conn.workers_mu.unlock(conn.io);
+                return false;
+            };
+            t.detach();
+        },
     };
-    t.detach();
+    return true;
+}
+
+/// Registers worker accounting and spawns the per-stream worker task.
+fn spawnWorker(conn: *Connection, st: *H2Stream) void {
+    if (spawnTask(conn, runStream, .{st})) return;
+    // 连回退线程都起不来:没有 worker 会接管并释放这条流,这里回收它。
+    removeStream(conn, st.id);
+    st.arena_state.deinit();
+    conn.gpa.destroy(st);
 }
 
 fn buildRequest(arena: std.mem.Allocator, decoded: []const hpack.Header) !types.Request {
@@ -1966,6 +1986,65 @@ test "h2 client: multiplexes concurrent streams over one connection" {
                 }
             }
             if (std.mem.eql(u8, got.items, body)) _ = ok.fetchAdd(1, .acq_rel);
+        }
+    };
+
+    var success = std.atomic.Value(u32).init(0);
+    var threads: [N]std.Thread = undefined;
+    for (0..N) |i| threads[i] = std.Thread.spawn(.{}, Worker.run, .{ &client, i, &success }) catch return;
+    for (threads) |th| th.join();
+    try testing.expectEqual(@as(u32, N), success.load(.acquire));
+}
+
+test "h2: server serves many concurrent streams via group workers and drains cleanly" {
+    const client_mod = @import("client.zig");
+    const fds = try newSocketPair();
+    errdefer _ = c.close(fds[1]);
+    var srv: Server = .{
+        .io = testing.io,
+        .gpa = testing.allocator,
+        .handler = h2EchoHandler,
+        .config = .{},
+    };
+    const t = try std.Thread.spawn(.{}, serveRawH2OnFd, .{ &srv, fds[0] });
+    defer t.join();
+    defer _ = c.close(fds[1]);
+
+    var rbuf: [16384]u8 = undefined;
+    var wbuf: [16384]u8 = undefined;
+    var reader = peerStream(fds[1]).reader(testing.io, &rbuf);
+    var writer = peerStream(fds[1]).writer(testing.io, &wbuf);
+    var client: client_mod.Client = undefined;
+    try client.init(testing.io, testing.allocator, &reader.interface, &writer.interface);
+    defer client.deinit();
+
+    const N = 16;
+    const Worker = struct {
+        fn run(cli: *client_mod.Client, idx: usize, ok: *std.atomic.Value(u32)) void {
+            var body_buf: [40]u8 = undefined;
+            const body = std.fmt.bufPrint(&body_buf, "stream {d}", .{idx}) catch return;
+            const s = cli.openStream(.{ .path = "/echo", .method = "POST" }, false) catch return;
+            s.send(body, true) catch return;
+            var arena_state = std.heap.ArenaAllocator.init(cli.gpa);
+            defer arena_state.deinit();
+            const arena = arena_state.allocator();
+            var got = std.ArrayList(u8).empty;
+            defer got.deinit(cli.gpa);
+            while (true) {
+                const ev = s.readEvent(arena) catch return;
+                switch (ev) {
+                    .data => |d| {
+                        got.appendSlice(cli.gpa, d.payload) catch return;
+                        if (d.end_stream) break;
+                    },
+                    .headers => |h| if (h.end_stream) break,
+                    .rst, .goaway => return,
+                }
+            }
+            if (std.mem.eql(u8, got.items, body)) {
+                _ = ok.fetchAdd(1, .acq_rel);
+                s.close();
+            }
         }
     };
 
