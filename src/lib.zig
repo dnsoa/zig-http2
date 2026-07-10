@@ -46,6 +46,7 @@ pub const Config = server_mod.Config;
 pub const serveConn = server_mod.serveConn;
 
 pub const Client = client_mod.Client;
+pub const Stream = client_mod.Stream;
 pub const RequestHead = client_mod.RequestHead;
 pub const Event = client_mod.Event;
 
@@ -58,4 +59,11 @@ test {
     _ = hpack;
     _ = server_mod;
     _ = client_mod;
+}
+
+test "Stream re-export names the client stream type" {
+    // External consumers store a `*h2.Stream` in their own structs (a field
+    // needs a namable type, unlike the type-inferred doc example), so the
+    // re-export must be exactly the type openStream hands out.
+    if (Stream != client_mod.Stream) @compileError("h2.Stream must be the client stream type");
 }
