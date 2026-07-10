@@ -441,7 +441,7 @@ const Connection = struct {
     workers_mu: Io.Mutex = .init,
     workers_cond: Io.Condition = .init,
     active_workers: u32 = 0,
-    // Worker 任务组:worker/看门狗都作为任务加入,drain 时统一 await。
+    // Worker task group: workers and watchdogs are added as tasks here; drained together via await.
     worker_group: Io.Group = .init,
 
     closing: std.atomic.Value(bool) = .init(false),
@@ -515,7 +515,7 @@ const Connection = struct {
         self.workers_mu.lockUncancelable(self.io);
         while (self.active_workers > 0) self.workers_cond.waitUncancelable(self.io, &self.workers_mu);
         self.workers_mu.unlock(self.io);
-        // 所有任务已退出(计数归零);await 释放 group 自身资源,立即返回。
+        // All tasks have exited (counter hit 0); await releases the group's own resources and returns immediately.
         self.worker_group.await(self.io) catch {};
     }
 };
@@ -925,11 +925,12 @@ fn handleHeaders(conn: *Connection, r: *Io.Reader, fh: ParsedHeader, first: []co
     spawnWorker(conn, st);
 }
 
-/// 启动一个连接任务:优先交给调用方 Io 后端(Io.Group.concurrent),从而把
-/// "线程 vs 纤程" 留给后端决定;后端无并发能力时回退到 detach 的 OS 线程。
-/// 成功计入 active_workers(任务自己在退出时归还);两条路径都起不来才返回 false。
-/// `f` 的返回类型须可强转 Io.Cancelable!void(void 满足);`args` 显式声明为
-/// `f` 的 ArgsTuple,与 Io.Group.concurrent / std.Thread.spawn 的入参要求一致。
+/// Launches a connection task: prefers the Io backend (Io.Group.concurrent) to let
+/// the backend choose between threads and fibers; falls back to a detached OS thread
+/// if the backend has no concurrency support. Increments active_workers on success
+/// (tasks decrement on exit); returns false only if both paths fail. f's return type
+/// must coerce to Io.Cancelable!void (void satisfies); args is f's ArgsTuple, matching
+/// the parameter expectations of Io.Group.concurrent / std.Thread.spawn.
 fn spawnTask(conn: *Connection, comptime f: anytype, args: std.meta.ArgsTuple(@TypeOf(f))) bool {
     conn.workers_mu.lockUncancelable(conn.io);
     conn.active_workers += 1;
@@ -951,8 +952,9 @@ fn spawnTask(conn: *Connection, comptime f: anytype, args: std.meta.ArgsTuple(@T
 /// Registers worker accounting and spawns the per-stream worker task.
 fn spawnWorker(conn: *Connection, st: *H2Stream) void {
     if (spawnTask(conn, runStream, .{st})) return;
-    // 连回退线程都起不来:没有 worker 会接管并释放这条流,这里回收它。
+    // Neither a group task nor a fallback thread could start: reclaim the stream.
     removeStream(conn, st.id);
+    st.rx_buf.deinit(conn.gpa);
     st.arena_state.deinit();
     conn.gpa.destroy(st);
 }
