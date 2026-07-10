@@ -75,6 +75,11 @@ pub const Stream = struct {
     /// DATA/HEADERS can report whether it closes the stream.
     end_flags: std.ArrayList(bool) = .empty,
     is_headers: std.ArrayList(bool) = .empty,
+    /// Read cursor into the queues: `readEvent` advances this instead of
+    /// `orderedRemove(0)` (which is O(n) per event → O(n²) per stream). The
+    /// backing arrays are cleared once fully drained (`q_head == len`), which
+    /// happens every flow-control cycle, so they stay bounded.
+    q_head: usize = 0,
     reset: ?u32 = null,
     rst_delivered: bool = false,
     remote_closed: bool = false,
@@ -125,10 +130,18 @@ pub const Stream = struct {
         self.recv_mu.lockUncancelable(c.io);
         defer self.recv_mu.unlock(c.io);
         while (true) {
-            if (self.queue.items.len > 0) {
-                const bytes = self.queue.orderedRemove(0);
-                const end_stream = self.end_flags.orderedRemove(0);
-                const is_hdr = self.is_headers.orderedRemove(0);
+            if (self.queue.items.len > self.q_head) {
+                const bytes = self.queue.items[self.q_head];
+                const end_stream = self.end_flags.items[self.q_head];
+                const is_hdr = self.is_headers.items[self.q_head];
+                self.q_head += 1;
+                if (self.q_head == self.queue.items.len) {
+                    // Fully drained: reclaim the backing arrays and reset the cursor.
+                    self.queue.clearRetainingCapacity();
+                    self.end_flags.clearRetainingCapacity();
+                    self.is_headers.clearRetainingCapacity();
+                    self.q_head = 0;
+                }
                 if (is_hdr) {
                     const hs = bytes.headers;
                     const out = try arena.alloc(Header, hs.len);
@@ -189,9 +202,11 @@ pub const Stream = struct {
         self.recv_mu.unlock(io);
     }
 
-    /// Frees everything still buffered on this stream.
+    /// Frees everything still buffered on this stream. Items before `q_head`
+    /// were already consumed (and freed) by `readEvent`, so only `[q_head..]`
+    /// remains to free.
     fn freeQueued(self: *Stream, gpa: std.mem.Allocator) void {
-        for (self.queue.items, self.is_headers.items) |item, is_hdr| {
+        for (self.queue.items[self.q_head..], self.is_headers.items[self.q_head..]) |item, is_hdr| {
             if (is_hdr) freeHeaders(gpa, item.headers) else gpa.free(item.data);
         }
         self.queue.deinit(gpa);
@@ -208,7 +223,10 @@ pub const Client = struct {
     dec: hpack.Decoder,
     next_id: u31 = 1,
     peer_max_frame: u32 = 16384,
-    peer_initial_window: u32 = @intCast(p2.default_window),
+    /// Peer's advertised SETTINGS_INITIAL_WINDOW_SIZE. Written by the reader
+    /// thread (applyInitialWindow) and read by opener threads (openStream), so
+    /// it is atomic to avoid a data race on that cross-thread read.
+    peer_initial_window: std.atomic.Value(u32) = .init(@intCast(p2.default_window)),
 
     write_mu: Io.Mutex = .init,
 
@@ -322,7 +340,7 @@ pub const Client = struct {
             self.write_mu.unlock(self.io);
             return error.OutOfMemory;
         };
-        st.* = .{ .client = self, .id = sid, .send_window = self.peer_initial_window };
+        st.* = .{ .client = self, .id = sid, .send_window = self.peer_initial_window.load(.acquire) };
         self.streams_mu.lockUncancelable(self.io);
         self.streams.put(self.gpa, sid, st) catch {
             self.streams_mu.unlock(self.io);
@@ -550,8 +568,8 @@ pub const Client = struct {
         defer self.streams_mu.unlock(self.io);
         self.send_mu.lockUncancelable(self.io);
         defer self.send_mu.unlock(self.io);
-        const delta: i64 = @as(i64, new_iw) - @as(i64, self.peer_initial_window);
-        self.peer_initial_window = new_iw;
+        const delta: i64 = @as(i64, new_iw) - @as(i64, self.peer_initial_window.load(.acquire));
+        self.peer_initial_window.store(new_iw, .release);
         if (delta == 0) return;
         var it = self.streams.valueIterator();
         while (it.next()) |s| s.*.send_window += delta;

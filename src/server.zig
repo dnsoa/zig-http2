@@ -2502,6 +2502,38 @@ fn flowEchoHandler(ctx: *types.Context) anyerror!void {
     try ctx.res.finish();
 }
 
+test "h2 client: partial queue drain frees the remaining buffered items (q_head)" {
+    // Guards the head-index dequeue: readEvent frees the items it consumes and
+    // freeQueued frees only [q_head..]. If a stream is torn down while some items
+    // were consumed and others are still buffered, there must be no double-free
+    // (of consumed items) and no leak (of buffered ones) — testing.allocator
+    // flags either.
+    const client_mod = @import("client.zig");
+    const fds = try newSocketPair();
+    errdefer _ = c.close(fds[1]);
+    var srv: Server = .{ .io = testing.io, .gpa = testing.allocator, .handler = flowEchoHandler, .config = .{} };
+    const t = try std.Thread.spawn(.{}, serveRawH2OnFd, .{ &srv, fds[0] });
+    defer t.join();
+    defer _ = c.close(fds[1]);
+
+    var rbuf: [8192]u8 = undefined;
+    var wbuf: [8192]u8 = undefined;
+    var reader = peerStream(fds[1]).reader(testing.io, &rbuf);
+    var writer = peerStream(fds[1]).writer(testing.io, &wbuf);
+    var client: client_mod.Client = undefined;
+    try client.init(testing.io, testing.allocator, &reader.interface, &writer.interface);
+    defer client.deinit(); // frees the partially-drained stream via freeQueued([q_head..])
+
+    const s = try client.openStream(.{ .path = "/x", .method = "POST" }, false);
+    try s.send("hello", true);
+    // Let the whole response (HEADERS + DATA + END_STREAM) queue up, then read
+    // only the first event so later items stay buffered (q_head > 0 at deinit).
+    Io.sleep(testing.io, .{ .nanoseconds = 80 * std.time.ns_per_ms }, .awake) catch {};
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    _ = try s.readEvent(arena.allocator());
+}
+
 test "h2: small-window body streams end-to-end without RST (credit on consume)" {
     const client_mod = @import("client.zig");
     const fds = try newSocketPair();
@@ -2530,7 +2562,7 @@ test "h2: small-window body streams end-to-end without RST (credit on consume)" 
     // ahead with the client's default (65535) and tripping the new stream
     // overflow RST on a spurious over-large first DATA frame.
     var waited: usize = 0;
-    while (client.peer_initial_window != srv.config.initial_window_size) : (waited += 1) {
+    while (client.peer_initial_window.load(.acquire) != srv.config.initial_window_size) : (waited += 1) {
         if (waited > 2000) return error.SettingsNotApplied;
         Io.sleep(testing.io, .{ .nanoseconds = 1 * std.time.ns_per_ms }, .awake) catch {};
     }
