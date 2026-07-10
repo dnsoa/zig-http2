@@ -85,6 +85,11 @@ pub const Stream = struct {
     reset: ?u32 = null,
     rst_delivered: bool = false,
     remote_closed: bool = false,
+    /// Set by a local `cancel()` so a blocked `readEvent` wakes and returns
+    /// `error.StreamCancelled` instead of hanging until the peer acts (RST to
+    /// the peer does not, by itself, unblock our own reader). Guarded by
+    /// `recv_mu`; distinct from `reset`, which is a peer-initiated RST_STREAM.
+    cancelled: bool = false,
     /// Set when the stream is reset (peer RST_STREAM). Read by `send` without
     /// holding `recv_mu`, so it is atomic; lets a send blocked on the flow
     /// window bail out instead of deadlocking after a reset.
@@ -165,6 +170,10 @@ pub const Stream = struct {
         self.recv_mu.lockUncancelable(c.io);
         defer self.recv_mu.unlock(c.io);
         while (true) {
+            // A local cancel() takes priority: return promptly (dropping any
+            // buffered items) so a blocked reader wakes the moment another
+            // thread cancels the stream.
+            if (self.cancelled) return error.StreamCancelled;
             if (self.queue.items.len > self.q_head) {
                 const bytes = self.queue.items[self.q_head];
                 const end_stream = self.end_flags.items[self.q_head];
@@ -217,13 +226,32 @@ pub const Stream = struct {
         }
     }
 
-    /// Cancels the stream: sends RST_STREAM(CANCEL). Stop using the stream
-    /// afterwards (the peer tears down its half).
+    /// Cancels the stream: wakes any local reader/sender, then sends
+    /// RST_STREAM(CANCEL) so the peer tears down its half. Safe to call from
+    /// another thread than the one blocked in `readEvent`/`send`. Stop using
+    /// the stream afterwards.
     pub fn cancel(self: *Stream) !void {
+        const c = self.client;
+        // Wake local waiters first, so a blocked readEvent/send returns
+        // promptly even if writeFrame below blocks or fails.
+        self.abortLocal();
+        c.noteEnd(self, true, true); // reset closes both directions
         var p: [4]u8 = undefined;
         std.mem.writeInt(u32, &p, @intFromEnum(p2.ErrorCode.cancel), .big);
-        try self.client.writeFrame(.rst_stream, 0, self.id, &p);
-        self.client.noteEnd(self, true, true); // reset closes both directions
+        try c.writeFrame(.rst_stream, 0, self.id, &p);
+    }
+
+    /// Marks the stream locally cancelled and wakes a blocked `readEvent`
+    /// (via `recv_cond`) and a blocked `send` (via `aborted` + `send_cond`).
+    /// Touches no wire; idempotent and callable from any thread.
+    fn abortLocal(self: *Stream) void {
+        const c = self.client;
+        self.aborted.store(true, .release);
+        self.recv_mu.lockUncancelable(c.io);
+        self.cancelled = true;
+        self.recv_cond.broadcast(c.io);
+        self.recv_mu.unlock(c.io);
+        c.send_cond.broadcast(c.io);
     }
 
     /// Releases the stream: deregisters it from the client and frees it.
@@ -241,7 +269,7 @@ pub const Stream = struct {
     pub fn close(self: *Stream) void {
         const c = self.client;
         self.recv_mu.lockUncancelable(c.io);
-        const ended = self.remote_closed or self.reset != null;
+        const ended = self.remote_closed or self.reset != null or self.cancelled;
         self.recv_mu.unlock(c.io);
         if (!ended and !c.dead.load(.acquire)) self.cancel() catch {};
         c.removeStream(self.id);
@@ -1172,6 +1200,129 @@ test "a blocked send() is released with error when the stream is reset" {
     sender.join();
 
     try testing.expect(signaled); // fails (deadlock) before the fix
+    try testing.expectEqual(error.StreamReset, ctx.err.?);
+}
+
+test "cancel() wakes a blocked readEvent locally with error.StreamCancelled" {
+    const io = testing.io;
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var srv = try addr.listen(io, .{ .mode = .stream, .reuse_address = true });
+    defer srv.deinit(io);
+    const port = srv.socket.address.ip4.port;
+    const caddr = try net.IpAddress.parse("127.0.0.1", port);
+    const cstream = try caddr.connect(io, .{ .mode = .stream });
+    defer cstream.close(io);
+    var accepted = try srv.accept(io);
+    defer accepted.close(io);
+
+    var crbuf: [4096]u8 = undefined;
+    var cwbuf: [4096]u8 = undefined;
+    var csr = cstream.reader(io, &crbuf);
+    var csw = cstream.writer(io, &cwbuf);
+    var client: Client = undefined;
+    try client.init(io, testing.allocator, &csr.interface, &csw.interface);
+
+    var arbuf: [4096]u8 = undefined;
+    var awbuf: [4096]u8 = undefined;
+    var asr = accepted.reader(io, &arbuf);
+    var asw = accepted.writer(io, &awbuf);
+    var pf: [p2.preface.len]u8 = undefined;
+    try asr.interface.readSliceAll(&pf);
+    var cs = try ctRead(testing.allocator, &asr.interface);
+    cs.deinit(testing.allocator);
+    try ctWrite(&asw.interface, .settings, 0, 0, "");
+    try ctWrite(&asw.interface, .settings, p2.flag_ack, 0, "");
+
+    // A receive thread blocks in readEvent (the peer sends no stream frames).
+    const s = try client.openStream(.{ .path = "/x" }, true);
+    var ctx = ReaderCtx{ .s = s };
+    const rt = try std.Thread.spawn(.{}, blockedReader, .{&ctx});
+    Io.sleep(io, .{ .nanoseconds = 50 * std.time.ns_per_ms }, .awake) catch {};
+
+    // A cancel() from this thread must wake the blocked reader promptly —
+    // sending RST to the peer alone does not (the peer just stops sending).
+    try s.cancel();
+    var woke = false;
+    var waited: u64 = 0;
+    while (waited < 2000) : (waited += 20) {
+        if (ctx.done.load(.acquire)) {
+            woke = true;
+            break;
+        }
+        Io.sleep(io, .{ .nanoseconds = 20 * std.time.ns_per_ms }, .awake) catch {};
+    }
+
+    // Cleanup inline: if cancel() failed to wake the reader, deinit does (with
+    // error.ConnectionClosed), so join never hangs — the assertion below is
+    // what reports the failure.
+    client.deinit();
+    rt.join();
+
+    try testing.expect(woke); // false before the fix (reader stays blocked)
+    try testing.expectEqual(error.StreamCancelled, ctx.err.?);
+}
+
+test "cancel() releases a blocked send() with error.StreamReset" {
+    const io = testing.io;
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var srv = try addr.listen(io, .{ .mode = .stream, .reuse_address = true });
+    defer srv.deinit(io);
+    const port = srv.socket.address.ip4.port;
+    const caddr = try net.IpAddress.parse("127.0.0.1", port);
+    const cstream = try caddr.connect(io, .{ .mode = .stream });
+    defer cstream.close(io);
+    var accepted = try srv.accept(io);
+    defer accepted.close(io);
+
+    var crbuf: [4096]u8 = undefined;
+    var cwbuf: [4096]u8 = undefined;
+    var csr = cstream.reader(io, &crbuf);
+    var csw = cstream.writer(io, &cwbuf);
+    var client: Client = undefined;
+    try client.init(io, testing.allocator, &csr.interface, &csw.interface);
+
+    var arbuf: [4096]u8 = undefined;
+    var awbuf: [4096]u8 = undefined;
+    var asr = accepted.reader(io, &arbuf);
+    var asw = accepted.writer(io, &awbuf);
+    var pf: [p2.preface.len]u8 = undefined;
+    try asr.interface.readSliceAll(&pf);
+    var cs = try ctRead(testing.allocator, &asr.interface);
+    cs.deinit(testing.allocator);
+    // Advertise a zero initial send window and wait for the ack, so the stream
+    // is born unable to send and the sender blocks immediately.
+    var iw0: [6]u8 = undefined;
+    p2.putSetting(&iw0, p2.set_initial_window_size, 0);
+    try ctWrite(&asw.interface, .settings, 0, 0, &iw0);
+    while (true) {
+        var f = try ctRead(testing.allocator, &asr.interface);
+        const is_ack = f.hdr.ftype == .settings and (f.hdr.flags & p2.flag_ack != 0);
+        f.deinit(testing.allocator);
+        if (is_ack) break;
+    }
+
+    const s = try client.openStream(.{ .path = "/x" }, false);
+    var ctx = SenderCtx{ .s = s };
+    const sender = try std.Thread.spawn(.{}, blockedSender, .{&ctx});
+    Io.sleep(io, .{ .nanoseconds = 50 * std.time.ns_per_ms }, .awake) catch {};
+
+    // A local cancel() from this thread must release the blocked sender —
+    // not just notify the peer.
+    try s.cancel();
+    var released = false;
+    var waited: u64 = 0;
+    while (waited < 2000) : (waited += 20) {
+        if (ctx.done.load(.acquire)) {
+            released = true;
+            break;
+        }
+        Io.sleep(io, .{ .nanoseconds = 20 * std.time.ns_per_ms }, .awake) catch {};
+    }
+
+    client.deinit();
+    sender.join();
+
+    try testing.expect(released); // false before the fix (sender stays blocked)
     try testing.expectEqual(error.StreamReset, ctx.err.?);
 }
 
