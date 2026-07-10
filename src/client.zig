@@ -45,9 +45,11 @@ pub const Event = union(enum) {
 };
 
 /// One inbound item buffered on a stream's queue (gpa-owned until delivered).
+/// DATA carries its flow-control cost (the whole frame: pad octet + data +
+/// padding) so the window is credited only when the caller consumes it.
 const Queued = union(enum) {
     headers: []const Header,
-    data: []u8,
+    data: struct { bytes: []u8, fc_cost: u32 },
 };
 
 /// How often the reader's blocking read wakes when no keepalive is configured,
@@ -87,6 +89,11 @@ pub const Stream = struct {
     /// holding `recv_mu`, so it is atomic; lets a send blocked on the flow
     /// window bail out instead of deadlocking after a reset.
     aborted: std.atomic.Value(bool) = .init(false),
+    /// Set when a GOAWAY with a lower last-stream-id refuses this stream: it was
+    /// not processed by the peer and is safe to retry. Surfaced to the caller as
+    /// one Event.goaway, then the stream ends. Guarded by recv_mu.
+    goaway_refused: bool = false,
+    goaway_delivered: bool = false,
 
     /// Sends `data` as flow-controlled DATA frames; `end_stream` half-closes.
     /// Blocks while the send window is empty; errors on reset/teardown.
@@ -139,6 +146,12 @@ pub const Stream = struct {
         const c = self.client;
         c.beginOp();
         defer c.endOp();
+        // Credit the flow-control window for a consumed DATA item only after
+        // releasing recv_mu (defers run LIFO, so this runs after the unlock
+        // below) — replenish takes write_mu, and holding recv_mu across it would
+        // risk a lock cycle with deliver/openStream.
+        var credit: u32 = 0;
+        defer if (credit > 0) c.replenish(self.id, credit);
         self.recv_mu.lockUncancelable(c.io);
         defer self.recv_mu.unlock(c.io);
         while (true) {
@@ -163,8 +176,9 @@ pub const Stream = struct {
                     freeHeaders(c.gpa, hs);
                     return .{ .headers = .{ .sid = self.id, .headers = out, .end_stream = end_stream } };
                 } else {
-                    const out = try arena.dupe(u8, bytes.data);
-                    c.gpa.free(bytes.data);
+                    const out = try arena.dupe(u8, bytes.data.bytes);
+                    c.gpa.free(bytes.data.bytes);
+                    credit = bytes.data.fc_cost;
                     return .{ .data = .{ .sid = self.id, .payload = out, .end_stream = end_stream } };
                 }
             }
@@ -175,6 +189,15 @@ pub const Stream = struct {
                 if (!self.rst_delivered) {
                     self.rst_delivered = true;
                     return .{ .rst = .{ .sid = self.id, .code = self.reset.? } };
+                }
+                return error.EndOfStream;
+            }
+            if (self.goaway_refused) {
+                // The peer's GOAWAY refused this (unprocessed) stream: surface it
+                // once as Event.goaway, then end so a drain loop terminates.
+                if (!self.goaway_delivered) {
+                    self.goaway_delivered = true;
+                    return .goaway;
                 }
                 return error.EndOfStream;
             }
@@ -225,11 +248,22 @@ pub const Stream = struct {
     /// remains to free.
     fn freeQueued(self: *Stream, gpa: std.mem.Allocator) void {
         for (self.queue.items[self.q_head..], self.is_headers.items[self.q_head..]) |item, is_hdr| {
-            if (is_hdr) freeHeaders(gpa, item.headers) else gpa.free(item.data);
+            if (is_hdr) freeHeaders(gpa, item.headers) else gpa.free(item.data.bytes);
         }
         self.queue.deinit(gpa);
         self.end_flags.deinit(gpa);
         self.is_headers.deinit(gpa);
+    }
+
+    /// Sum of the flow-control cost of DATA still buffered (from `q_head`) — the
+    /// connection window we owe the peer back if the stream is torn down before
+    /// the caller consumes it.
+    fn unconsumedFcCost(self: *const Stream) u32 {
+        var sum: u32 = 0;
+        for (self.queue.items[self.q_head..], self.is_headers.items[self.q_head..]) |item, is_hdr| {
+            if (!is_hdr) sum += item.data.fc_cost;
+        }
+        return sum;
     }
 };
 
@@ -270,6 +304,12 @@ pub const Client = struct {
     dead: std.atomic.Value(bool) = .init(false),
     reader_thread: ?std.Thread = null,
 
+    // Graceful GOAWAY state. `goaway_seen` gates it (release/acquire); the two
+    // fields are written once by the reader before the flag is set.
+    goaway_seen: std.atomic.Value(bool) = .init(false),
+    goaway_last_id: u31 = 0,
+    goaway_code: u32 = 0,
+
     const TimedHeader = union(enum) { work: anyerror!void, timer: void };
 
     /// Sends the connection preface + empty SETTINGS and starts the reader.
@@ -290,6 +330,14 @@ pub const Client = struct {
         p2.putSetting(settings[6..12], p2.set_max_frame_size, max_recv_frame);
         try self.writeFrame(.settings, 0, 0, &settings);
         self.reader_thread = std.Thread.spawn(.{}, readerLoop, .{self}) catch null;
+    }
+
+    /// If the peer has sent a GOAWAY, returns its last-processed stream id and
+    /// error code; null otherwise. Streams with a higher id were not processed
+    /// and are safe to retry on a fresh connection.
+    pub fn goAway(self: *Client) ?struct { last_stream_id: u31, code: u32 } {
+        if (!self.goaway_seen.load(.acquire)) return null;
+        return .{ .last_stream_id = self.goaway_last_id, .code = self.goaway_code };
     }
 
     pub fn deinit(self: *Client) void {
@@ -370,6 +418,7 @@ pub const Client = struct {
     /// can deliver the response.
     pub fn openStream(self: *Client, head: RequestHead, end_stream: bool) !*Stream {
         if (self.dead.load(.acquire)) return error.ConnectionClosed;
+        if (self.goaway_seen.load(.acquire)) return error.GoingAway;
 
         var tmp = std.heap.ArenaAllocator.init(self.gpa);
         defer tmp.deinit();
@@ -416,8 +465,13 @@ pub const Client = struct {
         self.streams_mu.lockUncancelable(self.io);
         if (self.streams.fetchRemove(sid)) |kv| {
             self.streams_mu.unlock(self.io);
+            // Return the connection window for any DATA the caller never
+            // consumed, so tearing streams down doesn't leak it (only while the
+            // connection is still live — a dead peer needs no credit).
+            const owed = kv.value.unconsumedFcCost();
             kv.value.freeQueued(self.gpa);
             self.gpa.destroy(kv.value);
+            if (!self.dead.load(.acquire)) self.windowUpdate(0, owed);
         } else {
             self.streams_mu.unlock(self.io);
         }
@@ -475,8 +529,33 @@ pub const Client = struct {
             .ping => if (fh.flags & p2.flag_ack == 0) try self.writeFrame(.ping, p2.flag_ack, 0, payload),
             .window_update => try self.handleWindowUpdate(fh.sid, payload),
             .goaway => {
-                self.kill();
-                return error.ConnectionClosed;
+                if (payload.len < 8) {
+                    self.sendGoaway(.protocol_error);
+                    self.kill();
+                    return error.ProtocolError;
+                }
+                const last_id: u31 = @intCast(std.mem.readInt(u32, payload[0..4], .big) & 0x7fff_ffff);
+                self.goaway_last_id = last_id;
+                self.goaway_code = std.mem.readInt(u32, payload[4..8], .big);
+                self.goaway_seen.store(true, .release);
+                // Refuse only streams the peer will not process (id > last_id):
+                // one Event.goaway, then the stream ends — safe to retry. Streams
+                // <= last_id keep receiving. Do NOT kill: teardown happens when
+                // the transport actually closes (reader hits EOF -> kill).
+                self.streams_mu.lockUncancelable(self.io);
+                var it = self.streams.valueIterator();
+                while (it.next()) |sp| {
+                    const s = sp.*;
+                    if (s.id > last_id) {
+                        s.aborted.store(true, .release);
+                        s.recv_mu.lockUncancelable(self.io);
+                        s.goaway_refused = true;
+                        s.recv_cond.broadcast(self.io);
+                        s.recv_mu.unlock(self.io);
+                    }
+                }
+                self.streams_mu.unlock(self.io);
+                self.send_cond.broadcast(self.io); // release refused senders
             },
             .rst_stream => {
                 const code: u32 = if (payload.len >= 4) std.mem.readInt(u32, payload[0..4], .big) else 0;
@@ -499,19 +578,20 @@ pub const Client = struct {
                 try block.appendSlice(self.gpa, stripHeaderPadding(fh, payload));
                 if (fh.flags & p2.flag_end_headers == 0) try self.readContinuations(fh.sid, &block);
                 const hs = try self.dec.decode(self.gpa, block.items);
-                try self.deliver(fh.sid, true, hs, &[_]u8{}, fh.flags & p2.flag_end_stream != 0);
+                try self.deliver(fh.sid, true, hs, &[_]u8{}, fh.flags & p2.flag_end_stream != 0, 0);
             },
             .data => {
-                // Flow control counts the whole frame (pad octet + data + pad);
-                // credit it before stripping padding for delivery.
-                if (payload.len > 0) self.replenish(fh.sid, @intCast(payload.len));
+                // Flow control counts the whole frame (pad octet + data + pad).
+                // We credit it only when the caller consumes the DATA (see
+                // readEvent) so an unread stream backpressures the peer.
+                const fc_cost: u32 = @intCast(payload.len);
                 const body = stripDataPadding(fh, payload) orelse {
                     self.sendGoaway(.protocol_error);
                     self.kill();
                     return error.ProtocolError;
                 };
                 const copy = try self.gpa.dupe(u8, body);
-                try self.deliver(fh.sid, false, &[_]hpack.Header{}, copy, fh.flags & p2.flag_end_stream != 0);
+                try self.deliver(fh.sid, false, &[_]hpack.Header{}, copy, fh.flags & p2.flag_end_stream != 0, fc_cost);
             },
             .push_promise => {
                 // We advertised ENABLE_PUSH=0, so a push is a protocol
@@ -526,12 +606,12 @@ pub const Client = struct {
 
     /// Pushes one item onto the stream's queue (or frees it if the stream is
     /// gone). Lock order: streams_mu -> recv_mu.
-    fn deliver(self: *Client, sid: u31, is_headers: bool, hs: []const Header, bytes: []u8, end_stream: bool) !void {
+    fn deliver(self: *Client, sid: u31, is_headers: bool, hs: []const Header, bytes: []u8, end_stream: bool, fc_cost: u32) !void {
         self.streams_mu.lockUncancelable(self.io);
         const st = self.streams.get(sid);
         if (st) |s| {
             s.recv_mu.lockUncancelable(self.io);
-            const item: Queued = if (is_headers) .{ .headers = hs } else .{ .data = bytes };
+            const item: Queued = if (is_headers) .{ .headers = hs } else .{ .data = .{ .bytes = bytes, .fc_cost = fc_cost } };
             s.queue.append(self.gpa, item) catch {
                 s.recv_mu.unlock(self.io);
                 self.streams_mu.unlock(self.io);
@@ -559,16 +639,31 @@ pub const Client = struct {
             self.streams_mu.unlock(self.io);
         } else {
             self.streams_mu.unlock(self.io);
-            if (is_headers) freeHeaders(self.gpa, hs) else self.gpa.free(bytes);
+            if (is_headers) {
+                freeHeaders(self.gpa, hs);
+            } else {
+                self.gpa.free(bytes);
+                // Stream already gone, but the connection window must still be
+                // returned for its DATA (RFC 7540 §6.9 — conn flow control spans
+                // closed streams), or a hostile peer could leak it to zero.
+                self.windowUpdate(0, fc_cost);
+            }
         }
     }
 
-    /// Credits the peer's send windows for `amt` bytes of DATA we received.
-    fn replenish(self: *Client, sid: u31, amt: u31) void {
+    /// Sends a WINDOW_UPDATE crediting `amt` bytes to `sid` (0 = connection).
+    fn windowUpdate(self: *Client, sid: u31, amt: u32) void {
+        if (amt == 0) return;
         var wu: [4]u8 = undefined;
-        std.mem.writeInt(u32, &wu, @as(u32, amt), .big);
-        self.writeFrame(.window_update, 0, 0, &wu) catch {};
+        std.mem.writeInt(u32, &wu, amt, .big);
         self.writeFrame(.window_update, 0, sid, &wu) catch {};
+    }
+
+    /// Credits both the connection and the stream window for `amt` bytes of
+    /// consumed DATA, reopening the peer's send window.
+    fn replenish(self: *Client, sid: u31, amt: u32) void {
+        self.windowUpdate(0, amt); // connection
+        self.windowUpdate(sid, amt); // stream
     }
 
     fn handleWindowUpdate(self: *Client, sid: u31, payload: []const u8) !void {
@@ -966,6 +1061,149 @@ test "a blocked send() is released with error when the stream is reset" {
 
     try testing.expect(signaled); // fails (deadlock) before the fix
     try testing.expectEqual(error.StreamReset, ctx.err.?);
+}
+
+test "client defers WINDOW_UPDATE until DATA is consumed (backpressure)" {
+    const io = testing.io;
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var srv = try addr.listen(io, .{ .mode = .stream, .reuse_address = true });
+    defer srv.deinit(io);
+    const port = srv.socket.address.ip4.port;
+    const caddr = try net.IpAddress.parse("127.0.0.1", port);
+    const cstream = try caddr.connect(io, .{ .mode = .stream });
+    defer cstream.close(io);
+    var accepted = try srv.accept(io);
+    defer accepted.close(io);
+
+    var crbuf: [4096]u8 = undefined;
+    var cwbuf: [4096]u8 = undefined;
+    var csr = cstream.reader(io, &crbuf);
+    var csw = cstream.writer(io, &cwbuf);
+    var client: Client = undefined;
+    try client.init(io, testing.allocator, &csr.interface, &csw.interface);
+    defer client.deinit();
+
+    var arbuf: [4096]u8 = undefined;
+    var awbuf: [4096]u8 = undefined;
+    var asr = accepted.reader(io, &arbuf);
+    var asw = accepted.writer(io, &awbuf);
+    var pf: [p2.preface.len]u8 = undefined;
+    try asr.interface.readSliceAll(&pf);
+    var cs = try ctRead(testing.allocator, &asr.interface);
+    cs.deinit(testing.allocator);
+    try ctWrite(&asw.interface, .settings, 0, 0, "");
+    try ctWrite(&asw.interface, .settings, p2.flag_ack, 0, "");
+
+    const s = try client.openStream(.{ .path = "/x" }, true);
+
+    // Response: HEADERS(:status 200), a DATA frame, then a PING. The client
+    // processes frames in order, so any WINDOW_UPDATE it emits for the DATA
+    // arrives before the PING ack.
+    var henc = std.heap.ArenaAllocator.init(testing.allocator);
+    defer henc.deinit();
+    var blk: std.ArrayList(u8) = .empty;
+    try hpack.Encoder.encodeResponse(henc.allocator(), &blk, 200, &.{});
+    try ctWrite(&asw.interface, .headers, p2.flag_end_headers, 1, blk.items);
+    try ctWrite(&asw.interface, .data, 0, 1, "hello");
+    const ping = [_]u8{0} ** 8;
+    try ctWrite(&asw.interface, .ping, 0, 0, &ping);
+
+    // Drain client output up to the PING ack; no WINDOW_UPDATE may appear yet,
+    // because we have not consumed the DATA.
+    var saw_wu_before_consume = false;
+    while (true) {
+        var f = try ctRead(testing.allocator, &asr.interface);
+        const is_wu = f.hdr.ftype == .window_update;
+        const is_ping_ack = f.hdr.ftype == .ping and (f.hdr.flags & p2.flag_ack != 0);
+        f.deinit(testing.allocator);
+        if (is_wu) saw_wu_before_consume = true;
+        if (is_ping_ack) break;
+    }
+    try testing.expect(!saw_wu_before_consume); // fails before the fix
+
+    // Consume the DATA; now the client must credit both windows by 5 bytes.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const e1 = try s.readEvent(arena.allocator());
+    try testing.expect(e1 == .headers);
+    const e2 = try s.readEvent(arena.allocator());
+    try testing.expectEqualStrings("hello", e2.data.payload);
+
+    var saw_conn_wu = false;
+    var saw_stream_wu = false;
+    while (!(saw_conn_wu and saw_stream_wu)) {
+        var f = try ctRead(testing.allocator, &asr.interface);
+        defer f.deinit(testing.allocator);
+        if (f.hdr.ftype == .window_update) {
+            const incr = std.mem.readInt(u32, f.payload[0..4], .big);
+            try testing.expectEqual(@as(u32, 5), incr);
+            if (f.hdr.sid == 0) saw_conn_wu = true else if (f.hdr.sid == 1) saw_stream_wu = true;
+        }
+    }
+}
+
+test "graceful GOAWAY: streams <= last_id survive, higher ones are refused" {
+    const io = testing.io;
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var srv = try addr.listen(io, .{ .mode = .stream, .reuse_address = true });
+    defer srv.deinit(io);
+    const port = srv.socket.address.ip4.port;
+    const caddr = try net.IpAddress.parse("127.0.0.1", port);
+    const cstream = try caddr.connect(io, .{ .mode = .stream });
+    defer cstream.close(io);
+    var accepted = try srv.accept(io);
+    defer accepted.close(io);
+
+    var crbuf: [4096]u8 = undefined;
+    var cwbuf: [4096]u8 = undefined;
+    var csr = cstream.reader(io, &crbuf);
+    var csw = cstream.writer(io, &cwbuf);
+    var client: Client = undefined;
+    try client.init(io, testing.allocator, &csr.interface, &csw.interface);
+    defer client.deinit();
+
+    var arbuf: [4096]u8 = undefined;
+    var awbuf: [4096]u8 = undefined;
+    var asr = accepted.reader(io, &arbuf);
+    var asw = accepted.writer(io, &awbuf);
+    var pf: [p2.preface.len]u8 = undefined;
+    try asr.interface.readSliceAll(&pf);
+    var cs = try ctRead(testing.allocator, &asr.interface);
+    cs.deinit(testing.allocator);
+    try ctWrite(&asw.interface, .settings, 0, 0, "");
+    try ctWrite(&asw.interface, .settings, p2.flag_ack, 0, "");
+
+    const s1 = try client.openStream(.{ .path = "/a" }, true); // sid 1
+    const s3 = try client.openStream(.{ .path = "/b" }, true); // sid 3
+
+    // GOAWAY(last_stream_id = 1, NO_ERROR), then s1's response.
+    var ga: [8]u8 = undefined;
+    std.mem.writeInt(u32, ga[0..4], 1, .big);
+    std.mem.writeInt(u32, ga[4..8], @intFromEnum(p2.ErrorCode.no_error), .big);
+    try ctWrite(&asw.interface, .goaway, 0, 0, &ga);
+    var henc = std.heap.ArenaAllocator.init(testing.allocator);
+    defer henc.deinit();
+    var blk: std.ArrayList(u8) = .empty;
+    try hpack.Encoder.encodeResponse(henc.allocator(), &blk, 200, &.{});
+    try ctWrite(&asw.interface, .headers, p2.flag_end_headers | p2.flag_end_stream, 1, blk.items);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    // s3 (> last_id) is refused: one .goaway event, then the stream ends.
+    const e = try s3.readEvent(arena.allocator());
+    try testing.expect(e == .goaway);
+    try testing.expectError(error.EndOfStream, s3.readEvent(arena.allocator()));
+
+    // No new streams may be opened after a GOAWAY.
+    try testing.expectError(error.GoingAway, client.openStream(.{ .path = "/c" }, true));
+    const ga_state = client.goAway().?;
+    try testing.expectEqual(@as(u31, 1), ga_state.last_stream_id);
+
+    // s1 (<= last_id) still receives its response — not aborted by the GOAWAY.
+    const e1 = try s1.readEvent(arena.allocator());
+    try testing.expect(e1 == .headers);
+    try testing.expect(e1.headers.end_stream);
 }
 
 test "readEvent surfaces a reset once, then ends the stream" {
