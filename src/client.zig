@@ -375,7 +375,7 @@ pub const Client = struct {
         p2.putSetting(settings[0..6], p2.set_enable_push, 0);
         p2.putSetting(settings[6..12], p2.set_max_frame_size, max_recv_frame);
         try self.writeFrame(.settings, 0, 0, &settings);
-        self.reader_thread = std.Thread.spawn(.{}, readerLoop, .{self}) catch null;
+        self.reader_thread = std.Thread.spawn(.{}, readerLoop, .{self}) catch return error.SystemResources;
     }
 
     /// If the peer has sent a GOAWAY, returns its last-processed stream id and
@@ -386,9 +386,20 @@ pub const Client = struct {
         return .{ .last_stream_id = self.goaway_last_id, .code = self.goaway_code };
     }
 
+    /// Releases the client: stops the reader thread, waits for in-flight
+    /// readEvent/send to drain, then frees all streams.
+    ///
+    /// ⚠️ The reader thread blocks in an I/O read on `r`; `dead`+broadcast wake
+    /// cond-waiters but NOT an I/O-blocked read. So the reader only exits when
+    /// that read returns — i.e. when the **transport is closed** (EOF/error) or
+    /// keepalive PINGs periodically wake it. **The caller must close the
+    /// transport around `deinit`** (e.g. close the socket for `connectTcp`, or
+    /// the custom Reader's underlying fd for `Channel.init`). Without this,
+    /// `reader_thread.join` blocks indefinitely on a persistent connection.
     pub fn deinit(self: *Client) void {
         // Tell the reader to stop, then wake any blocked senders/readers so they
-        // observe `dead` and return. The reader wakes within `reader_wake_ms`.
+        // observe `dead` and return. (This wakes cond-waiters; the I/O-blocked
+        // reader still needs the transport closed by the caller — see doc above.)
         self.dead.store(true, .release);
         self.send_cond.broadcast(self.io);
         self.admit_cond.broadcast(self.io); // release a blocked openStream
