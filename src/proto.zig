@@ -76,3 +76,41 @@ pub fn putSetting(buf: *[6]u8, id: u16, value: u32) void {
     std.mem.writeInt(u16, buf[0..2], id, .big);
     std.mem.writeInt(u32, buf[2..6], value, .big);
 }
+
+/// Returns a connection-error code when `fh`/`payload` violate framing rules
+/// (RFC 7540 §4/§6), or null when the frame is structurally acceptable. Shared
+/// by the server read loop and the client reader thread — both must reject the
+/// same mistakes, so the rules live once here.
+pub fn validateInboundFrame(fh: ParsedHeader, payload: []const u8) ?ErrorCode {
+    switch (fh.ftype) {
+        .settings => {
+            if (fh.sid != 0) return .protocol_error;
+            if (fh.flags & flag_ack != 0 and payload.len != 0) return .frame_size_error;
+            if (payload.len % 6 != 0) return .frame_size_error;
+        },
+        .ping => {
+            if (fh.sid != 0) return .protocol_error;
+            if (payload.len != 8) return .frame_size_error;
+        },
+        .headers, .data, .continuation => {
+            if (fh.sid == 0) return .protocol_error;
+        },
+        .rst_stream => {
+            if (fh.sid == 0) return .protocol_error;
+            if (payload.len != 4) return .frame_size_error; // RFC 7540 §6.4
+        },
+        .priority => {
+            if (fh.sid == 0) return .protocol_error;
+            if (payload.len != 5) return .frame_size_error; // RFC 7540 §6.3
+        },
+        .goaway => {
+            if (fh.sid != 0) return .protocol_error;
+            if (payload.len < 8) return .frame_size_error;
+        },
+        .window_update => {
+            if (payload.len != 4) return .frame_size_error;
+        },
+        else => {},
+    }
+    return null;
+}

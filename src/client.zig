@@ -75,6 +75,11 @@ pub const Stream = struct {
     id: u31,
     /// Flow-control window for DATA we send, guarded by `client.send_mu`.
     send_window: i64,
+    /// Flow-control window for DATA we receive (RFC 7540 §6.9.2), decremented
+    /// by the reader thread on each DATA frame and credited back as the caller
+    /// consumes items. Guarded by `recv_mu`; written by the reader under
+    /// streams_mu -> recv_mu, read/credited by readEvent under recv_mu.
+    recv_window: i64 = p2.default_window,
 
     recv_mu: Io.Mutex = .init,
     recv_cond: Io.Condition = .init,
@@ -336,6 +341,14 @@ pub const Client = struct {
     send_cond: Io.Condition = .init,
     conn_send_window: i64 = p2.default_window,
 
+    // Inbound (receive) flow control, connection level: every DATA frame is
+    // deducted in full (padding included) on arrival and credited back only as
+    // the caller consumes it. A window gone negative means the peer ignored
+    // the window we advertised — a connection FLOW_CONTROL_ERROR (RFC 7540
+    // §6.9). `fc_mu` is a leaf lock; when nested, taken under streams_mu only.
+    fc_mu: Io.Mutex = .init,
+    conn_recv_window: i64 = p2.default_window,
+
     streams_mu: Io.Mutex = .init,
     streams: std.AutoHashMapUnmanaged(u31, *Stream) = .empty,
 
@@ -564,12 +577,44 @@ pub const Client = struct {
         };
         self.streams_mu.unlock(self.io);
 
-        const flags: u8 = p2.flag_end_headers | (if (end_stream) p2.flag_end_stream else 0);
-        self.writeFrameLocked(.headers, flags, sid, block.items) catch {
+        // Emit HEADERS (plus CONTINUATION when the block exceeds the peer's
+        // SETTINGS_MAX_FRAME_SIZE, RFC 7540 §6.2) atomically under write_mu,
+        // mirroring the server's writeHeaders: a single oversized HEADERS
+        // frame is a FRAME_SIZE_ERROR to any spec-compliant peer. END_STREAM
+        // rides the HEADERS frame, END_HEADERS the last fragment.
+        const es: u8 = if (end_stream) p2.flag_end_stream else 0;
+        const max: usize = self.peer_max_frame.load(.acquire);
+        if (block.items.len > max_header_block) {
+            // Same bound the server enforces inbound; past it a huge block
+            // could also overflow putHeader's 24-bit length field.
             self.write_mu.unlock(self.io);
             self.removeStream(sid); // releases the slot
-            return error.ConnectionClosed;
-        };
+            return error.HeadersTooLarge;
+        }
+        if (block.items.len <= max) {
+            self.writeFrameLocked(.headers, p2.flag_end_headers | es, sid, block.items) catch {
+                self.write_mu.unlock(self.io);
+                self.removeStream(sid); // releases the slot
+                return error.ConnectionClosed;
+            };
+        } else {
+            self.writeFrameLocked(.headers, es, sid, block.items[0..max]) catch {
+                self.write_mu.unlock(self.io);
+                self.removeStream(sid); // releases the slot
+                return error.ConnectionClosed;
+            };
+            var off: usize = max;
+            while (off < block.items.len) {
+                const end = @min(off + max, block.items.len);
+                const last = end == block.items.len;
+                self.writeFrameLocked(.continuation, if (last) p2.flag_end_headers else 0, sid, block.items[off..end]) catch {
+                    self.write_mu.unlock(self.io);
+                    self.removeStream(sid); // releases the slot
+                    return error.ConnectionClosed;
+                };
+                off = end;
+            }
+        }
         self.w.flush() catch {
             self.write_mu.unlock(self.io);
             self.removeStream(sid);
@@ -596,12 +641,20 @@ pub const Client = struct {
             self.streams_mu.unlock(self.io);
             // Return the connection window for any DATA the caller never
             // consumed, so tearing streams down doesn't leak it (only while the
-            // connection is still live — a dead peer needs no credit).
+            // connection is still live — a dead peer needs no credit). The
+            // ledger must grow with the credit granted, same as replenish.
             const owed = kv.value.unconsumedFcCost();
             self.releaseSlot(kv.value); // backstop: free the slot if not already
             kv.value.freeQueued(self.gpa);
             self.gpa.destroy(kv.value);
-            if (!self.dead.load(.acquire)) self.windowUpdate(0, owed);
+            if (!self.dead.load(.acquire)) {
+                if (owed > 0) {
+                    self.fc_mu.lockUncancelable(self.io);
+                    self.conn_recv_window += @as(i64, owed);
+                    self.fc_mu.unlock(self.io);
+                }
+                self.windowUpdate(0, owed);
+            }
         } else {
             self.streams_mu.unlock(self.io);
         }
@@ -633,6 +686,15 @@ pub const Client = struct {
                     return;
                 };
             }
+            // Same framing rules as the server (SETTINGS sid/length, PING
+            // length, WINDOW_UPDATE length, DATA/HEADERS on stream 0, ...):
+            // a violation is a connection error (RFC 7540 §4/§6), so GOAWAY
+            // rather than mis-handle the frame.
+            if (p2.validateInboundFrame(fh, payload)) |code| {
+                self.sendGoaway(code);
+                self.kill();
+                return;
+            }
             self.handle(fh, payload) catch {
                 self.kill();
                 return;
@@ -654,7 +716,7 @@ pub const Client = struct {
     fn handle(self: *Client, fh: p2.ParsedHeader, payload: []const u8) !void {
         switch (fh.ftype) {
             .settings => if (fh.flags & p2.flag_ack == 0) {
-                self.applyPeerSettings(payload);
+                try self.applyPeerSettings(payload);
                 try self.writeFrame(.settings, p2.flag_ack, 0, "");
             },
             .ping => if (fh.flags & p2.flag_ack == 0) try self.writeFrame(.ping, p2.flag_ack, 0, payload),
@@ -730,13 +792,30 @@ pub const Client = struct {
                     self.kill();
                     return error.ProtocolError;
                 };
+                // Inbound connection-level flow control: deduct the full frame
+                // length on arrival. A negative window means the peer sent
+                // beyond what we advertised — a connection FLOW_CONTROL_ERROR
+                // (RFC 7540 §6.9), not an invitation to buffer it all.
+                {
+                    self.fc_mu.lockUncancelable(self.io);
+                    self.conn_recv_window -= @as(i64, fc_cost);
+                    const overflow = self.conn_recv_window < 0;
+                    self.fc_mu.unlock(self.io);
+                    if (overflow) {
+                        self.sendGoaway(.flow_control_error);
+                        self.kill();
+                        return error.FlowControlError;
+                    }
+                }
                 const copy = try self.gpa.dupe(u8, body);
                 try self.deliver(fh.sid, false, &[_]hpack.Header{}, copy, fh.flags & p2.flag_end_stream != 0, fc_cost);
             },
             .push_promise => {
                 // We advertised ENABLE_PUSH=0, so a push is a protocol
                 // violation. Tolerating it is also unsafe: its header block goes
-                // undecoded, desyncing HPACK for every later frame. Tear down.
+                // undecoded, desyncing HPACK for every later frame. Tear down
+                // (GOAWAY first, so the peer learns why).
+                self.sendGoaway(.protocol_error);
                 self.kill();
                 return error.ConnectionClosed;
             },
@@ -754,34 +833,79 @@ pub const Client = struct {
     }
 
     /// Pushes one item onto the stream's queue (or frees it if the stream is
-    /// gone). Lock order: streams_mu -> recv_mu.
+    /// gone). Lock order: streams_mu -> recv_mu. For DATA, also deducts the
+    /// stream receive window; on overflow (or an unknown stream) the frame is
+    /// a stream error — freed and RST — while the connection-level window is
+    /// returned immediately, since closed streams still consume conn credit
+    /// (RFC 7540 §6.9).
     fn deliver(self: *Client, sid: u31, is_headers: bool, hs: []const Header, bytes: []u8, end_stream: bool, fc_cost: u32) !void {
         self.streams_mu.lockUncancelable(self.io);
         const st = self.streams.get(sid);
         if (st) |s| {
             s.recv_mu.lockUncancelable(self.io);
             const item: Queued = if (is_headers) .{ .headers = hs } else .{ .data = .{ .bytes = bytes, .fc_cost = fc_cost } };
-            s.queue.append(self.gpa, item) catch {
-                s.recv_mu.unlock(self.io);
-                self.streams_mu.unlock(self.io);
+            var rst: ?p2.ErrorCode = null;
+            if (!is_headers) {
+                s.recv_window -= @as(i64, fc_cost);
+                if (s.recv_window < 0) {
+                    // Peer sent beyond the stream window we track: a stream
+                    // FLOW_CONTROL_ERROR. Drop the frame and reset the stream
+                    // (its queued DATA is freed by readEvent's reset path or
+                    // removeStream), keeping the connection.
+                    s.recv_window += @as(i64, fc_cost); // nothing delivered: no stream credit owed
+                    rst = .flow_control_error;
+                }
+            }
+            if (rst == null) {
+                var oom = false;
+                s.queue.append(self.gpa, item) catch {
+                    oom = true;
+                };
+                if (!oom) {
+                    s.end_flags.append(self.gpa, end_stream) catch {
+                        s.queue.items.len -= 1;
+                        oom = true;
+                    };
+                }
+                if (!oom) {
+                    s.is_headers.append(self.gpa, is_headers) catch {
+                        s.queue.items.len -= 1;
+                        s.end_flags.items.len -= 1;
+                        oom = true;
+                    };
+                }
+                if (oom) {
+                    if (is_headers) freeHeaders(self.gpa, hs) else self.gpa.free(bytes);
+                    s.recv_mu.unlock(self.io);
+                    self.streams_mu.unlock(self.io);
+                    return error.OutOfMemory;
+                }
+            } else {
                 if (is_headers) freeHeaders(self.gpa, hs) else self.gpa.free(bytes);
-                return error.OutOfMemory;
-            };
-            s.end_flags.append(self.gpa, end_stream) catch {
-                s.queue.items.len -= 1;
+            }
+            if (rst) |code| {
+                s.aborted.store(true, .release);
+                s.reset = @intFromEnum(code);
+                s.recv_cond.broadcast(self.io);
                 s.recv_mu.unlock(self.io);
+                self.noteEnd(s, true, true); // reset frees its slot
                 self.streams_mu.unlock(self.io);
-                if (is_headers) freeHeaders(self.gpa, hs) else self.gpa.free(bytes);
-                return error.OutOfMemory;
-            };
-            s.is_headers.append(self.gpa, is_headers) catch {
-                s.queue.items.len -= 1;
-                s.end_flags.items.len -= 1;
-                s.recv_mu.unlock(self.io);
-                self.streams_mu.unlock(self.io);
-                if (is_headers) freeHeaders(self.gpa, hs) else self.gpa.free(bytes);
-                return error.OutOfMemory;
-            };
+                self.send_cond.broadcast(self.io); // release a sender blocked on the window
+                var p: [4]u8 = undefined;
+                std.mem.writeInt(u32, &p, @intFromEnum(code), .big);
+                self.writeFrame(.rst_stream, 0, sid, &p) catch {};
+                // The frame is dropped: return the connection window we
+                // deducted on arrival, and keep our ledger in step with the
+                // credit we grant (RFC 7540 §6.9 — conn flow control spans
+                // reset/closed streams).
+                {
+                    self.fc_mu.lockUncancelable(self.io);
+                    self.conn_recv_window += @as(i64, fc_cost);
+                    self.fc_mu.unlock(self.io);
+                }
+                self.windowUpdate(0, fc_cost);
+                return;
+            }
             if (end_stream) s.remote_closed = true;
             s.recv_cond.broadcast(self.io);
             s.recv_mu.unlock(self.io);
@@ -793,11 +917,34 @@ pub const Client = struct {
                 freeHeaders(self.gpa, hs);
             } else {
                 self.gpa.free(bytes);
-                // Stream already gone, but the connection window must still be
-                // returned for its DATA (RFC 7540 §6.9 — conn flow control spans
-                // closed streams), or a hostile peer could leak it to zero.
-                self.windowUpdate(0, fc_cost);
+                // DATA on an id above the highest we ever allocated (next_id
+                // is the next to hand out) is DATA on an idle stream: a
+                // connection PROTOCOL_ERROR (RFC 9113 §5.1), the same rule the
+                // server enforces — GOAWAY, and the reader tears us down.
+                // next_id is written under write_mu, so read it under it too.
+                self.write_mu.lockUncancelable(self.io);
+                const idle = sid >= self.next_id;
+                self.write_mu.unlock(self.io);
+                if (idle) {
+                    self.sendGoaway(.protocol_error);
+                    return error.ProtocolError;
+                }
+                // An id at or below it that is not open was closed: a stream
+                // error — RST STREAM_CLOSED, keeping the connection.
+                var p: [4]u8 = undefined;
+                std.mem.writeInt(u32, &p, @intFromEnum(p2.ErrorCode.stream_closed), .big);
+                self.writeFrame(.rst_stream, 0, sid, &p) catch {};
             }
+            // Stream already gone, but the connection window must still be
+            // returned for its DATA (RFC 7540 §6.9 — conn flow control spans
+            // closed streams), or a hostile peer could leak it to zero. The
+            // ledger grows with the credit granted, same as replenish.
+            if (fc_cost > 0) {
+                self.fc_mu.lockUncancelable(self.io);
+                self.conn_recv_window += @as(i64, fc_cost);
+                self.fc_mu.unlock(self.io);
+            }
+            self.windowUpdate(0, fc_cost);
         }
     }
 
@@ -810,16 +957,50 @@ pub const Client = struct {
     }
 
     /// Credits both the connection and the stream window for `amt` bytes of
-    /// consumed DATA, reopening the peer's send window.
+    /// consumed DATA, reopening the peer's send window. The stream-level
+    /// increment is capped so the window never exceeds 2^31-1 (RFC 7540
+    /// §6.9.1) — a peer that pads every frame could otherwise grow it without
+    /// bound, one small replenish at a time.
     fn replenish(self: *Client, sid: u31, amt: u32) void {
+        if (amt == 0) return;
+        {
+            // Our own connection-window ledger must grow with the credit we
+            // grant, or the next 65535 inbound bytes would look like an
+            // overflow even though everything was consumed.
+            self.fc_mu.lockUncancelable(self.io);
+            self.conn_recv_window += @as(i64, amt);
+            self.fc_mu.unlock(self.io);
+        }
+        var stream_amt: u32 = amt;
+        self.streams_mu.lockUncancelable(self.io);
+        const st = self.streams.get(sid);
+        if (st) |s| {
+            s.recv_mu.lockUncancelable(self.io);
+            const room: i64 = 0x7fff_ffff - s.recv_window;
+            if (room < @as(i64, amt)) stream_amt = if (room > 0) @intCast(room) else 0;
+            if (stream_amt > 0) s.recv_window += @intCast(stream_amt);
+            s.recv_mu.unlock(self.io);
+        }
+        self.streams_mu.unlock(self.io);
         self.windowUpdate(0, amt); // connection
-        self.windowUpdate(sid, amt); // stream
+        if (stream_amt > 0) self.windowUpdate(sid, stream_amt); // stream
     }
 
     fn handleWindowUpdate(self: *Client, sid: u31, payload: []const u8) !void {
-        if (payload.len < 4) return;
+        // Length == 4 is guaranteed by proto.validateInboundFrame before dispatch.
         const incr: i64 = @intCast(std.mem.readInt(u32, payload[0..4], .big) & 0x7fff_ffff);
-        if (incr == 0) return error.ProtocolError;
+        // A 0 increment is a PROTOCOL_ERROR: connection-level is fatal, stream
+        // level resets just that stream (RFC 7540 §6.9).
+        if (incr == 0) {
+            if (sid == 0) {
+                self.sendGoaway(.protocol_error);
+                return error.ProtocolError;
+            }
+            var p: [4]u8 = undefined;
+            std.mem.writeInt(u32, &p, @intFromEnum(p2.ErrorCode.protocol_error), .big);
+            self.writeFrame(.rst_stream, 0, sid, &p) catch {};
+            return;
+        }
         var overflow_sid: ?u31 = null;
         {
             self.streams_mu.lockUncancelable(self.io);
@@ -851,20 +1032,28 @@ pub const Client = struct {
         }
     }
 
-    fn applyPeerSettings(self: *Client, payload: []const u8) void {
+    fn applyPeerSettings(self: *Client, payload: []const u8) !void {
         var i: usize = 0;
         var new_iw: ?u32 = null;
         while (i + 6 <= payload.len) : (i += 6) {
             const id = std.mem.readInt(u16, payload[i..][0..2], .big);
             const val = std.mem.readInt(u32, payload[i + 2 ..][0..4], .big);
             switch (id) {
-                p2.set_max_frame_size => if (val >= 16384 and val <= 16777215) {
+                p2.set_max_frame_size => {
+                    // Outside [2^14, 2^24-1] is a connection PROTOCOL_ERROR
+                    // (RFC 7540 §6.5.2); ignoring the value would keep the
+                    // connection alive against an oversized frame we may then
+                    // read (or a tiny frame size wedging our sender).
+                    if (val < 16384 or val > 16777215) {
+                        self.sendGoaway(.protocol_error);
+                        return error.ProtocolError;
+                    }
                     self.peer_max_frame.store(val, .release);
                 },
                 p2.set_initial_window_size => {
                     if (val > 0x7fff_ffff) {
-                        self.kill();
-                        return;
+                        self.sendGoaway(.flow_control_error);
+                        return error.FlowControlError;
                     }
                     new_iw = val;
                 },
@@ -877,22 +1066,42 @@ pub const Client = struct {
                 else => {},
             }
         }
-        if (new_iw) |iw| self.applyInitialWindow(iw);
+        if (new_iw) |iw| try self.applyInitialWindow(iw);
     }
 
     /// Shift every live stream's send window by the SETTINGS_INITIAL_WINDOW_SIZE
-    /// delta (RFC 7540 §6.9.2). Lock order: streams_mu -> send_mu.
-    fn applyInitialWindow(self: *Client, new_iw: u32) void {
-        self.streams_mu.lockUncancelable(self.io);
-        defer self.streams_mu.unlock(self.io);
-        self.send_mu.lockUncancelable(self.io);
-        defer self.send_mu.unlock(self.io);
-        const delta: i64 = @as(i64, new_iw) - @as(i64, self.peer_initial_window.load(.acquire));
-        self.peer_initial_window.store(new_iw, .release);
-        if (delta == 0) return;
-        var it = self.streams.valueIterator();
-        while (it.next()) |s| s.*.send_window += delta;
-        self.send_cond.broadcast(self.io);
+    /// delta (RFC 7540 §6.9.2). Lock order: streams_mu -> send_mu. Returns
+    /// error.FlowControlError (after GOAWAY) when the shift pushes any window
+    /// past 2^31-1 — a connection FLOW_CONTROL_ERROR (RFC 7540 §6.9.2).
+    fn applyInitialWindow(self: *Client, new_iw: u32) !void {
+        var overflow = false;
+        {
+            self.streams_mu.lockUncancelable(self.io);
+            defer self.streams_mu.unlock(self.io);
+            self.send_mu.lockUncancelable(self.io);
+            defer self.send_mu.unlock(self.io);
+            const delta: i64 = @as(i64, new_iw) - @as(i64, self.peer_initial_window.load(.acquire));
+            self.peer_initial_window.store(new_iw, .release);
+            if (delta != 0) {
+                var it = self.streams.valueIterator();
+                while (it.next()) |s| {
+                    // Each window is <= 2^31-1 and |delta| < 2^31, so the sum
+                    // cannot overflow i64; a result over 2^31-1 is the illegal
+                    // state itself.
+                    s.*.send_window += delta;
+                    if (s.*.send_window > 0x7fff_ffff) overflow = true;
+                }
+                self.send_cond.broadcast(self.io);
+            }
+        }
+        // GOAWAY only after the locks drop: sendGoaway takes write_mu, and
+        // openStream holds write_mu while waiting on streams_mu, so GOAWAYing
+        // under streams_mu inverts that order (deadlock) — same reasoning as
+        // the deferred RST in handleWindowUpdate.
+        if (overflow) {
+            self.sendGoaway(.flow_control_error);
+            return error.FlowControlError;
+        }
     }
 
     fn readContinuations(self: *Client, sid: u31, block: *std.ArrayList(u8)) !void {
@@ -2127,4 +2336,614 @@ test "openStream seeds a new stream's window from the peer's INITIAL_WINDOW_SIZE
     const window = s.send_window;
     client.send_mu.unlock(io);
     try testing.expectEqual(@as(i64, 4096), window);
+}
+
+// --- framing-validation regression tests (#8): the reader now applies the
+// same RFC 7540 §4/§6 rules the server does, via proto.validateInboundFrame. ---
+
+fn ctHandshake(asr: *Io.Reader, asw: *Io.Writer) !void {
+    var pf: [p2.preface.len]u8 = undefined;
+    try asr.readSliceAll(&pf);
+    var cs = try ctRead(testing.allocator, asr); // client SETTINGS
+    cs.deinit(testing.allocator);
+    try ctWrite(asw, .settings, 0, 0, "");
+    try ctWrite(asw, .settings, p2.flag_ack, 0, "");
+}
+
+test "client GOAWAYs a SETTINGS frame on a nonzero stream" {
+    const io = testing.io;
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var srv = try addr.listen(io, .{ .mode = .stream, .reuse_address = true });
+    defer srv.deinit(io);
+    const port = srv.socket.address.ip4.port;
+    const caddr = try net.IpAddress.parse("127.0.0.1", port);
+    const cstream = try caddr.connect(io, .{ .mode = .stream });
+    defer cstream.close(io);
+    var accepted = try srv.accept(io);
+    defer accepted.close(io);
+
+    var crbuf: [4096]u8 = undefined;
+    var cwbuf: [4096]u8 = undefined;
+    var csr = cstream.reader(io, &crbuf);
+    var csw = cstream.writer(io, &cwbuf);
+    var client: Client = undefined;
+    try client.init(io, testing.allocator, &csr.interface, &csw.interface);
+
+    var arbuf: [4096]u8 = undefined;
+    var awbuf: [4096]u8 = undefined;
+    var asr = accepted.reader(io, &arbuf);
+    var asw = accepted.writer(io, &awbuf);
+    try ctHandshake(&asr.interface, &asw.interface);
+
+    // SETTINGS must arrive on stream 0 (RFC 7540 §6.5).
+    try ctWrite(&asw.interface, .settings, 0, 1, "");
+
+    try waitDead(io, &client, 3000);
+    const code = try ctReadGoawayCode(testing.allocator, &asr.interface);
+    try testing.expectEqual(@as(u32, @intFromEnum(p2.ErrorCode.protocol_error)), code);
+    client.deinit();
+}
+
+test "client GOAWAYs a SETTINGS ack carrying a payload" {
+    const io = testing.io;
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var srv = try addr.listen(io, .{ .mode = .stream, .reuse_address = true });
+    defer srv.deinit(io);
+    const port = srv.socket.address.ip4.port;
+    const caddr = try net.IpAddress.parse("127.0.0.1", port);
+    const cstream = try caddr.connect(io, .{ .mode = .stream });
+    defer cstream.close(io);
+    var accepted = try srv.accept(io);
+    defer accepted.close(io);
+
+    var crbuf: [4096]u8 = undefined;
+    var cwbuf: [4096]u8 = undefined;
+    var csr = cstream.reader(io, &crbuf);
+    var csw = cstream.writer(io, &cwbuf);
+    var client: Client = undefined;
+    try client.init(io, testing.allocator, &csr.interface, &csw.interface);
+
+    var arbuf: [4096]u8 = undefined;
+    var awbuf: [4096]u8 = undefined;
+    var asr = accepted.reader(io, &arbuf);
+    var asw = accepted.writer(io, &awbuf);
+    try ctHandshake(&asr.interface, &asw.interface);
+
+    var s: [6]u8 = undefined;
+    p2.putSetting(&s, p2.set_initial_window_size, 1);
+    try ctWrite(&asw.interface, .settings, p2.flag_ack, 0, &s);
+
+    try waitDead(io, &client, 3000);
+    const code = try ctReadGoawayCode(testing.allocator, &asr.interface);
+    try testing.expectEqual(@as(u32, @intFromEnum(p2.ErrorCode.frame_size_error)), code);
+    client.deinit();
+}
+
+test "client GOAWAYs a PING with a bad length" {
+    const io = testing.io;
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var srv = try addr.listen(io, .{ .mode = .stream, .reuse_address = true });
+    defer srv.deinit(io);
+    const port = srv.socket.address.ip4.port;
+    const caddr = try net.IpAddress.parse("127.0.0.1", port);
+    const cstream = try caddr.connect(io, .{ .mode = .stream });
+    defer cstream.close(io);
+    var accepted = try srv.accept(io);
+    defer accepted.close(io);
+
+    var crbuf: [4096]u8 = undefined;
+    var cwbuf: [4096]u8 = undefined;
+    var csr = cstream.reader(io, &crbuf);
+    var csw = cstream.writer(io, &cwbuf);
+    var client: Client = undefined;
+    try client.init(io, testing.allocator, &csr.interface, &csw.interface);
+
+    var arbuf: [4096]u8 = undefined;
+    var awbuf: [4096]u8 = undefined;
+    var asr = accepted.reader(io, &arbuf);
+    var asw = accepted.writer(io, &awbuf);
+    try ctHandshake(&asr.interface, &asw.interface);
+
+    // PING must be exactly 8 bytes (RFC 7540 §6.7).
+    try ctWrite(&asw.interface, .ping, 0, 0, "123456789");
+
+    try waitDead(io, &client, 3000);
+    const code = try ctReadGoawayCode(testing.allocator, &asr.interface);
+    try testing.expectEqual(@as(u32, @intFromEnum(p2.ErrorCode.frame_size_error)), code);
+    client.deinit();
+}
+
+test "client GOAWAYs a WINDOW_UPDATE with a bad length" {
+    const io = testing.io;
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var srv = try addr.listen(io, .{ .mode = .stream, .reuse_address = true });
+    defer srv.deinit(io);
+    const port = srv.socket.address.ip4.port;
+    const caddr = try net.IpAddress.parse("127.0.0.1", port);
+    const cstream = try caddr.connect(io, .{ .mode = .stream });
+    defer cstream.close(io);
+    var accepted = try srv.accept(io);
+    defer accepted.close(io);
+
+    var crbuf: [4096]u8 = undefined;
+    var cwbuf: [4096]u8 = undefined;
+    var csr = cstream.reader(io, &crbuf);
+    var csw = cstream.writer(io, &cwbuf);
+    var client: Client = undefined;
+    try client.init(io, testing.allocator, &csr.interface, &csw.interface);
+
+    var arbuf: [4096]u8 = undefined;
+    var awbuf: [4096]u8 = undefined;
+    var asr = accepted.reader(io, &arbuf);
+    var asw = accepted.writer(io, &awbuf);
+    try ctHandshake(&asr.interface, &asw.interface);
+
+    // WINDOW_UPDATE must be exactly 4 bytes (RFC 7540 §6.9).
+    try ctWrite(&asw.interface, .window_update, 0, 0, "abc");
+
+    try waitDead(io, &client, 3000);
+    const code = try ctReadGoawayCode(testing.allocator, &asr.interface);
+    try testing.expectEqual(@as(u32, @intFromEnum(p2.ErrorCode.frame_size_error)), code);
+    client.deinit();
+}
+
+test "client GOAWAYs a peer MAX_FRAME_SIZE outside the RFC range" {
+    const io = testing.io;
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var srv = try addr.listen(io, .{ .mode = .stream, .reuse_address = true });
+    defer srv.deinit(io);
+    const port = srv.socket.address.ip4.port;
+    const caddr = try net.IpAddress.parse("127.0.0.1", port);
+    const cstream = try caddr.connect(io, .{ .mode = .stream });
+    defer cstream.close(io);
+    var accepted = try srv.accept(io);
+    defer accepted.close(io);
+
+    var crbuf: [4096]u8 = undefined;
+    var cwbuf: [4096]u8 = undefined;
+    var csr = cstream.reader(io, &crbuf);
+    var csw = cstream.writer(io, &cwbuf);
+    var client: Client = undefined;
+    try client.init(io, testing.allocator, &csr.interface, &csw.interface);
+
+    var arbuf: [4096]u8 = undefined;
+    var awbuf: [4096]u8 = undefined;
+    var asr = accepted.reader(io, &arbuf);
+    var asw = accepted.writer(io, &awbuf);
+    try ctHandshake(&asr.interface, &asw.interface);
+
+    // Below the 2^14 floor (RFC 7540 §6.5.2). The value was previously
+    // ignored, leaving the connection running against an illegal setting.
+    var s: [6]u8 = undefined;
+    p2.putSetting(&s, p2.set_max_frame_size, 16383);
+    try ctWrite(&asw.interface, .settings, 0, 0, &s);
+
+    try waitDead(io, &client, 3000);
+    const code = try ctReadGoawayCode(testing.allocator, &asr.interface);
+    try testing.expectEqual(@as(u32, @intFromEnum(p2.ErrorCode.protocol_error)), code);
+    client.deinit();
+}
+
+test "client resets a stream WINDOW_UPDATE with a zero increment" {
+    const io = testing.io;
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var srv = try addr.listen(io, .{ .mode = .stream, .reuse_address = true });
+    defer srv.deinit(io);
+    const port = srv.socket.address.ip4.port;
+    const caddr = try net.IpAddress.parse("127.0.0.1", port);
+    const cstream = try caddr.connect(io, .{ .mode = .stream });
+    defer cstream.close(io);
+    var accepted = try srv.accept(io);
+    defer accepted.close(io);
+
+    var crbuf: [4096]u8 = undefined;
+    var cwbuf: [4096]u8 = undefined;
+    var csr = cstream.reader(io, &crbuf);
+    var csw = cstream.writer(io, &cwbuf);
+    var client: Client = undefined;
+    try client.init(io, testing.allocator, &csr.interface, &csw.interface);
+    defer client.deinit();
+
+    var arbuf: [4096]u8 = undefined;
+    var awbuf: [4096]u8 = undefined;
+    var asr = accepted.reader(io, &arbuf);
+    var asw = accepted.writer(io, &awbuf);
+    try ctHandshake(&asr.interface, &asw.interface);
+
+    _ = try client.openStream(.{ .path = "/x" }, false);
+    // A 0 increment on a stream is a stream PROTOCOL_ERROR (RFC 7540 §6.9):
+    // RST the stream, keep the connection.
+    try ctWrite(&asw.interface, .window_update, 0, 1, &[_]u8{ 0, 0, 0, 0 });
+
+    while (true) {
+        var f = try ctRead(testing.allocator, &asr.interface);
+        defer f.deinit(testing.allocator);
+        if (f.hdr.ftype == .rst_stream) {
+            try testing.expectEqual(@as(u31, 1), f.hdr.sid);
+            try testing.expectEqual(@as(u32, @intFromEnum(p2.ErrorCode.protocol_error)), std.mem.readInt(u32, f.payload[0..4], .big));
+            break;
+        }
+    }
+    // The connection must survive a stream-level framing mistake.
+    Io.sleep(io, .{ .nanoseconds = 100 * std.time.ns_per_ms }, .awake) catch {};
+    try testing.expect(!client.dead.load(.acquire));
+}
+
+test "client GOAWAYs FLOW_CONTROL_ERROR when INITIAL_WINDOW_SIZE overflows a stream window" {
+    const io = testing.io;
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var srv = try addr.listen(io, .{ .mode = .stream, .reuse_address = true });
+    defer srv.deinit(io);
+    const port = srv.socket.address.ip4.port;
+    const caddr = try net.IpAddress.parse("127.0.0.1", port);
+    const cstream = try caddr.connect(io, .{ .mode = .stream });
+    defer cstream.close(io);
+    var accepted = try srv.accept(io);
+    defer accepted.close(io);
+
+    var crbuf: [4096]u8 = undefined;
+    var cwbuf: [4096]u8 = undefined;
+    var csr = cstream.reader(io, &crbuf);
+    var csw = cstream.writer(io, &cwbuf);
+    var client: Client = undefined;
+    try client.init(io, testing.allocator, &csr.interface, &csw.interface);
+
+    var arbuf: [4096]u8 = undefined;
+    var awbuf: [4096]u8 = undefined;
+    var asr = accepted.reader(io, &arbuf);
+    var asw = accepted.writer(io, &awbuf);
+    try ctHandshake(&asr.interface, &asw.interface);
+
+    const s = try client.openStream(.{ .path = "/x" }, false);
+    // Raise stream 1's send window to exactly 2^31-1 ...
+    var wu: [4]u8 = undefined;
+    std.mem.writeInt(u32, &wu, 0x7fff_ffff - 65535, .big);
+    try ctWrite(&asw.interface, .window_update, 0, 1, &wu);
+    // ... then raise the initial window by one: the delta shifts every open
+    // stream past the 2^31-1 ceiling (RFC 7540 §6.9.2).
+    var st: [6]u8 = undefined;
+    p2.putSetting(&st, p2.set_initial_window_size, 65536);
+    try ctWrite(&asw.interface, .settings, 0, 0, &st);
+
+    try waitDead(io, &client, 3000);
+    const code = try ctReadGoawayCode(testing.allocator, &asr.interface);
+    try testing.expectEqual(@as(u32, @intFromEnum(p2.ErrorCode.flow_control_error)), code);
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    try testing.expectError(error.ConnectionClosed, s.readEvent(arena_state.allocator()));
+    client.deinit();
+}
+
+// --- inbound flow-control regression tests (#3) ---
+
+test "client GOAWAYs DATA beyond the connection receive window" {
+    const io = testing.io;
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var srv = try addr.listen(io, .{ .mode = .stream, .reuse_address = true });
+    defer srv.deinit(io);
+    const port = srv.socket.address.ip4.port;
+    const caddr = try net.IpAddress.parse("127.0.0.1", port);
+    const cstream = try caddr.connect(io, .{ .mode = .stream });
+    defer cstream.close(io);
+    var accepted = try srv.accept(io);
+    defer accepted.close(io);
+
+    var crbuf: [4096]u8 = undefined;
+    var cwbuf: [4096]u8 = undefined;
+    var csr = cstream.reader(io, &crbuf);
+    var csw = cstream.writer(io, &cwbuf);
+    var client: Client = undefined;
+    try client.init(io, testing.allocator, &csr.interface, &csw.interface);
+
+    var arbuf: [8192]u8 = undefined;
+    var awbuf: [70000]u8 = undefined;
+    var asr = accepted.reader(io, &arbuf);
+    var asw = accepted.writer(io, &awbuf);
+    try ctHandshake(&asr.interface, &asw.interface);
+
+    _ = try client.openStream(.{ .path = "/x" }, false);
+    var big: [16384]u8 = @splat('x');
+    // 16384 * 4 = 65536 > the 65535-byte connection window: the fourth frame
+    // crosses it. Previously all of it was buffered without bound.
+    try ctWrite(&asw.interface, .data, 0, 1, &big);
+    try ctWrite(&asw.interface, .data, 0, 1, &big);
+    try ctWrite(&asw.interface, .data, 0, 1, &big);
+    try ctWrite(&asw.interface, .data, 0, 1, &big);
+
+    try waitDead(io, &client, 3000);
+    const code = try ctReadGoawayCode(testing.allocator, &asr.interface);
+    try testing.expectEqual(@as(u32, @intFromEnum(p2.ErrorCode.flow_control_error)), code);
+    client.deinit();
+}
+
+test "client keeps receiving after consumed DATA is credited back" {
+    // Deduct-on-arrival must pair with credit-on-consumption: after the caller
+    // drains three frames and the windows are replenished, a fourth frame is
+    // legal again. (Without the ledger growing with the granted credit, the
+    // fourth frame would look like an overflow.)
+    const io = testing.io;
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var srv = try addr.listen(io, .{ .mode = .stream, .reuse_address = true });
+    defer srv.deinit(io);
+    const port = srv.socket.address.ip4.port;
+    const caddr = try net.IpAddress.parse("127.0.0.1", port);
+    const cstream = try caddr.connect(io, .{ .mode = .stream });
+    defer cstream.close(io);
+    var accepted = try srv.accept(io);
+    defer accepted.close(io);
+
+    var crbuf: [4096]u8 = undefined;
+    var cwbuf: [4096]u8 = undefined;
+    var csr = cstream.reader(io, &crbuf);
+    var csw = cstream.writer(io, &cwbuf);
+    var client: Client = undefined;
+    try client.init(io, testing.allocator, &csr.interface, &csw.interface);
+    defer client.deinit();
+
+    var arbuf: [8192]u8 = undefined;
+    var awbuf: [70000]u8 = undefined;
+    var asr = accepted.reader(io, &arbuf);
+    var asw = accepted.writer(io, &awbuf);
+    try ctHandshake(&asr.interface, &asw.interface);
+
+    const s = try client.openStream(.{ .path = "/x" }, false);
+    var chunk: [16384]u8 = @splat('y');
+    try ctWrite(&asw.interface, .data, 0, 1, &chunk);
+    try ctWrite(&asw.interface, .data, 0, 1, &chunk);
+    try ctWrite(&asw.interface, .data, 0, 1, &chunk);
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var i: usize = 0;
+    while (i < 3) : (i += 1) {
+        const ev = try s.readEvent(arena);
+        try testing.expectEqual(@as(usize, 16384), ev.data.payload.len);
+    }
+
+    // The three stream-level WINDOW_UPDATEs only flow once the caller consumed
+    // the frames; the peer waits for them, so this frame is legal.
+    var seen_wu: u32 = 0;
+    while (seen_wu < 3) {
+        var f = try ctRead(testing.allocator, &asr.interface);
+        defer f.deinit(testing.allocator);
+        if (f.hdr.ftype == .window_update and f.hdr.sid == 1) seen_wu += 1;
+    }
+    try ctWrite(&asw.interface, .data, p2.flag_end_stream, 1, &chunk);
+
+    const ev4 = try s.readEvent(arena);
+    try testing.expectEqual(@as(usize, 16384), ev4.data.payload.len);
+    try testing.expect(ev4.data.end_stream);
+    try testing.expectError(error.EndOfStream, s.readEvent(arena));
+    try testing.expect(!client.dead.load(.acquire));
+}
+
+// --- outbound header-block splitting regression tests (#4) ---
+
+test "openStream splits a large header block into HEADERS + CONTINUATION" {
+    const io = testing.io;
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var srv = try addr.listen(io, .{ .mode = .stream, .reuse_address = true });
+    defer srv.deinit(io);
+    const port = srv.socket.address.ip4.port;
+    const caddr = try net.IpAddress.parse("127.0.0.1", port);
+    const cstream = try caddr.connect(io, .{ .mode = .stream });
+    defer cstream.close(io);
+    var accepted = try srv.accept(io);
+    defer accepted.close(io);
+
+    var crbuf: [4096]u8 = undefined;
+    var cwbuf: [25000]u8 = undefined;
+    var csr = cstream.reader(io, &crbuf);
+    var csw = cstream.writer(io, &cwbuf);
+    var client: Client = undefined;
+    try client.init(io, testing.allocator, &csr.interface, &csw.interface);
+    defer client.deinit();
+
+    var arbuf: [4096]u8 = undefined;
+    var asr = accepted.reader(io, &arbuf);
+    var pf: [p2.preface.len]u8 = undefined;
+    try asr.interface.readSliceAll(&pf);
+    var cs = try ctRead(testing.allocator, &asr.interface); // client SETTINGS
+    cs.deinit(testing.allocator);
+
+    // The block encodes well past the peer's 16384-byte max frame size: one
+    // HEADERS frame used to carry it all (a FRAME_SIZE_ERROR to the peer).
+    // 0xff bytes have no huffman compression (8 code bits each), so the value
+    // survives encoding at ~full length.
+    var big: [20000]u8 = @splat(0xff);
+    _ = try client.openStream(.{ .path = "/big", .headers = &.{.{ .name = "x-big", .value = &big }} }, true);
+
+    // Skip the client's SETTINGS ack, then expect HEADERS (exactly max frame
+    // size, END_STREAM set, END_HEADERS clear) followed by CONTINUATION(s).
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var block: std.ArrayList(u8) = .empty;
+    while (true) {
+        var f = try ctRead(testing.allocator, &asr.interface);
+        defer f.deinit(testing.allocator);
+        if (f.hdr.ftype != .headers) continue; // settings ack
+        try testing.expectEqual(@as(u31, 1), f.hdr.sid);
+        try testing.expectEqual(@as(u32, 16384), f.hdr.length);
+        try testing.expect(f.hdr.flags & p2.flag_end_stream != 0);
+        try testing.expect(f.hdr.flags & p2.flag_end_headers == 0);
+        try block.appendSlice(arena, f.payload);
+        break;
+    }
+    while (true) {
+        var f = try ctRead(testing.allocator, &asr.interface);
+        defer f.deinit(testing.allocator);
+        try testing.expectEqual(p2.FrameType.continuation, f.hdr.ftype);
+        try testing.expectEqual(@as(u31, 1), f.hdr.sid);
+        try testing.expect(f.hdr.length <= 16384);
+        try block.appendSlice(arena, f.payload);
+        if (f.hdr.flags & p2.flag_end_headers != 0) break;
+    }
+
+    var dec = hpack.Decoder.init(testing.allocator, p2.our_header_table_size);
+    defer dec.deinit();
+    const hs = try dec.decode(arena, block.items);
+    var found = false;
+    for (hs) |h| {
+        if (std.mem.eql(u8, h.name, "x-big")) {
+            found = true;
+            try testing.expectEqual(@as(usize, 20000), h.value.len);
+        }
+    }
+    try testing.expect(found);
+}
+
+test "openStream rejects a header block above the cap" {
+    const io = testing.io;
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var srv = try addr.listen(io, .{ .mode = .stream, .reuse_address = true });
+    defer srv.deinit(io);
+    const port = srv.socket.address.ip4.port;
+    const caddr = try net.IpAddress.parse("127.0.0.1", port);
+    const cstream = try caddr.connect(io, .{ .mode = .stream });
+    defer cstream.close(io);
+    var accepted = try srv.accept(io);
+    defer accepted.close(io);
+
+    var crbuf: [4096]u8 = undefined;
+    var cwbuf: [4096]u8 = undefined;
+    var csr = cstream.reader(io, &crbuf);
+    var csw = cstream.writer(io, &cwbuf);
+    var client: Client = undefined;
+    try client.init(io, testing.allocator, &csr.interface, &csw.interface);
+    defer client.deinit();
+
+    // ~500KB of incompressible value bytes: past the 256KiB cap, rejected
+    // before any oversized frame reaches the wire (or overflows putHeader's
+    // 24-bit length field).
+    const too_big = try testing.allocator.alloc(u8, 500000);
+    defer testing.allocator.free(too_big);
+    @memset(too_big, 0xff);
+    try testing.expectError(
+        error.HeadersTooLarge,
+        client.openStream(.{ .path = "/huge", .headers = &.{.{ .name = "x-big", .value = too_big }} }, false),
+    );
+}
+
+test "client GOAWAYs DATA on an idle stream id" {
+    // DATA on an id at or above the highest we ever allocated is a connection
+    // PROTOCOL_ERROR (RFC 9113 §5.1) — the same rule the server enforces.
+    const io = testing.io;
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var srv = try addr.listen(io, .{ .mode = .stream, .reuse_address = true });
+    defer srv.deinit(io);
+    const port = srv.socket.address.ip4.port;
+    const caddr = try net.IpAddress.parse("127.0.0.1", port);
+    const cstream = try caddr.connect(io, .{ .mode = .stream });
+    defer cstream.close(io);
+    var accepted = try srv.accept(io);
+    defer accepted.close(io);
+
+    var crbuf: [4096]u8 = undefined;
+    var cwbuf: [4096]u8 = undefined;
+    var csr = cstream.reader(io, &crbuf);
+    var csw = cstream.writer(io, &cwbuf);
+    var client: Client = undefined;
+    try client.init(io, testing.allocator, &csr.interface, &csw.interface);
+
+    var arbuf: [4096]u8 = undefined;
+    var awbuf: [4096]u8 = undefined;
+    var asr = accepted.reader(io, &arbuf);
+    var asw = accepted.writer(io, &awbuf);
+    try ctHandshake(&asr.interface, &asw.interface);
+
+    // No stream was ever opened (next_id == 1): sid 1 is idle.
+    try ctWrite(&asw.interface, .data, 0, 1, "xxxx");
+
+    try waitDead(io, &client, 3000);
+    const code = try ctReadGoawayCode(testing.allocator, &asr.interface);
+    try testing.expectEqual(@as(u32, @intFromEnum(p2.ErrorCode.protocol_error)), code);
+    client.deinit();
+}
+
+test "client RSTs DATA on a closed stream and keeps the connection" {
+    // An id below the highest allocated that is no longer open was closed:
+    // a stream error — RST(STREAM_CLOSED) — with the connection window still
+    // returned (RFC 9113 §5.1, RFC 7540 §6.9).
+    const io = testing.io;
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var srv = try addr.listen(io, .{ .mode = .stream, .reuse_address = true });
+    defer srv.deinit(io);
+    const port = srv.socket.address.ip4.port;
+    const caddr = try net.IpAddress.parse("127.0.0.1", port);
+    const cstream = try caddr.connect(io, .{ .mode = .stream });
+    defer cstream.close(io);
+    var accepted = try srv.accept(io);
+    defer accepted.close(io);
+
+    var crbuf: [4096]u8 = undefined;
+    var cwbuf: [4096]u8 = undefined;
+    var csr = cstream.reader(io, &crbuf);
+    var csw = cstream.writer(io, &cwbuf);
+    var client: Client = undefined;
+    try client.init(io, testing.allocator, &csr.interface, &csw.interface);
+    defer client.deinit();
+
+    var arbuf: [4096]u8 = undefined;
+    var awbuf: [4096]u8 = undefined;
+    var asr = accepted.reader(io, &arbuf);
+    var asw = accepted.writer(io, &awbuf);
+    try ctHandshake(&asr.interface, &asw.interface);
+
+    const s = try client.openStream(.{ .path = "/x" }, false);
+    s.close(); // sends RST(CANCEL), deregisters the stream; next_id is now 3
+
+    try ctWrite(&asw.interface, .data, 0, 1, "xxxx");
+    while (true) {
+        var f = try ctRead(testing.allocator, &asr.interface);
+        defer f.deinit(testing.allocator);
+        if (f.hdr.ftype == .rst_stream and f.hdr.sid == 1 and
+            std.mem.readInt(u32, f.payload[0..4], .big) == @intFromEnum(p2.ErrorCode.stream_closed))
+        {
+            break;
+        }
+    }
+    // A stream-level mistake must not take the connection down.
+    Io.sleep(io, .{ .nanoseconds = 100 * std.time.ns_per_ms }, .awake) catch {};
+    try testing.expect(!client.dead.load(.acquire));
+}
+
+test "client GOAWAYs a peer PUSH_PROMISE before tearing down" {
+    // We advertised ENABLE_PUSH=0: a push is a PROTOCOL_ERROR (RFC 9113 §6.6),
+    // and its header block must not be dropped silently (HPACK desync).
+    const io = testing.io;
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var srv = try addr.listen(io, .{ .mode = .stream, .reuse_address = true });
+    defer srv.deinit(io);
+    const port = srv.socket.address.ip4.port;
+    const caddr = try net.IpAddress.parse("127.0.0.1", port);
+    const cstream = try caddr.connect(io, .{ .mode = .stream });
+    defer cstream.close(io);
+    var accepted = try srv.accept(io);
+    defer accepted.close(io);
+
+    var crbuf: [4096]u8 = undefined;
+    var cwbuf: [4096]u8 = undefined;
+    var csr = cstream.reader(io, &crbuf);
+    var csw = cstream.writer(io, &cwbuf);
+    var client: Client = undefined;
+    try client.init(io, testing.allocator, &csr.interface, &csw.interface);
+
+    var arbuf: [4096]u8 = undefined;
+    var awbuf: [4096]u8 = undefined;
+    var asr = accepted.reader(io, &arbuf);
+    var asw = accepted.writer(io, &awbuf);
+    try ctHandshake(&asr.interface, &asw.interface);
+
+    var pp: [5]u8 = undefined;
+    std.mem.writeInt(u32, pp[0..4], 2, .big); // promised stream 2
+    pp[4] = 0x88;
+    try ctWrite(&asw.interface, .push_promise, p2.flag_end_headers, 0, &pp);
+
+    try waitDead(io, &client, 3000);
+    const code = try ctReadGoawayCode(testing.allocator, &asr.interface);
+    try testing.expectEqual(@as(u32, @intFromEnum(p2.ErrorCode.protocol_error)), code);
+    client.deinit();
 }
