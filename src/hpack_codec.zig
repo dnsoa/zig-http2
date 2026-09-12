@@ -303,10 +303,17 @@ pub fn decodeString(data: []const u8, allocator: Allocator) !struct { value: []u
 
     const huffman = (data[0] & 0x80) != 0;
     const len_result = try decodeInteger(data, 7);
+    // Bound the declared length against what is actually left BEFORE narrowing
+    // it to usize or adding it to the prefix length. `decodeInteger` yields up
+    // to 2^64-1, and the old `data.len < len + str_len` check did that add
+    // first: a crafted prefix wrapped it, so the check passed and, in a safe
+    // build, the add itself panicked — an integer-overflow abort reachable from
+    // one 12-byte HEADERS block, i.e. any peer could kill the process.
+    // Comparing on the u64 also keeps the @intCast in range on a 32-bit usize.
+    const remaining = data.len - len_result.len; // decodeInteger consumed <= data.len
+    if (len_result.value > remaining) return error.UnexpectedEof;
     const str_len: usize = @intCast(len_result.value);
     const total_len = len_result.len + str_len;
-
-    if (data.len < total_len) return error.UnexpectedEof;
 
     const str_data = data[len_result.len..total_len];
 

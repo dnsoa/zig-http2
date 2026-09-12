@@ -104,9 +104,9 @@ pub const Decoder = struct {
                 // 6.2.1 Literal with Incremental Indexing (6-bit prefix).
                 const h = try self.literal(arena, block[i..], 6);
                 i += h.consumed;
+                try own(arena, &out, h);
                 try self.account(&list_size, h.name, h.value);
                 try self.dyn.add(h.name, h.value);
-                try out.append(arena, .{ .name = h.name, .value = h.value });
             } else if (b & 0xE0 == 0x20) {
                 // 6.3 Dynamic Table Size Update (5-bit prefix).
                 const n = try decInt(block[i..], 5);
@@ -119,8 +119,8 @@ pub const Decoder = struct {
                 // a server doesn't do for inbound headers; either way: not indexed.
                 const h = try self.literal(arena, block[i..], 4);
                 i += h.consumed;
+                try own(arena, &out, h);
                 try self.account(&list_size, h.name, h.value);
-                try out.append(arena, .{ .name = h.name, .value = h.value });
             }
         }
         return out.toOwnedSlice(arena);
@@ -135,6 +135,22 @@ pub const Decoder = struct {
     }
 
     const Literal = struct { name: []const u8, value: []const u8, consumed: usize };
+
+    /// Moves a freshly decoded literal into `out`, which then owns its
+    /// `name`/`value`. Callers do this *before* charging the field against the
+    /// header-list budget: accounting can reject the block
+    /// (`HeaderListTooLarge`), and a pair not yet in `out` is missed by
+    /// `decode`'s errdefer and leaks — which matters because the client decodes
+    /// onto its gpa, not an arena, so a hostile peer could leak ~4KB per
+    /// rejected block, repeatedly. The errdefer here covers only the append
+    /// itself; once it succeeds, `out` is solely responsible for the pair.
+    fn own(arena: std.mem.Allocator, out: *std.ArrayList(Header), h: Literal) Error!void {
+        errdefer {
+            arena.free(h.name);
+            arena.free(h.value);
+        }
+        try out.append(arena, .{ .name = h.name, .value = h.value });
+    }
 
     /// Decodes a literal representation whose first byte has an `prefix_bits`-wide
     /// name index (0 ⇒ literal name follows). Name/value land on `arena`.
@@ -172,7 +188,10 @@ pub const Encoder = struct {
         headers: []const Header,
     ) Error!void {
         // :status — use a static full-entry index when one exists, else literal.
-        var sbuf: [3]u8 = undefined;
+        // Sized for the widest u16 ("65535"): `status` comes from the handler
+        // via `Response.status`, so a 4- or 5-digit code is a caller bug, not a
+        // reason to hit `catch unreachable` and panic the connection.
+        var sbuf: [5]u8 = undefined;
         const status_str = std.fmt.bufPrint(&sbuf, "{d}", .{status}) catch unreachable;
         if (hp.StaticTable.findNameValue(":status", status_str)) |idx| {
             try emitIndexed(arena, out, idx);
@@ -507,6 +526,68 @@ test "Decoder.decode surfaces an overflowing indexed integer as an error" {
     // The whole server HEADERS path funnels through here; it must not crash.
     const block = [_]u8{ 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f };
     try testing.expectError(Error.Truncated, dec.decode(arena_state.allocator(), &block));
+}
+
+test "decodeString rejects a length that would overflow the buffer bound" {
+    // A 7-bit-prefix length of 2^64-1. The old bound was
+    // `data.len < len_result.len + str_len`, whose add wraps here: the check
+    // passed and the add itself panicked in safe builds.
+    var buf: [16]u8 = undefined;
+    const n = try hp.encodeInteger(std.math.maxInt(u64), 7, &buf);
+    try testing.expectError(error.UnexpectedEof, hp.decodeString(buf[0..n], testing.allocator));
+}
+
+test "Decoder.decode survives a literal declaring a 2^64-1 string length" {
+    // The whole server/client HEADERS path funnels through here, so this 12-byte
+    // block — 00 7f 80 ff ff ff ff ff ff ff ff 01 — was a remote process abort
+    // from a single unauthenticated frame.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var dec = Decoder.init(testing.allocator, 4096);
+    defer dec.deinit();
+
+    var lenbuf: [16]u8 = undefined;
+    const n = try hp.encodeInteger(std.math.maxInt(u64), 7, &lenbuf);
+    var block: [12]u8 = undefined;
+    block[0] = 0x00; // literal without indexing, new (literal) name
+    @memcpy(block[1 .. 1 + n], lenbuf[0..n]);
+    try testing.expectError(Error.Truncated, dec.decode(arena_state.allocator(), block[0 .. 1 + n]));
+}
+
+test "decode frees the pending literal when the header-list cap trips (no leak)" {
+    // The field that pushes the running total past max_list_size is decoded
+    // (name + value allocated) before `account` rejects it. It must reach `out`
+    // first, or decode's errdefer misses it — testing.allocator flags the leak.
+    // The client decodes onto its gpa, so this leaked per rejected block there.
+    var block: std.ArrayList(u8) = .empty;
+    defer block.deinit(testing.allocator);
+    var i: usize = 0;
+    while (i < 140) : (i += 1) {
+        // Literal without indexing, new name: 0x00 | name "a" | value 4000*'v'
+        // (4000 as a 7-bit-prefix integer is 0x7f,0xA1,0x1E). Each field is
+        // 1 + 4000 + 32 = 4033 toward the 512KiB cap, so #131 trips it.
+        try block.appendSlice(testing.allocator, &.{ 0x00, 0x01, 'a', 0x7f, 0xA1, 0x1E });
+        try block.appendNTimes(testing.allocator, 'v', 4000);
+    }
+    var dec = Decoder.init(testing.allocator, 4096);
+    defer dec.deinit();
+    try testing.expectError(Error.HeaderListTooLarge, dec.decode(testing.allocator, block.items));
+}
+
+test "encodeResponse tolerates a status code wider than three digits" {
+    // `status` comes from the handler; a 4-digit code used to overflow the
+    // format buffer and hit `catch unreachable`, panicking the connection.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var out: std.ArrayList(u8) = .empty;
+    try Encoder.encodeResponse(arena, &out, 65535, &.{});
+
+    var dec = Decoder.init(testing.allocator, 4096);
+    defer dec.deinit();
+    const hs = try dec.decode(arena, out.items);
+    try testing.expectEqualStrings("65535", findHeader(hs, ":status").?);
 }
 
 test "Huffman round trip over short and long codes" {
