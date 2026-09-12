@@ -1237,6 +1237,12 @@ fn buildRequest(arena: std.mem.Allocator, decoded: []const hpack.Header) !types.
     var seen_authority = false;
 
     for (decoded) |h| {
+        // NUL/CR/LF in any name or value — pseudo-headers included — is
+        // malformed (RFC 9113 §8.2.1): a CR LF pair in :path or a value is a
+        // header-injection primitive against any downstream hop that
+        // concatenates fields back into HTTP/1.
+        for (h.name) |ch| if (ch == 0 or ch == '\r' or ch == '\n') return error.BadRequest;
+        for (h.value) |ch| if (ch == 0 or ch == '\r' or ch == '\n') return error.BadRequest;
         if (h.name.len > 0 and h.name[0] == ':') {
             if (saw_regular) return error.BadRequest;
             if (std.mem.eql(u8, h.name, ":method")) {
@@ -1265,11 +1271,6 @@ fn buildRequest(arena: std.mem.Allocator, decoded: []const hpack.Header) !types.
         // the request malformed (RFC 9113 §8.2.1). Accepting it lets a peer
         // smuggle a field past any downstream check that compares case-sensitively.
         for (h.name) |ch| if (std.ascii.isUpper(ch)) return error.BadRequest;
-        // NUL/CR/LF in a name or value are also malformed (RFC 9113 §8.2.1): a
-        // CR LF pair in a value is a header-injection primitive against any
-        // downstream hop that concatenates fields back into HTTP/1.
-        for (h.name) |ch| if (ch == 0 or ch == '\r' or ch == '\n') return error.BadRequest;
-        for (h.value) |ch| if (ch == 0 or ch == '\r' or ch == '\n') return error.BadRequest;
         if (isConnectionSpecificHeader(h.name)) return error.BadRequest;
         if (std.ascii.eqlIgnoreCase(h.name, "te") and !std.mem.eql(u8, h.value, "trailers")) return error.BadRequest;
         if (std.ascii.eqlIgnoreCase(h.name, "content-length")) {
@@ -1281,9 +1282,9 @@ fn buildRequest(arena: std.mem.Allocator, decoded: []const hpack.Header) !types.
             // bodies through a size check downstream (request smuggling).
             if (content_length) |first| {
                 if (first != cl) return error.BadRequest;
-            } else {
-                content_length = cl;
+                continue; // identical duplicate: forward the field once
             }
+            content_length = cl;
         }
         if (std.ascii.eqlIgnoreCase(h.name, "host")) {
             host = h.value;
@@ -3542,6 +3543,9 @@ test "buildRequest accepts identical duplicate content-length" {
 
     const req = try buildRequest(arena_state.allocator(), &decoded);
     try testing.expectEqual(@as(u64, 7), req.content_length.?);
+    // The duplicate is deduplicated on the wire field list too: forwarding
+    // both copies invites a size-confusion on any downstream hop.
+    try testing.expectEqual(@as(usize, 1), countHeaders(req.headers, "content-length"));
 }
 
 test "buildRequest rejects CTL octets in field names and values" {
@@ -3559,6 +3563,12 @@ test "buildRequest rejects CTL octets in field names and values" {
     }
     {
         var decoded = base ++ [_]hpack.Header{.{ .name = "x-ba\x00d", .value = "ok" }};
+        try testing.expectError(error.BadRequest, buildRequest(arena_state.allocator(), &decoded));
+    }
+    // Pseudo-header values are scanned too: CRLF in :path is the same
+    // injection primitive against an HTTP/1 hop.
+    {
+        var decoded = base ++ [_]hpack.Header{.{ .name = ":path", .value = "/x\r\nGET / HTTP/1.1" }};
         try testing.expectError(error.BadRequest, buildRequest(arena_state.allocator(), &decoded));
     }
 }
