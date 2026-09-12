@@ -70,6 +70,30 @@ const max_header_block: usize = 256 * 1024;
 /// block needs a handful (256KiB / 16KiB ⇒ ~16), so this is generous.
 const max_continuation_frames: usize = 256;
 
+/// Tunables for a client connection. `init` uses the defaults; pass your own
+/// through `initWithConfig`.
+pub const Config = struct {
+    /// Connection-level inbound flow-control window, aggregated across streams.
+    /// The RFC's fixed initial value is 65535 and a connection window can only
+    /// be enlarged via WINDOW_UPDATE, so anything larger is advertised with a
+    /// stream-0 WINDOW_UPDATE right after the preface. Clamped to
+    /// [65535, 2^31-1].
+    ///
+    /// This is a throughput knob, and 65535 is a low ceiling: a client pulling
+    /// a large response can have at most one window in flight per round trip,
+    /// so it tops out near `window / RTT` regardless of bandwidth (~1.3 MB/s at
+    /// 50 ms). Loopback hides it entirely. Mirrors the server's
+    /// `Config.connection_window_size`, and shares its default.
+    connection_window_size: u32 = 1 << 20,
+    /// SETTINGS_INITIAL_WINDOW_SIZE we advertise: the peer's initial send
+    /// window into each stream we open. Clamped to [0, 2^31-1].
+    ///
+    /// Raising it above the RFC default is safe in a way lowering it is not —
+    /// a peer that has yet to process our SETTINGS uses 65535, which is more
+    /// conservative than what we are asking for, never less.
+    initial_window_size: u32 = 1 << 20,
+};
+
 pub const Stream = struct {
     client: *Client,
     id: u31,
@@ -323,6 +347,7 @@ pub const Client = struct {
     r: *Io.Reader,
     w: *Io.Writer,
     dec: hpack.Decoder,
+    cfg: Config = .{},
     next_id: u31 = 1,
     /// Peer's SETTINGS_MAX_FRAME_SIZE. Written by the reader thread on SETTINGS
     /// and read by caller threads sizing DATA frames in `Stream.send`, so it is
@@ -384,20 +409,35 @@ pub const Client = struct {
     /// Sends the connection preface + empty SETTINGS and starts the reader.
     /// Takes `self` by pointer so the reader thread has a stable address.
     pub fn init(self: *Client, io: Io, gpa: std.mem.Allocator, r: *Io.Reader, w: *Io.Writer) !void {
+        return self.initWithConfig(io, gpa, r, w, .{});
+    }
+
+    /// As `init`, with explicit flow-control tuning. See `Config`.
+    pub fn initWithConfig(self: *Client, io: Io, gpa: std.mem.Allocator, r: *Io.Reader, w: *Io.Writer, cfg: Config) !void {
+        const cwnd = p2.clampConnWindow(cfg.connection_window_size);
         self.* = .{
             .io = io,
             .gpa = gpa,
             .r = r,
             .w = w,
             .dec = hpack.Decoder.init(gpa, p2.our_header_table_size),
+            .cfg = cfg,
+            .conn_recv_window = cwnd,
         };
         try self.w.writeAll(p2.preface);
-        // Advertise SETTINGS_ENABLE_PUSH=0 (we don't implement PUSH_PROMISE) and
-        // SETTINGS_MAX_FRAME_SIZE=16384 (the largest inbound frame we accept).
-        var settings: [12]u8 = undefined;
+        // Advertise SETTINGS_ENABLE_PUSH=0 (we don't implement PUSH_PROMISE),
+        // SETTINGS_MAX_FRAME_SIZE=16384 (the largest inbound frame we accept),
+        // and the per-stream window we are prepared to receive into.
+        var settings: [18]u8 = undefined;
         p2.putSetting(settings[0..6], p2.set_enable_push, 0);
         p2.putSetting(settings[6..12], p2.set_max_frame_size, max_recv_frame);
+        p2.putSetting(settings[12..18], p2.set_initial_window_size, @intCast(p2.clampInitialWindow(cfg.initial_window_size)));
         try self.writeFrame(.settings, 0, 0, &settings);
+        // The connection window is the one thing SETTINGS cannot carry: it is
+        // fixed at 65535 and only ever grows by WINDOW_UPDATE (RFC 7540 §6.9.2).
+        if (cwnd > p2.default_window) {
+            self.windowUpdate(0, @intCast(cwnd - p2.default_window));
+        }
         self.reader_thread = std.Thread.spawn(.{}, readerLoop, .{self}) catch return error.SystemResources;
     }
 
@@ -560,7 +600,9 @@ pub const Client = struct {
             self.admitCancel();
             return error.OutOfMemory;
         };
-        st.* = .{ .client = self, .id = sid, .send_window = 0 };
+        // The receive window must match the SETTINGS_INITIAL_WINDOW_SIZE we
+        // advertised, or our ledger disagrees with the peer's from the start.
+        st.* = .{ .client = self, .id = sid, .send_window = 0, .recv_window = p2.clampInitialWindow(self.cfg.initial_window_size) };
         self.streams_mu.lockUncancelable(self.io);
         // Seed the send window under streams_mu, which applyInitialWindow also
         // holds while it rewrites peer_initial_window and shifts every
@@ -1618,7 +1660,11 @@ test "client defers WINDOW_UPDATE until DATA is consumed (backpressure)" {
     var csr = cstream.reader(io, &crbuf);
     var csw = cstream.writer(io, &cwbuf);
     var client: Client = undefined;
-    try client.init(io, testing.allocator, &csr.interface, &csw.interface);
+    // RFC floor, so the handshake emits no stream-0 WINDOW_UPDATE to confuse
+    // the "no WINDOW_UPDATE before consumption" assertion below.
+    try client.initWithConfig(io, testing.allocator, &csr.interface, &csw.interface, .{
+        .connection_window_size = @intCast(p2.default_window),
+    });
     defer client.deinit();
 
     var arbuf: [4096]u8 = undefined;
@@ -2634,7 +2680,11 @@ test "client GOAWAYs DATA beyond the connection receive window" {
     var csr = cstream.reader(io, &crbuf);
     var csw = cstream.writer(io, &cwbuf);
     var client: Client = undefined;
-    try client.init(io, testing.allocator, &csr.interface, &csw.interface);
+    // Pinned to the RFC floor: this test is about the overflow check, not about
+    // what the default window happens to be.
+    try client.initWithConfig(io, testing.allocator, &csr.interface, &csw.interface, .{
+        .connection_window_size = @intCast(p2.default_window),
+    });
 
     var arbuf: [8192]u8 = undefined;
     var awbuf: [70000]u8 = undefined;
@@ -2946,4 +2996,200 @@ test "client GOAWAYs a peer PUSH_PROMISE before tearing down" {
     const code = try ctReadGoawayCode(testing.allocator, &asr.interface);
     try testing.expectEqual(@as(u32, @intFromEnum(p2.ErrorCode.protocol_error)), code);
     client.deinit();
+}
+
+test "the client advertises its receive windows during the handshake" {
+    // Both halves of the window it is prepared to receive into: the per-stream
+    // one via SETTINGS_INITIAL_WINDOW_SIZE, and the connection one via a
+    // stream-0 WINDOW_UPDATE — SETTINGS cannot carry the latter, which is
+    // fixed at 65535 and only ever grows by WINDOW_UPDATE (RFC 7540 §6.9.2).
+    const io = testing.io;
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var srv = try addr.listen(io, .{ .mode = .stream, .reuse_address = true });
+    defer srv.deinit(io);
+    const port = srv.socket.address.ip4.port;
+    const caddr = try net.IpAddress.parse("127.0.0.1", port);
+    const cstream = try caddr.connect(io, .{ .mode = .stream });
+    defer cstream.close(io);
+    var accepted = try srv.accept(io);
+
+    var crbuf: [4096]u8 = undefined;
+    var cwbuf: [4096]u8 = undefined;
+    var csr = cstream.reader(io, &crbuf);
+    var csw = cstream.writer(io, &cwbuf);
+    var client: Client = undefined;
+    try client.initWithConfig(io, testing.allocator, &csr.interface, &csw.interface, .{
+        .connection_window_size = 1 << 20,
+        .initial_window_size = 512 * 1024,
+    });
+    defer client.deinit();
+    defer accepted.close(io);
+
+    var arbuf: [4096]u8 = undefined;
+    var asr = accepted.reader(io, &arbuf);
+    var pf: [p2.preface.len]u8 = undefined;
+    try asr.interface.readSliceAll(&pf);
+
+    var settings = try ctRead(testing.allocator, &asr.interface);
+    defer settings.deinit(testing.allocator);
+    try testing.expectEqual(p2.FrameType.settings, settings.hdr.ftype);
+    var advertised_iw: ?u32 = null;
+    var i: usize = 0;
+    while (i + 6 <= settings.payload.len) : (i += 6) {
+        const id = std.mem.readInt(u16, settings.payload[i..][0..2], .big);
+        const val = std.mem.readInt(u32, settings.payload[i + 2 ..][0..4], .big);
+        if (id == p2.set_initial_window_size) advertised_iw = val;
+    }
+    try testing.expectEqual(@as(u32, 512 * 1024), advertised_iw.?);
+
+    // Send our SETTINGS so the client owes us an ack, then read until it
+    // arrives, noting any stream-0 WINDOW_UPDATE on the way. Reading straight
+    // for the WINDOW_UPDATE would block forever on a build that never sends
+    // one — a hang instead of a failure.
+    var awbuf2: [256]u8 = undefined;
+    var asw2 = accepted.writer(io, &awbuf2);
+    try ctWrite(&asw2.interface, .settings, 0, 0, "");
+    var conn_incr: ?u32 = null;
+    while (true) {
+        var f = try ctRead(testing.allocator, &asr.interface);
+        defer f.deinit(testing.allocator);
+        if (f.hdr.ftype == .window_update and f.hdr.sid == 0) {
+            conn_incr = std.mem.readInt(u32, f.payload[0..4], .big) & 0x7fff_ffff;
+        }
+        if (f.hdr.ftype == .settings and f.hdr.flags & p2.flag_ack != 0) break;
+    }
+    try testing.expectEqual(@as(u32, (1 << 20) - 65535), conn_incr.?);
+}
+
+test "a default client keeps the RFC floor untouched when configured to it" {
+    // The floor is a legal configuration and must emit no stream-0
+    // WINDOW_UPDATE at all — enlarging by zero would be a PROTOCOL_ERROR.
+    const io = testing.io;
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var srv = try addr.listen(io, .{ .mode = .stream, .reuse_address = true });
+    defer srv.deinit(io);
+    const port = srv.socket.address.ip4.port;
+    const caddr = try net.IpAddress.parse("127.0.0.1", port);
+    const cstream = try caddr.connect(io, .{ .mode = .stream });
+    defer cstream.close(io);
+    var accepted = try srv.accept(io);
+
+    var crbuf: [4096]u8 = undefined;
+    var cwbuf: [4096]u8 = undefined;
+    var csr = cstream.reader(io, &crbuf);
+    var csw = cstream.writer(io, &cwbuf);
+    var client: Client = undefined;
+    try client.initWithConfig(io, testing.allocator, &csr.interface, &csw.interface, .{
+        .connection_window_size = @intCast(p2.default_window),
+    });
+    defer client.deinit();
+    defer accepted.close(io);
+
+    var arbuf: [4096]u8 = undefined;
+    var awbuf: [4096]u8 = undefined;
+    var asr = accepted.reader(io, &arbuf);
+    var asw = accepted.writer(io, &awbuf);
+    var pf: [p2.preface.len]u8 = undefined;
+    try asr.interface.readSliceAll(&pf);
+    var settings = try ctRead(testing.allocator, &asr.interface);
+    settings.deinit(testing.allocator);
+
+    // Next frame from the client must be its SETTINGS ack for ours, not a
+    // WINDOW_UPDATE.
+    try ctWrite(&asw.interface, .settings, 0, 0, "");
+    var next = try ctRead(testing.allocator, &asr.interface);
+    defer next.deinit(testing.allocator);
+    try testing.expectEqual(p2.FrameType.settings, next.hdr.ftype);
+    try testing.expect(next.hdr.flags & p2.flag_ack != 0);
+}
+
+test "an enlarged connection window accepts more than 65535 bytes in flight" {
+    // The point of the knob: with the RFC floor a peer may only have 65535
+    // bytes outstanding before it must wait for a WINDOW_UPDATE, which caps a
+    // download at roughly one window per round trip. Here the peer pushes
+    // ~96 KiB without waiting for anything, and the client must take it
+    // instead of answering FLOW_CONTROL_ERROR.
+    const io = testing.io;
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var srv = try addr.listen(io, .{ .mode = .stream, .reuse_address = true });
+    defer srv.deinit(io);
+    const port = srv.socket.address.ip4.port;
+    const caddr = try net.IpAddress.parse("127.0.0.1", port);
+    const cstream = try caddr.connect(io, .{ .mode = .stream });
+    defer cstream.close(io);
+    var accepted = try srv.accept(io);
+
+    var crbuf: [8192]u8 = undefined;
+    var cwbuf: [8192]u8 = undefined;
+    var csr = cstream.reader(io, &crbuf);
+    var csw = cstream.writer(io, &cwbuf);
+    var client: Client = undefined;
+    try client.initWithConfig(io, testing.allocator, &csr.interface, &csw.interface, .{
+        .connection_window_size = 1 << 20,
+        .initial_window_size = 1 << 20,
+    });
+    defer client.deinit();
+    defer accepted.close(io);
+
+    var arbuf: [8192]u8 = undefined;
+    var awbuf: [65536]u8 = undefined;
+    var asr = accepted.reader(io, &arbuf);
+    var asw = accepted.writer(io, &awbuf);
+    var pf: [p2.preface.len]u8 = undefined;
+    try asr.interface.readSliceAll(&pf);
+    var cs = try ctRead(testing.allocator, &asr.interface);
+    cs.deinit(testing.allocator);
+    // Drain the handshake up to our ack rather than assuming the next frame is
+    // the stream-0 enlargement, so a build that omits it fails on the transfer
+    // below instead of blocking here.
+    try ctWrite(&asw.interface, .settings, 0, 0, "");
+    while (true) {
+        var f = try ctRead(testing.allocator, &asr.interface);
+        defer f.deinit(testing.allocator);
+        if (f.hdr.ftype == .settings and f.hdr.flags & p2.flag_ack != 0) break;
+    }
+
+    const s = try client.openStream(.{ .path = "/big" }, true);
+    var hf = try ctRead(testing.allocator, &asr.interface);
+    while (hf.hdr.ftype != .headers) {
+        hf.deinit(testing.allocator);
+        hf = try ctRead(testing.allocator, &asr.interface);
+    }
+    const sid = hf.hdr.sid;
+    hf.deinit(testing.allocator);
+
+    var blk: struct { buf: std.ArrayList(u8) = .empty } = .{};
+    defer blk.buf.deinit(testing.allocator);
+    try blk.buf.append(testing.allocator, 0x88); // :status 200
+    try ctWrite(&asw.interface, .headers, p2.flag_end_headers, sid, blk.buf.items);
+
+    // 6 x 16 KiB = 98304 bytes, all before the client has consumed anything.
+    var chunk: [16384]u8 = @splat('z');
+    var sent: usize = 0;
+    while (sent < 6) : (sent += 1) try ctWrite(&asw.interface, .data, 0, sid, &chunk);
+    try ctWrite(&asw.interface, .data, p2.flag_end_stream, sid, "");
+
+    // Let the client's reader take all of it in BEFORE we consume anything.
+    // That is the state under test: the peer has ~96 KiB outstanding while we
+    // are still busy. Without the pause the consumer below races the reader,
+    // replenishing as it goes, and a 65535-byte window might never be
+    // exceeded — the test would pass on an unfixed build depending on timing.
+    std.Io.sleep(io, .{ .nanoseconds = 200 * std.time.ns_per_ms }, .awake) catch {};
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var got: usize = 0;
+    while (true) {
+        const ev = try s.readEvent(arena_state.allocator());
+        switch (ev) {
+            .data => |d| {
+                got += d.payload.len;
+                if (d.end_stream) break;
+            },
+            .headers => |h| if (h.end_stream) break,
+            .rst, .goaway => return error.UnexpectedStreamEnd,
+        }
+        _ = arena_state.reset(.retain_capacity);
+    }
+    try testing.expectEqual(@as(usize, 6 * 16384), got);
 }
