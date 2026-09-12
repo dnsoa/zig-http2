@@ -63,6 +63,12 @@ const max_recv_frame: u32 = p2.our_max_frame_size; // 16384
 /// Hard cap on one response's accumulated header block across HEADERS +
 /// CONTINUATION (CVE-2024-27316 class); matches the server's bound.
 const max_header_block: usize = 256 * 1024;
+/// Cap on CONTINUATION frames per header block, mirroring the server's. Bytes
+/// are already bounded by `max_header_block`, but a zero-length CONTINUATION
+/// adds none, so a peer streaming empty ones makes no byte progress and the
+/// size cap never fires — `readContinuations` would loop forever. A legitimate
+/// block needs a handful (256KiB / 16KiB ⇒ ~16), so this is generous.
+const max_continuation_frames: usize = 256;
 
 pub const Stream = struct {
     client: *Client,
@@ -140,7 +146,7 @@ pub const Stream = struct {
                     c.send_cond.waitUncancelable(c.io, &c.send_mu);
                     continue;
                 }
-                const want: i64 = @min(@as(i64, @intCast(data.len - off)), @min(avail, @as(i64, @intCast(c.peer_max_frame))));
+                const want: i64 = @min(@as(i64, @intCast(data.len - off)), @min(avail, @as(i64, @intCast(c.peer_max_frame.load(.acquire)))));
                 self.send_window -= want;
                 c.conn_send_window -= want;
                 break :blk @as(usize, @intCast(want));
@@ -313,7 +319,11 @@ pub const Client = struct {
     w: *Io.Writer,
     dec: hpack.Decoder,
     next_id: u31 = 1,
-    peer_max_frame: u32 = 16384,
+    /// Peer's SETTINGS_MAX_FRAME_SIZE. Written by the reader thread on SETTINGS
+    /// and read by caller threads sizing DATA frames in `Stream.send`, so it is
+    /// atomic — the same reader-writes/worker-reads pattern as the server's
+    /// `Settings.max_frame_size`.
+    peer_max_frame: std.atomic.Value(u32) = .init(16384),
     /// Peer's advertised SETTINGS_INITIAL_WINDOW_SIZE. Written by the reader
     /// thread (applyInitialWindow) and read by opener threads (openStream), so
     /// it is atomic to avoid a data race on that cross-thread read.
@@ -537,8 +547,14 @@ pub const Client = struct {
             self.admitCancel();
             return error.OutOfMemory;
         };
-        st.* = .{ .client = self, .id = sid, .send_window = self.peer_initial_window.load(.acquire) };
+        st.* = .{ .client = self, .id = sid, .send_window = 0 };
         self.streams_mu.lockUncancelable(self.io);
+        // Seed the send window under streams_mu, which applyInitialWindow also
+        // holds while it rewrites peer_initial_window and shifts every
+        // registered stream. Reading it outside the lock let a concurrent
+        // SETTINGS land in between, so the new stream picked up neither the new
+        // value nor the delta and ran with a stale window.
+        st.send_window = self.peer_initial_window.load(.acquire);
         self.streams.put(self.gpa, sid, st) catch {
             self.streams_mu.unlock(self.io);
             self.write_mu.unlock(self.io);
@@ -694,7 +710,12 @@ pub const Client = struct {
             .headers => {
                 var block: std.ArrayList(u8) = .empty;
                 defer block.deinit(self.gpa);
-                try block.appendSlice(self.gpa, stripHeaderPadding(fh, payload));
+                const frag = stripHeaderPadding(fh, payload) orelse {
+                    self.sendGoaway(.protocol_error);
+                    self.kill();
+                    return error.ProtocolError;
+                };
+                try block.appendSlice(self.gpa, frag);
                 if (fh.flags & p2.flag_end_headers == 0) try self.readContinuations(fh.sid, &block);
                 const hs = try self.dec.decode(self.gpa, block.items);
                 try self.deliver(fh.sid, true, hs, &[_]u8{}, fh.flags & p2.flag_end_stream != 0, 0);
@@ -719,7 +740,16 @@ pub const Client = struct {
                 self.kill();
                 return error.ConnectionClosed;
             },
-            else => {}, // priority / stray continuation
+            .continuation => {
+                // `readContinuations` consumes an in-sequence CONTINUATION
+                // inline, so one arriving here continues nothing: a connection
+                // PROTOCOL_ERROR (RFC 9113 §6.10). Ignoring it also dropped a
+                // header-block fragment, desyncing HPACK for every later frame.
+                self.sendGoaway(.protocol_error);
+                self.kill();
+                return error.ProtocolError;
+            },
+            else => {}, // priority
         }
     }
 
@@ -829,7 +859,7 @@ pub const Client = struct {
             const val = std.mem.readInt(u32, payload[i + 2 ..][0..4], .big);
             switch (id) {
                 p2.set_max_frame_size => if (val >= 16384 and val <= 16777215) {
-                    self.peer_max_frame = val;
+                    self.peer_max_frame.store(val, .release);
                 },
                 p2.set_initial_window_size => {
                     if (val > 0x7fff_ffff) {
@@ -866,14 +896,28 @@ pub const Client = struct {
     }
 
     fn readContinuations(self: *Client, sid: u31, block: *std.ArrayList(u8)) !void {
+        var frames: usize = 0;
         while (true) {
             var hb: [9]u8 = undefined;
             try self.r.readSliceAll(&hb);
             const cf = p2.parseHeader(&hb);
-            if (cf.ftype != .continuation or cf.sid != sid) return error.ProtocolError;
+            if (cf.ftype != .continuation or cf.sid != sid) {
+                // A header block must not be interleaved with any other frame
+                // (RFC 9113 §6.10) — a connection error, so say so on the wire
+                // rather than just dropping the connection.
+                self.sendGoaway(.protocol_error);
+                return error.ProtocolError;
+            }
             if (cf.length > max_recv_frame) {
                 self.sendGoaway(.frame_size_error);
                 return error.FrameSizeError;
+            }
+            frames += 1;
+            if (frames > max_continuation_frames) {
+                // Zero-length CONTINUATIONs never grow `block`, so the byte cap
+                // below cannot stop an endless stream of them; cap the count.
+                self.sendGoaway(.enhance_your_calm);
+                return error.ProtocolError;
             }
             if (block.items.len + cf.length > max_header_block) {
                 self.sendGoaway(.enhance_your_calm);
@@ -976,16 +1020,27 @@ fn stripDataPadding(fh: p2.ParsedHeader, payload: []const u8) ?[]const u8 {
     return rest[0 .. rest.len - pad];
 }
 
-/// HEADERS frames may carry PADDED/PRIORITY prefixes; strip them for decoding.
-fn stripHeaderPadding(fh: p2.ParsedHeader, payload: []const u8) []const u8 {
+/// Strips a HEADERS frame's PADDED/PRIORITY prefixes (RFC 9113 §6.2). Returns
+/// null when a prefix does not fit the payload — a connection PROTOCOL_ERROR —
+/// so the caller tears down instead of decoding what is left.
+///
+/// Trimming silently and decoding the remainder anyway is the same desync the
+/// server side had: HPACK's dynamic table is connection-wide state, so one
+/// mis-framed block leaves our table out of step with the peer's and every
+/// later indexed reference resolves to the wrong field, with no error anywhere.
+fn stripHeaderPadding(fh: p2.ParsedHeader, payload: []const u8) ?[]const u8 {
     var frag = payload;
     if (fh.flags & p2.flag_padded != 0) {
-        if (frag.len == 0) return frag;
+        if (frag.len == 0) return null; // PADDED set but no pad-length octet
         const pad = frag[0];
         frag = frag[1..];
-        if (pad <= frag.len) frag = frag[0 .. frag.len - pad];
+        if (pad > frag.len) return null; // padding longer than what remains
+        frag = frag[0 .. frag.len - pad];
     }
-    if (fh.flags & p2.flag_priority != 0 and frag.len >= 5) frag = frag[5..];
+    if (fh.flags & p2.flag_priority != 0) {
+        if (frag.len < 5) return null; // PRIORITY set but no room for its fields
+        frag = frag[5..];
+    }
     return frag;
 }
 
@@ -1864,4 +1919,212 @@ test "keepalive declares a silent peer dead instead of hanging" {
     try testing.expectError(error.ConnectionClosed, s.readEvent(arena_state.allocator()));
     const elapsed_ms = @divFloor(Io.Timestamp.now(io, .awake).nanoseconds - start, std.time.ns_per_ms);
     try testing.expect(elapsed_ms < 3000);
+}
+
+/// Waits (bounded) for the client's reader to declare the connection dead. A
+/// regression test that reads straight for the GOAWAY would block forever on
+/// the unfixed code, hanging the suite instead of reporting a failure; this
+/// gives it a deadline. The GOAWAY is written and flushed before `kill`, so it
+/// is already buffered once this returns.
+fn waitDead(io: Io, client: *Client, ms: u64) !void {
+    var waited: u64 = 0;
+    while (waited < ms) : (waited += 20) {
+        if (client.dead.load(.acquire)) return;
+        Io.sleep(io, .{ .nanoseconds = 20 * std.time.ns_per_ms }, .awake) catch {};
+    }
+    return error.ClientStillAlive;
+}
+
+test "client rejects a zero-length CONTINUATION flood with GOAWAY(ENHANCE_YOUR_CALM)" {
+    // Empty CONTINUATION frames add no bytes, so `max_header_block` never trips
+    // on them; without a frame-count cap readContinuations spins forever on a
+    // hostile server (CVE-2024-27316 class). The server side has had this cap;
+    // the client's mirror of the loop was missing it.
+    const io = testing.io;
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var srv = try addr.listen(io, .{ .mode = .stream, .reuse_address = true });
+    defer srv.deinit(io);
+    const port = srv.socket.address.ip4.port;
+    const caddr = try net.IpAddress.parse("127.0.0.1", port);
+    const cstream = try caddr.connect(io, .{ .mode = .stream });
+    defer cstream.close(io);
+    var accepted = try srv.accept(io);
+
+    var crbuf: [4096]u8 = undefined;
+    var cwbuf: [4096]u8 = undefined;
+    var csr = cstream.reader(io, &crbuf);
+    var csw = cstream.writer(io, &cwbuf);
+    var client: Client = undefined;
+    try client.init(io, testing.allocator, &csr.interface, &csw.interface);
+    // Teardown order matters: `deinit` joins the reader thread, which only
+    // leaves its blocking read once the transport closes. Closing the server
+    // side first (this defer runs before `deinit`'s) means that on a build
+    // without the fix these tests fail on waitDead's deadline instead of
+    // hanging the suite in `deinit`.
+    defer client.deinit();
+    defer accepted.close(io);
+
+    var arbuf: [4096]u8 = undefined;
+    var awbuf: [8192]u8 = undefined;
+    var asr = accepted.reader(io, &arbuf);
+    var asw = accepted.writer(io, &awbuf);
+    var pf: [p2.preface.len]u8 = undefined;
+    try asr.interface.readSliceAll(&pf);
+    var cs = try ctRead(testing.allocator, &asr.interface);
+    cs.deinit(testing.allocator);
+    try ctWrite(&asw.interface, .settings, 0, 0, "");
+    try ctWrite(&asw.interface, .settings, p2.flag_ack, 0, "");
+
+    // HEADERS (sid 1, END_HEADERS clear), then empty CONTINUATIONs past the cap.
+    try ctWrite(&asw.interface, .headers, 0, 1, "");
+    var i: usize = 0;
+    while (i < 400) : (i += 1) ctWrite(&asw.interface, .continuation, 0, 1, "") catch break;
+
+    try waitDead(io, &client, 3000);
+    const code = try ctReadGoawayCode(testing.allocator, &asr.interface);
+    try testing.expectEqual(@as(u32, @intFromEnum(p2.ErrorCode.enhance_your_calm)), code);
+}
+
+test "client treats a stray CONTINUATION as a connection PROTOCOL_ERROR" {
+    // A CONTINUATION with no HEADERS to continue was ignored, dropping a header
+    // block fragment and desyncing HPACK for every later frame.
+    const io = testing.io;
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var srv = try addr.listen(io, .{ .mode = .stream, .reuse_address = true });
+    defer srv.deinit(io);
+    const port = srv.socket.address.ip4.port;
+    const caddr = try net.IpAddress.parse("127.0.0.1", port);
+    const cstream = try caddr.connect(io, .{ .mode = .stream });
+    defer cstream.close(io);
+    var accepted = try srv.accept(io);
+
+    var crbuf: [4096]u8 = undefined;
+    var cwbuf: [4096]u8 = undefined;
+    var csr = cstream.reader(io, &crbuf);
+    var csw = cstream.writer(io, &cwbuf);
+    var client: Client = undefined;
+    try client.init(io, testing.allocator, &csr.interface, &csw.interface);
+    // Teardown order matters: `deinit` joins the reader thread, which only
+    // leaves its blocking read once the transport closes. Closing the server
+    // side first (this defer runs before `deinit`'s) means that on a build
+    // without the fix these tests fail on waitDead's deadline instead of
+    // hanging the suite in `deinit`.
+    defer client.deinit();
+    defer accepted.close(io);
+
+    var arbuf: [4096]u8 = undefined;
+    var awbuf: [4096]u8 = undefined;
+    var asr = accepted.reader(io, &arbuf);
+    var asw = accepted.writer(io, &awbuf);
+    var pf: [p2.preface.len]u8 = undefined;
+    try asr.interface.readSliceAll(&pf);
+    var cs = try ctRead(testing.allocator, &asr.interface);
+    cs.deinit(testing.allocator);
+    try ctWrite(&asw.interface, .settings, 0, 0, "");
+
+    try ctWrite(&asw.interface, .continuation, p2.flag_end_headers, 1, "");
+
+    try waitDead(io, &client, 3000);
+    const code = try ctReadGoawayCode(testing.allocator, &asr.interface);
+    try testing.expectEqual(@as(u32, @intFromEnum(p2.ErrorCode.protocol_error)), code);
+}
+
+test "client treats a HEADERS whose padding exceeds the payload as a connection PROTOCOL_ERROR" {
+    // Symmetric with the server's "padding exceeds payload" test. Trimming a bad
+    // prefix and decoding the remainder anyway desyncs HPACK for the rest of the
+    // connection, silently — the same class this PR closed on the server.
+    const io = testing.io;
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var srv = try addr.listen(io, .{ .mode = .stream, .reuse_address = true });
+    defer srv.deinit(io);
+    const port = srv.socket.address.ip4.port;
+    const caddr = try net.IpAddress.parse("127.0.0.1", port);
+    const cstream = try caddr.connect(io, .{ .mode = .stream });
+    defer cstream.close(io);
+    var accepted = try srv.accept(io);
+
+    var crbuf: [4096]u8 = undefined;
+    var cwbuf: [4096]u8 = undefined;
+    var csr = cstream.reader(io, &crbuf);
+    var csw = cstream.writer(io, &cwbuf);
+    var client: Client = undefined;
+    try client.init(io, testing.allocator, &csr.interface, &csw.interface);
+    defer client.deinit();
+    defer accepted.close(io);
+
+    var arbuf: [4096]u8 = undefined;
+    var awbuf: [4096]u8 = undefined;
+    var asr = accepted.reader(io, &arbuf);
+    var asw = accepted.writer(io, &awbuf);
+    var pf: [p2.preface.len]u8 = undefined;
+    try asr.interface.readSliceAll(&pf);
+    var cs = try ctRead(testing.allocator, &asr.interface);
+    cs.deinit(testing.allocator);
+    try ctWrite(&asw.interface, .settings, 0, 0, "");
+
+    const s = try client.openStream(.{ .path = "/x" }, true);
+    _ = s;
+    // PADDED response HEADERS declaring 200 bytes of padding over a 1-byte
+    // fragment. The fragment alone (0x88 = indexed ":status 200") is a complete,
+    // valid block, so on the old silent-trim path the client decodes it happily
+    // and stays alive — the test then fails on waitDead's deadline rather than
+    // passing for the wrong reason or blocking on a GOAWAY that never comes.
+    const padded = [_]u8{ 200, 0x88 };
+    try ctWrite(&asw.interface, .headers, p2.flag_end_headers | p2.flag_padded, 1, &padded);
+
+    try waitDead(io, &client, 3000);
+    const code = try ctReadGoawayCode(testing.allocator, &asr.interface);
+    try testing.expectEqual(@as(u32, @intFromEnum(p2.ErrorCode.protocol_error)), code);
+}
+
+test "openStream seeds a new stream's window from the peer's INITIAL_WINDOW_SIZE" {
+    // Pins the seeding itself: a stream opened after the peer's SETTINGS must
+    // start at the advertised window, not the RFC default. (The lock that makes
+    // the seed atomic against a concurrent applyInitialWindow is not directly
+    // observable — breaking the atomicity is what a race test would require.)
+    const io = testing.io;
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var srv = try addr.listen(io, .{ .mode = .stream, .reuse_address = true });
+    defer srv.deinit(io);
+    const port = srv.socket.address.ip4.port;
+    const caddr = try net.IpAddress.parse("127.0.0.1", port);
+    const cstream = try caddr.connect(io, .{ .mode = .stream });
+    defer cstream.close(io);
+    var accepted = try srv.accept(io);
+
+    var crbuf: [4096]u8 = undefined;
+    var cwbuf: [4096]u8 = undefined;
+    var csr = cstream.reader(io, &crbuf);
+    var csw = cstream.writer(io, &cwbuf);
+    var client: Client = undefined;
+    try client.init(io, testing.allocator, &csr.interface, &csw.interface);
+    defer client.deinit();
+    defer accepted.close(io);
+
+    var arbuf: [4096]u8 = undefined;
+    var awbuf: [4096]u8 = undefined;
+    var asr = accepted.reader(io, &arbuf);
+    var asw = accepted.writer(io, &awbuf);
+    var pf: [p2.preface.len]u8 = undefined;
+    try asr.interface.readSliceAll(&pf);
+    var cs = try ctRead(testing.allocator, &asr.interface);
+    cs.deinit(testing.allocator);
+
+    // Advertise a non-default initial window, then wait for our ack so the
+    // setting is known to be applied before the stream is opened.
+    var iw: [6]u8 = undefined;
+    p2.putSetting(&iw, p2.set_initial_window_size, 4096);
+    try ctWrite(&asw.interface, .settings, 0, 0, &iw);
+    while (true) {
+        var f = try ctRead(testing.allocator, &asr.interface);
+        const is_ack = f.hdr.ftype == .settings and (f.hdr.flags & p2.flag_ack != 0);
+        f.deinit(testing.allocator);
+        if (is_ack) break;
+    }
+
+    const s = try client.openStream(.{ .path = "/x" }, false);
+    client.send_mu.lockUncancelable(io);
+    const window = s.send_window;
+    client.send_mu.unlock(io);
+    try testing.expectEqual(@as(i64, 4096), window);
 }

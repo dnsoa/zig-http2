@@ -50,8 +50,13 @@ const putSetting = proto2.putSetting;
 const our_max_concurrent: u32 = 128;
 
 const Settings = struct {
+    /// Peer's SETTINGS_INITIAL_WINDOW_SIZE. Reader-thread-only (read in
+    /// handleHeaders, written in applyInitialWindow), so a plain field.
     initial_window_size: u32 = 65535,
-    max_frame_size: u32 = 16384,
+    /// Peer's SETTINGS_MAX_FRAME_SIZE. Written by the reader thread on SETTINGS
+    /// and read by worker threads sizing DATA/HEADERS frames, so it is atomic
+    /// rather than a plain field shared across threads.
+    max_frame_size: std.atomic.Value(u32) = .init(16384),
 };
 
 /// Timeouts and limits for a server connection.
@@ -320,7 +325,7 @@ const H2Stream = struct {
                 }
                 const avail = @min(self.send_window, conn.send_window);
                 if (avail > 0) {
-                    const want: i64 = @min(@as(i64, @intCast(data.len - off)), @min(avail, @as(i64, conn.peer.max_frame_size)));
+                    const want: i64 = @min(@as(i64, @intCast(data.len - off)), @min(avail, @as(i64, conn.peer.max_frame_size.load(.acquire))));
                     self.send_window -= want;
                     conn.send_window -= want;
                     break :blk @as(usize, @intCast(want));
@@ -526,7 +531,7 @@ const Connection = struct {
     /// HEADERS (+ CONTINUATION when the block exceeds the peer's max frame size),
     /// emitted atomically so no other stream's frames interleave.
     fn writeHeaders(self: *Connection, sid: u31, block: []const u8, end_stream: bool) !void {
-        const max = self.peer.max_frame_size;
+        const max = self.peer.max_frame_size.load(.acquire);
         // END_STREAM rides the HEADERS frame (never CONTINUATION).
         const es: u8 = if (end_stream) flag_end_stream else 0;
         self.cw.lock();
@@ -645,7 +650,15 @@ fn readLoop(conn: *Connection, r: *Io.Reader) void {
             .data => if (!handleData(conn, fh, payload)) return,
             .rst_stream => if (!resetStream(conn, fh.sid)) return,
             .goaway => return, // peer is leaving; stop reading, drain workers
-            .priority, .continuation => {}, // stray CONTINUATION ignored; PRIORITY no-op
+            .priority => {}, // no-op: we do not implement prioritization
+            .continuation => {
+                // handleHeaders consumes an in-sequence CONTINUATION inline, so
+                // one reaching here has no HEADERS to continue: a connection
+                // PROTOCOL_ERROR (RFC 9113 §6.10). Ignoring it also dropped a
+                // header-block fragment on the floor, desyncing HPACK.
+                sendGoaway(conn, .protocol_error);
+                return;
+            },
             else => {},
         }
     }
@@ -715,7 +728,7 @@ fn handleSettings(conn: *Connection, fh: ParsedHeader, payload: []const u8) bool
                     sendGoaway(conn, .protocol_error);
                     return false;
                 }
-                conn.peer.max_frame_size = val;
+                conn.peer.max_frame_size.store(val, .release);
             },
             else => {}, // header_table_size/enable_push/max_concurrent_streams: irrelevant to us
         }
@@ -937,17 +950,30 @@ fn sendGoaway(conn: *Connection, code: ErrorCode) void {
 fn handleHeaders(conn: *Connection, r: *Io.Reader, fh: ParsedHeader, first: []const u8) !void {
     const gpa = conn.gpa;
 
-    // Strip PADDED / PRIORITY prefixes from the first fragment.
+    // Strip PADDED / PRIORITY prefixes from the first fragment. A prefix that
+    // does not fit the payload is a connection PROTOCOL_ERROR (RFC 9113 §6.2):
+    // returning quietly instead left the stream with no response at all *and*
+    // skipped the HPACK decode below, desyncing the decoder for the rest of the
+    // connection.
     var frag = first;
     if (fh.flags & flag_padded != 0) {
-        if (frag.len == 0) return;
+        if (frag.len == 0) {
+            sendGoaway(conn, .protocol_error);
+            return error.ProtocolError;
+        }
         const pad = frag[0];
         frag = frag[1..];
-        if (pad > frag.len) return;
+        if (pad > frag.len) {
+            sendGoaway(conn, .protocol_error);
+            return error.ProtocolError;
+        }
         frag = frag[0 .. frag.len - pad];
     }
     if (fh.flags & flag_priority != 0) {
-        if (frag.len < 5) return;
+        if (frag.len < 5) {
+            sendGoaway(conn, .protocol_error);
+            return error.ProtocolError;
+        }
         frag = frag[5..];
     }
 
@@ -964,7 +990,17 @@ fn handleHeaders(conn: *Connection, r: *Io.Reader, fh: ParsedHeader, first: []co
             var hb: [9]u8 = undefined;
             try readSliceTimed(conn, r, &hb, conn.srv.config.head_timeout_ms);
             const cf = parseHeader(&hb);
-            if (cf.ftype != .continuation or cf.sid != fh.sid or cf.length > effectiveMaxFrameSize(conn.srv.config)) return error.ProtocolError;
+            if (cf.ftype != .continuation or cf.sid != fh.sid) {
+                // A header block must not be interleaved with any other frame
+                // (RFC 9113 §6.10) — a connection error, so say so on the wire
+                // rather than just dropping the connection.
+                sendGoaway(conn, .protocol_error);
+                return error.ProtocolError;
+            }
+            if (cf.length > effectiveMaxFrameSize(conn.srv.config)) {
+                sendGoaway(conn, .frame_size_error);
+                return error.ProtocolError;
+            }
             cont_frames += 1;
             if (cont_frames > max_continuation_frames) {
                 // Zero-length CONTINUATION frames never grow `block`, so the byte
@@ -999,38 +1035,26 @@ fn handleHeaders(conn: *Connection, r: *Io.Reader, fh: ParsedHeader, first: []co
         return error.ProtocolError;
     }
     // An odd id at or below the highest we've opened but not currently open is a
-    // closed (or idle) stream. Decode the block to keep the HPACK decoder synced
-    // (we keep the connection alive), then RST rather than GOAWAY.
-    if (fh.sid <= conn.last_stream_id) {
-        decodeDiscard(conn, block.items) catch {
-            sendGoaway(conn, .protocol_error);
-            return error.ProtocolError;
-        };
-        rstStreamCode(conn, fh.sid, .stream_closed);
-        return;
-    }
+    // closed (or idle) stream: RST rather than GOAWAY, keeping the connection.
+    if (fh.sid <= conn.last_stream_id) return refuseStream(conn, fh.sid, block.items, .stream_closed);
     conn.last_stream_id = fh.sid;
 
     // Graceful shutdown: stop accepting new streams once the server is stopping.
     // Refuse this one; in-flight streams keep draining and readLoop sends the
     // connection GOAWAY when it exits.
-    if (conn.srv.stop.load(.acquire)) {
-        rstStreamCode(conn, fh.sid, .refused_stream);
-        return;
-    }
+    if (conn.srv.stop.load(.acquire)) return refuseStream(conn, fh.sid, block.items, .refused_stream);
 
     // Concurrency cap.
     conn.streams_mu.lockUncancelable(conn.io);
     const count = conn.streams.count();
     conn.streams_mu.unlock(conn.io);
     if (count >= conn.srv.config.max_concurrent_streams) {
-        rstStreamCode(conn, fh.sid, .refused_stream);
-        return;
+        return refuseStream(conn, fh.sid, block.items, .refused_stream);
     }
 
     // Build the stream (owns its request arena). Decode happens on this (reader)
     // thread so the HPACK decoder stays single-threaded.
-    const st = gpa.create(H2Stream) catch return;
+    const st = gpa.create(H2Stream) catch return refuseStream(conn, fh.sid, block.items, .internal_error);
     st.* = .{
         .conn = conn,
         .id = fh.sid,
@@ -1049,10 +1073,9 @@ fn handleHeaders(conn: *Connection, r: *Io.Reader, fh: ParsedHeader, first: []co
     st.req = buildRequest(arena, decoded) catch |err| {
         st.arena_state.deinit();
         gpa.destroy(st);
-        if (err == error.BadRequest) {
-            rstStreamCode(conn, fh.sid, .protocol_error);
-            return;
-        }
+        // Either way the stream gets a reset: without one the peer waits for a
+        // response that will never come.
+        rstStreamCode(conn, fh.sid, if (err == error.BadRequest) .protocol_error else .internal_error);
         return;
     };
 
@@ -1061,6 +1084,7 @@ fn handleHeaders(conn: *Connection, r: *Io.Reader, fh: ParsedHeader, first: []co
         conn.streams_mu.unlock(conn.io);
         st.arena_state.deinit();
         gpa.destroy(st);
+        rstStreamCode(conn, fh.sid, .internal_error);
         return;
     };
     conn.streams_opened +%= 1;
@@ -1073,6 +1097,27 @@ fn handleHeaders(conn: *Connection, r: *Io.Reader, fh: ParsedHeader, first: []co
     // has not been spawned yet, so this thread owns `st`.
     if (fh.flags & flag_end_stream != 0) st.rx_eof = true else st.has_body = true;
     spawnWorker(conn, st);
+}
+
+/// Rejects one stream with `code` while keeping the connection usable.
+///
+/// The header block MUST still be fed to the HPACK decoder even though nobody
+/// will see the fields: HPACK's dynamic table is connection-wide state built
+/// from every block in wire order (RFC 7541 §2.2), independent of which streams
+/// we choose to serve. Skipping the decode leaves our table one entry behind the
+/// peer's, and from then on every indexed reference on the connection resolves
+/// to the wrong field — silently, with no error anywhere. Refusing at
+/// `max_concurrent_streams` is ordinary behaviour, not an attack, so this path
+/// is routine; in a proxy the mismatch is a header-smuggling primitive.
+///
+/// Returns an error only when the block itself is malformed, which is
+/// connection-fatal (GOAWAY already sent).
+fn refuseStream(conn: *Connection, sid: u31, block: []const u8, code: ErrorCode) !void {
+    decodeDiscard(conn, block) catch {
+        sendGoaway(conn, .protocol_error);
+        return error.ProtocolError;
+    };
+    rstStreamCode(conn, sid, code);
 }
 
 /// Decodes a header block into a throwaway arena purely to advance the HPACK
@@ -1209,6 +1254,10 @@ fn buildRequest(arena: std.mem.Allocator, decoded: []const hpack.Header) !types.
             continue;
         }
         saw_regular = true;
+        // HTTP/2 field names are lowercase on the wire; an uppercase byte makes
+        // the request malformed (RFC 9113 §8.2.1). Accepting it lets a peer
+        // smuggle a field past any downstream check that compares case-sensitively.
+        for (h.name) |ch| if (std.ascii.isUpper(ch)) return error.BadRequest;
         if (isConnectionSpecificHeader(h.name)) return error.BadRequest;
         if (std.ascii.eqlIgnoreCase(h.name, "te") and !std.mem.eql(u8, h.value, "trailers")) return error.BadRequest;
         if (std.ascii.eqlIgnoreCase(h.name, "content-length")) {
@@ -3166,4 +3215,126 @@ test "h2: HEADERS on a closed stream is RST(STREAM_CLOSED), not GOAWAY" {
     defer rst.deinit(testing.allocator);
     try testing.expectEqual(@as(u31, 1), rst.header.sid);
     try testing.expectEqual(@as(u32, @intFromEnum(ErrorCode.stream_closed)), std.mem.readInt(u32, rst.payload[0..4], .big));
+}
+
+/// Responds with the value of `x-marker`, or "MISSING" — a probe for whether a
+/// header block decoded against the expected HPACK dynamic table.
+fn markerHandler(ctx: *types.Context) anyerror!void {
+    if (ctx.body_reader) |br| {
+        var tmp: [64]u8 = undefined;
+        while (true) {
+            const n = try br.read(&tmp);
+            if (n == 0) break;
+        }
+    }
+    try ctx.res.send(200, "text/plain", ctx.req.get("x-marker") orelse "MISSING");
+}
+
+test "h2: a stream refused at max_concurrent_streams still advances the HPACK decoder" {
+    // HPACK's dynamic table is connection state built from every block in wire
+    // order, whether or not we serve the stream. Refusing without decoding left
+    // our table one entry behind the peer's, and every later indexed reference
+    // on the connection silently resolved to the wrong field.
+    const fds = try newSocketPair();
+    errdefer _ = c.close(fds[1]);
+    var srv: Server = .{
+        .io = testing.io,
+        .gpa = testing.allocator,
+        .handler = markerHandler,
+        .config = .{ .max_concurrent_streams = 1, .idle_timeout_ms = 5_000 },
+    };
+    const t = try std.Thread.spawn(.{}, serveRawH2OnFd, .{ &srv, fds[0] });
+    defer t.join();
+    defer _ = c.close(fds[1]);
+
+    var rbuf: [8192]u8 = undefined;
+    var wbuf: [8192]u8 = undefined;
+    var reader = peerStream(fds[1]).reader(testing.io, &rbuf);
+    var writer = peerStream(fds[1]).writer(testing.io, &wbuf);
+    try writer.interface.writeAll(preface);
+    try writer.interface.flush();
+    var settings = try readFrameOfType(testing.allocator, &reader.interface, .settings);
+    settings.deinit(testing.allocator);
+    try writeFrame(&writer.interface, .settings, 0, 0, "");
+    try writeFrame(&writer.interface, .settings, flag_ack, 0, "");
+
+    // Stream 1: no END_STREAM, so its handler blocks on the body and the stream
+    // holds the connection's only concurrency slot.
+    try writeFrame(&writer.interface, .headers, flag_end_headers, 1, &trailers_req_block);
+
+    // Stream 3: refused for lack of a slot. Its block carries a literal with
+    // incremental indexing, so a correctly-synced decoder gains dynamic entry
+    // 62 = (x-marker, zzz) even though nothing serves the stream.
+    const marker_block = [_]u8{ 0x82, 0x86, 0x84, 0x40, 0x08 } ++ "x-marker".* ++ [_]u8{0x03} ++ "zzz".*;
+    try writeFrame(&writer.interface, .headers, flag_end_headers | flag_end_stream, 3, &marker_block);
+    var rst = try readFrameOfType(testing.allocator, &reader.interface, .rst_stream);
+    defer rst.deinit(testing.allocator);
+    try testing.expectEqual(@as(u31, 3), rst.header.sid);
+    try testing.expectEqual(@as(u32, @intFromEnum(ErrorCode.refused_stream)), std.mem.readInt(u32, rst.payload[0..4], .big));
+
+    // Free the slot by ending stream 1, then drain its response.
+    try writeFrame(&writer.interface, .data, flag_end_stream, 1, "");
+    while (true) {
+        var f = try readFrameAlloc(testing.allocator, &reader.interface);
+        const es = (f.header.ftype == .data or f.header.ftype == .headers) and f.header.flags & flag_end_stream != 0;
+        f.deinit(testing.allocator);
+        if (es) break;
+    }
+
+    // Stream 5 references dynamic index 62. In sync that is (x-marker, zzz);
+    // with the refused block skipped it is stream 1's (:authority, ...) and the
+    // handler sees no marker at all.
+    const indexed_block = [_]u8{ 0x82, 0x86, 0x84, 0x80 | 62 };
+    try writeFrame(&writer.interface, .headers, flag_end_headers | flag_end_stream, 5, &indexed_block);
+    var data = try readFrameWith(testing.allocator, &reader.interface, .data, 5);
+    defer data.deinit(testing.allocator);
+    try testing.expectEqualStrings("zzz", data.payload);
+}
+
+test "h2: HEADERS whose padding exceeds the payload is a connection PROTOCOL_ERROR" {
+    // Previously a bare `return`: no response on the stream (the peer waits
+    // forever) and the block was never decoded, desyncing HPACK.
+    const fds = try newSocketPair();
+    errdefer _ = c.close(fds[1]);
+    var srv: Server = .{
+        .io = testing.io,
+        .gpa = testing.allocator,
+        .handler = h2TestHandler,
+        .config = .{ .idle_timeout_ms = 2_000 },
+    };
+    const t = try std.Thread.spawn(.{}, serveRawH2OnFd, .{ &srv, fds[0] });
+    defer t.join();
+    defer _ = c.close(fds[1]);
+
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [4096]u8 = undefined;
+    var reader = peerStream(fds[1]).reader(testing.io, &rbuf);
+    var writer = peerStream(fds[1]).writer(testing.io, &wbuf);
+    try writer.interface.writeAll(preface);
+    try writer.interface.flush();
+    var settings = try readFrameOfType(testing.allocator, &reader.interface, .settings);
+    settings.deinit(testing.allocator);
+    try writeFrame(&writer.interface, .settings, 0, 0, "");
+
+    // PADDED with a pad length of 200 over a 21-byte payload.
+    const padded = [_]u8{200} ++ trailers_req_block;
+    try writeFrame(&writer.interface, .headers, flag_end_headers | flag_end_stream | flag_padded, 1, &padded);
+
+    var goaway = try readFrameOfType(testing.allocator, &reader.interface, .goaway);
+    defer goaway.deinit(testing.allocator);
+    try testing.expectEqual(@as(u32, @intFromEnum(ErrorCode.protocol_error)), std.mem.readInt(u32, goaway.payload[4..8], .big));
+}
+
+test "buildRequest rejects an uppercase field name" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+
+    const decoded = [_]hpack.Header{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = "/x" },
+        .{ .name = "X-Smuggled", .value = "1" }, // malformed: RFC 9113 §8.2.1
+    };
+
+    try testing.expectError(error.BadRequest, buildRequest(arena_state.allocator(), &decoded));
 }
