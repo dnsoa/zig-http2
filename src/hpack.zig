@@ -68,10 +68,16 @@ pub const Decoder = struct {
 
     /// Resolves a combined HPACK index (1-based) to a name/value pair, slices
     /// into either static program memory or the dynamic table's storage.
-    fn lookup(self: *const Decoder, idx: usize) Error!hp.StaticTable.Entry {
+    ///
+    /// Takes the raw u64 the integer coder produced rather than a pre-narrowed
+    /// usize: a peer can encode an index above `maxInt(usize)`, and narrowing it
+    /// at the call site was a safe-build `@intCast` panic on a 32-bit target.
+    /// Any such index is out of range anyway, so it resolves to InvalidIndex.
+    fn lookup(self: *const Decoder, idx: u64) Error!hp.StaticTable.Entry {
         if (idx == 0) return Error.InvalidZeroIndex;
-        if (idx <= static_len) return hp.StaticTable.get(idx) orelse Error.InvalidIndex;
-        return self.dyn.get(idx - static_len - 1) orelse Error.InvalidIndex;
+        if (idx <= static_len) return hp.StaticTable.get(@intCast(idx)) orelse Error.InvalidIndex;
+        const dyn_idx = std.math.cast(usize, idx - static_len - 1) orelse return Error.InvalidIndex;
+        return self.dyn.get(dyn_idx) orelse Error.InvalidIndex;
     }
 
     /// Decodes `block` into headers allocated on `arena`. All returned names and
@@ -97,14 +103,14 @@ pub const Decoder = struct {
                 // 6.1 Indexed Header Field (7-bit prefix).
                 const n = try decInt(block[i..], 7);
                 i += n.len;
-                const e = try self.lookup(@intCast(n.value));
+                const e = try self.lookup(n.value);
                 try self.account(&list_size, e.name, e.value);
-                try out.append(arena, .{ .name = try arena.dupe(u8, e.name), .value = try arena.dupe(u8, e.value) });
+                try ownEntry(arena, &out, e);
             } else if (b & 0xC0 == 0x40) {
                 // 6.2.1 Literal with Incremental Indexing (6-bit prefix).
                 const h = try self.literal(arena, block[i..], 6);
                 i += h.consumed;
-                try own(arena, &out, h);
+                try own(arena, &out, h.name, h.value);
                 try self.account(&list_size, h.name, h.value);
                 try self.dyn.add(h.name, h.value);
             } else if (b & 0xE0 == 0x20) {
@@ -119,7 +125,7 @@ pub const Decoder = struct {
                 // a server doesn't do for inbound headers; either way: not indexed.
                 const h = try self.literal(arena, block[i..], 4);
                 i += h.consumed;
-                try own(arena, &out, h);
+                try own(arena, &out, h.name, h.value);
                 try self.account(&list_size, h.name, h.value);
             }
         }
@@ -144,12 +150,24 @@ pub const Decoder = struct {
     /// onto its gpa, not an arena, so a hostile peer could leak ~4KB per
     /// rejected block, repeatedly. The errdefer here covers only the append
     /// itself; once it succeeds, `out` is solely responsible for the pair.
-    fn own(arena: std.mem.Allocator, out: *std.ArrayList(Header), h: Literal) Error!void {
+    fn own(arena: std.mem.Allocator, out: *std.ArrayList(Header), name: []const u8, value: []const u8) Error!void {
         errdefer {
-            arena.free(h.name);
-            arena.free(h.value);
+            arena.free(name);
+            arena.free(value);
         }
-        try out.append(arena, .{ .name = h.name, .value = h.value });
+        try out.append(arena, .{ .name = name, .value = value });
+    }
+
+    /// Dupes a table entry onto `arena` and hands ownership to `out`. Both
+    /// errdefers are scoped to this call and it returns only on success, so an
+    /// OOM between the two dupes (or on the append) frees whichever half already
+    /// exists instead of leaking it.
+    fn ownEntry(arena: std.mem.Allocator, out: *std.ArrayList(Header), e: hp.StaticTable.Entry) Error!void {
+        const name = try arena.dupe(u8, e.name);
+        errdefer arena.free(name);
+        const value = try arena.dupe(u8, e.value);
+        errdefer arena.free(value);
+        try out.append(arena, .{ .name = name, .value = value });
     }
 
     /// Decodes a literal representation whose first byte has an `prefix_bits`-wide
@@ -159,7 +177,7 @@ pub const Decoder = struct {
         var i = n.len;
         var name: []const u8 = undefined;
         if (n.value != 0) {
-            const e = try self.lookup(@intCast(n.value));
+            const e = try self.lookup(n.value);
             name = try arena.dupe(u8, e.name);
         } else {
             const s = decStr(data[i..], arena) catch return Error.Truncated;

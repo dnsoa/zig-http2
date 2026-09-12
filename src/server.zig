@@ -990,7 +990,17 @@ fn handleHeaders(conn: *Connection, r: *Io.Reader, fh: ParsedHeader, first: []co
             var hb: [9]u8 = undefined;
             try readSliceTimed(conn, r, &hb, conn.srv.config.head_timeout_ms);
             const cf = parseHeader(&hb);
-            if (cf.ftype != .continuation or cf.sid != fh.sid or cf.length > effectiveMaxFrameSize(conn.srv.config)) return error.ProtocolError;
+            if (cf.ftype != .continuation or cf.sid != fh.sid) {
+                // A header block must not be interleaved with any other frame
+                // (RFC 9113 §6.10) — a connection error, so say so on the wire
+                // rather than just dropping the connection.
+                sendGoaway(conn, .protocol_error);
+                return error.ProtocolError;
+            }
+            if (cf.length > effectiveMaxFrameSize(conn.srv.config)) {
+                sendGoaway(conn, .frame_size_error);
+                return error.ProtocolError;
+            }
             cont_frames += 1;
             if (cont_frames > max_continuation_frames) {
                 // Zero-length CONTINUATION frames never grow `block`, so the byte

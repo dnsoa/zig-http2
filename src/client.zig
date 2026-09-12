@@ -146,7 +146,7 @@ pub const Stream = struct {
                     c.send_cond.waitUncancelable(c.io, &c.send_mu);
                     continue;
                 }
-                const want: i64 = @min(@as(i64, @intCast(data.len - off)), @min(avail, @as(i64, @intCast(c.peer_max_frame))));
+                const want: i64 = @min(@as(i64, @intCast(data.len - off)), @min(avail, @as(i64, @intCast(c.peer_max_frame.load(.acquire)))));
                 self.send_window -= want;
                 c.conn_send_window -= want;
                 break :blk @as(usize, @intCast(want));
@@ -319,7 +319,11 @@ pub const Client = struct {
     w: *Io.Writer,
     dec: hpack.Decoder,
     next_id: u31 = 1,
-    peer_max_frame: u32 = 16384,
+    /// Peer's SETTINGS_MAX_FRAME_SIZE. Written by the reader thread on SETTINGS
+    /// and read by caller threads sizing DATA frames in `Stream.send`, so it is
+    /// atomic — the same reader-writes/worker-reads pattern as the server's
+    /// `Settings.max_frame_size`.
+    peer_max_frame: std.atomic.Value(u32) = .init(16384),
     /// Peer's advertised SETTINGS_INITIAL_WINDOW_SIZE. Written by the reader
     /// thread (applyInitialWindow) and read by opener threads (openStream), so
     /// it is atomic to avoid a data race on that cross-thread read.
@@ -855,7 +859,7 @@ pub const Client = struct {
             const val = std.mem.readInt(u32, payload[i + 2 ..][0..4], .big);
             switch (id) {
                 p2.set_max_frame_size => if (val >= 16384 and val <= 16777215) {
-                    self.peer_max_frame = val;
+                    self.peer_max_frame.store(val, .release);
                 },
                 p2.set_initial_window_size => {
                     if (val > 0x7fff_ffff) {
@@ -897,7 +901,13 @@ pub const Client = struct {
             var hb: [9]u8 = undefined;
             try self.r.readSliceAll(&hb);
             const cf = p2.parseHeader(&hb);
-            if (cf.ftype != .continuation or cf.sid != sid) return error.ProtocolError;
+            if (cf.ftype != .continuation or cf.sid != sid) {
+                // A header block must not be interleaved with any other frame
+                // (RFC 9113 §6.10) — a connection error, so say so on the wire
+                // rather than just dropping the connection.
+                self.sendGoaway(.protocol_error);
+                return error.ProtocolError;
+            }
             if (cf.length > max_recv_frame) {
                 self.sendGoaway(.frame_size_error);
                 return error.FrameSizeError;
@@ -2065,4 +2075,56 @@ test "client treats a HEADERS whose padding exceeds the payload as a connection 
     try waitDead(io, &client, 3000);
     const code = try ctReadGoawayCode(testing.allocator, &asr.interface);
     try testing.expectEqual(@as(u32, @intFromEnum(p2.ErrorCode.protocol_error)), code);
+}
+
+test "openStream seeds a new stream's window from the peer's INITIAL_WINDOW_SIZE" {
+    // Pins the seeding itself: a stream opened after the peer's SETTINGS must
+    // start at the advertised window, not the RFC default. (The lock that makes
+    // the seed atomic against a concurrent applyInitialWindow is not directly
+    // observable — breaking the atomicity is what a race test would require.)
+    const io = testing.io;
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var srv = try addr.listen(io, .{ .mode = .stream, .reuse_address = true });
+    defer srv.deinit(io);
+    const port = srv.socket.address.ip4.port;
+    const caddr = try net.IpAddress.parse("127.0.0.1", port);
+    const cstream = try caddr.connect(io, .{ .mode = .stream });
+    defer cstream.close(io);
+    var accepted = try srv.accept(io);
+
+    var crbuf: [4096]u8 = undefined;
+    var cwbuf: [4096]u8 = undefined;
+    var csr = cstream.reader(io, &crbuf);
+    var csw = cstream.writer(io, &cwbuf);
+    var client: Client = undefined;
+    try client.init(io, testing.allocator, &csr.interface, &csw.interface);
+    defer client.deinit();
+    defer accepted.close(io);
+
+    var arbuf: [4096]u8 = undefined;
+    var awbuf: [4096]u8 = undefined;
+    var asr = accepted.reader(io, &arbuf);
+    var asw = accepted.writer(io, &awbuf);
+    var pf: [p2.preface.len]u8 = undefined;
+    try asr.interface.readSliceAll(&pf);
+    var cs = try ctRead(testing.allocator, &asr.interface);
+    cs.deinit(testing.allocator);
+
+    // Advertise a non-default initial window, then wait for our ack so the
+    // setting is known to be applied before the stream is opened.
+    var iw: [6]u8 = undefined;
+    p2.putSetting(&iw, p2.set_initial_window_size, 4096);
+    try ctWrite(&asw.interface, .settings, 0, 0, &iw);
+    while (true) {
+        var f = try ctRead(testing.allocator, &asr.interface);
+        const is_ack = f.hdr.ftype == .settings and (f.hdr.flags & p2.flag_ack != 0);
+        f.deinit(testing.allocator);
+        if (is_ack) break;
+    }
+
+    const s = try client.openStream(.{ .path = "/x" }, false);
+    client.send_mu.lockUncancelable(io);
+    const window = s.send_window;
+    client.send_mu.unlock(io);
+    try testing.expectEqual(@as(i64, 4096), window);
 }
