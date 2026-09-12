@@ -63,6 +63,12 @@ const max_recv_frame: u32 = p2.our_max_frame_size; // 16384
 /// Hard cap on one response's accumulated header block across HEADERS +
 /// CONTINUATION (CVE-2024-27316 class); matches the server's bound.
 const max_header_block: usize = 256 * 1024;
+/// Cap on CONTINUATION frames per header block, mirroring the server's. Bytes
+/// are already bounded by `max_header_block`, but a zero-length CONTINUATION
+/// adds none, so a peer streaming empty ones makes no byte progress and the
+/// size cap never fires — `readContinuations` would loop forever. A legitimate
+/// block needs a handful (256KiB / 16KiB ⇒ ~16), so this is generous.
+const max_continuation_frames: usize = 256;
 
 pub const Stream = struct {
     client: *Client,
@@ -537,8 +543,14 @@ pub const Client = struct {
             self.admitCancel();
             return error.OutOfMemory;
         };
-        st.* = .{ .client = self, .id = sid, .send_window = self.peer_initial_window.load(.acquire) };
+        st.* = .{ .client = self, .id = sid, .send_window = 0 };
         self.streams_mu.lockUncancelable(self.io);
+        // Seed the send window under streams_mu, which applyInitialWindow also
+        // holds while it rewrites peer_initial_window and shifts every
+        // registered stream. Reading it outside the lock let a concurrent
+        // SETTINGS land in between, so the new stream picked up neither the new
+        // value nor the delta and ran with a stale window.
+        st.send_window = self.peer_initial_window.load(.acquire);
         self.streams.put(self.gpa, sid, st) catch {
             self.streams_mu.unlock(self.io);
             self.write_mu.unlock(self.io);
@@ -719,7 +731,16 @@ pub const Client = struct {
                 self.kill();
                 return error.ConnectionClosed;
             },
-            else => {}, // priority / stray continuation
+            .continuation => {
+                // `readContinuations` consumes an in-sequence CONTINUATION
+                // inline, so one arriving here continues nothing: a connection
+                // PROTOCOL_ERROR (RFC 9113 §6.10). Ignoring it also dropped a
+                // header-block fragment, desyncing HPACK for every later frame.
+                self.sendGoaway(.protocol_error);
+                self.kill();
+                return error.ProtocolError;
+            },
+            else => {}, // priority
         }
     }
 
@@ -866,6 +887,7 @@ pub const Client = struct {
     }
 
     fn readContinuations(self: *Client, sid: u31, block: *std.ArrayList(u8)) !void {
+        var frames: usize = 0;
         while (true) {
             var hb: [9]u8 = undefined;
             try self.r.readSliceAll(&hb);
@@ -874,6 +896,13 @@ pub const Client = struct {
             if (cf.length > max_recv_frame) {
                 self.sendGoaway(.frame_size_error);
                 return error.FrameSizeError;
+            }
+            frames += 1;
+            if (frames > max_continuation_frames) {
+                // Zero-length CONTINUATIONs never grow `block`, so the byte cap
+                // below cannot stop an endless stream of them; cap the count.
+                self.sendGoaway(.enhance_your_calm);
+                return error.ProtocolError;
             }
             if (block.items.len + cf.length > max_header_block) {
                 self.sendGoaway(.enhance_your_calm);
@@ -1864,4 +1893,112 @@ test "keepalive declares a silent peer dead instead of hanging" {
     try testing.expectError(error.ConnectionClosed, s.readEvent(arena_state.allocator()));
     const elapsed_ms = @divFloor(Io.Timestamp.now(io, .awake).nanoseconds - start, std.time.ns_per_ms);
     try testing.expect(elapsed_ms < 3000);
+}
+
+/// Waits (bounded) for the client's reader to declare the connection dead. A
+/// regression test that reads straight for the GOAWAY would block forever on
+/// the unfixed code, hanging the suite instead of reporting a failure; this
+/// gives it a deadline. The GOAWAY is written and flushed before `kill`, so it
+/// is already buffered once this returns.
+fn waitDead(io: Io, client: *Client, ms: u64) !void {
+    var waited: u64 = 0;
+    while (waited < ms) : (waited += 20) {
+        if (client.dead.load(.acquire)) return;
+        Io.sleep(io, .{ .nanoseconds = 20 * std.time.ns_per_ms }, .awake) catch {};
+    }
+    return error.ClientStillAlive;
+}
+
+test "client rejects a zero-length CONTINUATION flood with GOAWAY(ENHANCE_YOUR_CALM)" {
+    // Empty CONTINUATION frames add no bytes, so `max_header_block` never trips
+    // on them; without a frame-count cap readContinuations spins forever on a
+    // hostile server (CVE-2024-27316 class). The server side has had this cap;
+    // the client's mirror of the loop was missing it.
+    const io = testing.io;
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var srv = try addr.listen(io, .{ .mode = .stream, .reuse_address = true });
+    defer srv.deinit(io);
+    const port = srv.socket.address.ip4.port;
+    const caddr = try net.IpAddress.parse("127.0.0.1", port);
+    const cstream = try caddr.connect(io, .{ .mode = .stream });
+    defer cstream.close(io);
+    var accepted = try srv.accept(io);
+
+    var crbuf: [4096]u8 = undefined;
+    var cwbuf: [4096]u8 = undefined;
+    var csr = cstream.reader(io, &crbuf);
+    var csw = cstream.writer(io, &cwbuf);
+    var client: Client = undefined;
+    try client.init(io, testing.allocator, &csr.interface, &csw.interface);
+    // Teardown order matters: `deinit` joins the reader thread, which only
+    // leaves its blocking read once the transport closes. Closing the server
+    // side first (this defer runs before `deinit`'s) means that on a build
+    // without the fix these tests fail on waitDead's deadline instead of
+    // hanging the suite in `deinit`.
+    defer client.deinit();
+    defer accepted.close(io);
+
+    var arbuf: [4096]u8 = undefined;
+    var awbuf: [8192]u8 = undefined;
+    var asr = accepted.reader(io, &arbuf);
+    var asw = accepted.writer(io, &awbuf);
+    var pf: [p2.preface.len]u8 = undefined;
+    try asr.interface.readSliceAll(&pf);
+    var cs = try ctRead(testing.allocator, &asr.interface);
+    cs.deinit(testing.allocator);
+    try ctWrite(&asw.interface, .settings, 0, 0, "");
+    try ctWrite(&asw.interface, .settings, p2.flag_ack, 0, "");
+
+    // HEADERS (sid 1, END_HEADERS clear), then empty CONTINUATIONs past the cap.
+    try ctWrite(&asw.interface, .headers, 0, 1, "");
+    var i: usize = 0;
+    while (i < 400) : (i += 1) ctWrite(&asw.interface, .continuation, 0, 1, "") catch break;
+
+    try waitDead(io, &client, 3000);
+    const code = try ctReadGoawayCode(testing.allocator, &asr.interface);
+    try testing.expectEqual(@as(u32, @intFromEnum(p2.ErrorCode.enhance_your_calm)), code);
+}
+
+test "client treats a stray CONTINUATION as a connection PROTOCOL_ERROR" {
+    // A CONTINUATION with no HEADERS to continue was ignored, dropping a header
+    // block fragment and desyncing HPACK for every later frame.
+    const io = testing.io;
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var srv = try addr.listen(io, .{ .mode = .stream, .reuse_address = true });
+    defer srv.deinit(io);
+    const port = srv.socket.address.ip4.port;
+    const caddr = try net.IpAddress.parse("127.0.0.1", port);
+    const cstream = try caddr.connect(io, .{ .mode = .stream });
+    defer cstream.close(io);
+    var accepted = try srv.accept(io);
+
+    var crbuf: [4096]u8 = undefined;
+    var cwbuf: [4096]u8 = undefined;
+    var csr = cstream.reader(io, &crbuf);
+    var csw = cstream.writer(io, &cwbuf);
+    var client: Client = undefined;
+    try client.init(io, testing.allocator, &csr.interface, &csw.interface);
+    // Teardown order matters: `deinit` joins the reader thread, which only
+    // leaves its blocking read once the transport closes. Closing the server
+    // side first (this defer runs before `deinit`'s) means that on a build
+    // without the fix these tests fail on waitDead's deadline instead of
+    // hanging the suite in `deinit`.
+    defer client.deinit();
+    defer accepted.close(io);
+
+    var arbuf: [4096]u8 = undefined;
+    var awbuf: [4096]u8 = undefined;
+    var asr = accepted.reader(io, &arbuf);
+    var asw = accepted.writer(io, &awbuf);
+    var pf: [p2.preface.len]u8 = undefined;
+    try asr.interface.readSliceAll(&pf);
+    var cs = try ctRead(testing.allocator, &asr.interface);
+    cs.deinit(testing.allocator);
+    try ctWrite(&asw.interface, .settings, 0, 0, "");
+
+    try ctWrite(&asw.interface, .continuation, p2.flag_end_headers, 1, "");
+
+    try waitDead(io, &client, 3000);
+    const code = try ctReadGoawayCode(testing.allocator, &asr.interface);
+    try testing.expectEqual(@as(u32, @intFromEnum(p2.ErrorCode.protocol_error)), code);
 }
