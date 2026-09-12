@@ -679,7 +679,11 @@ pub const Client = struct {
                 self.kill();
                 return;
             };
-            defer self.gpa.free(payload);
+            // `handle` may take ownership of this buffer (an unpadded DATA
+            // frame is handed straight to the stream queue) rather than have it
+            // copied out; then freeing it here would be a double free.
+            var taken = false;
+            defer if (!taken) self.gpa.free(payload);
             if (payload.len > 0) {
                 self.r.readSliceAll(payload) catch {
                     self.kill();
@@ -695,7 +699,7 @@ pub const Client = struct {
                 self.kill();
                 return;
             }
-            self.handle(fh, payload) catch {
+            self.handle(fh, payload, &taken) catch {
                 self.kill();
                 return;
             };
@@ -713,7 +717,9 @@ pub const Client = struct {
         self.streams_mu.unlock(self.io);
     }
 
-    fn handle(self: *Client, fh: p2.ParsedHeader, payload: []const u8) !void {
+    /// Dispatches one inbound frame. `taken` is set when `payload`'s ownership
+    /// moves to a stream queue, telling `readerLoop` not to free it.
+    fn handle(self: *Client, fh: p2.ParsedHeader, payload: []u8, taken: *bool) !void {
         switch (fh.ftype) {
             .settings => if (fh.flags & p2.flag_ack == 0) {
                 try self.applyPeerSettings(payload);
@@ -807,8 +813,17 @@ pub const Client = struct {
                         return error.FlowControlError;
                     }
                 }
-                const copy = try self.gpa.dupe(u8, body);
-                try self.deliver(fh.sid, false, &[_]hpack.Header{}, copy, fh.flags & p2.flag_end_stream != 0, fc_cost);
+                // Unpadded is the common case, and then the frame buffer *is*
+                // the message: hand it to the queue instead of duplicating it.
+                // That drops an allocation, a `max_frame_size`-sized memcpy and
+                // a free from every DATA frame.
+                if (body.len == payload.len) {
+                    taken.* = true;
+                    try self.deliver(fh.sid, false, &[_]hpack.Header{}, payload, fh.flags & p2.flag_end_stream != 0, fc_cost);
+                } else {
+                    const copy = try self.gpa.dupe(u8, body);
+                    try self.deliver(fh.sid, false, &[_]hpack.Header{}, copy, fh.flags & p2.flag_end_stream != 0, fc_cost);
+                }
             },
             .push_promise => {
                 // We advertised ENABLE_PUSH=0, so a push is a protocol

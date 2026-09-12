@@ -178,6 +178,26 @@ const ConnWriter = struct {
         try self.frameLocked(ftype, flags, sid, payload);
         try self.w.flush();
     }
+
+    /// Writes one frame and leaves it in the transport's buffer.
+    ///
+    /// The caller MUST flush before it blocks or returns. Bytes parked in the
+    /// buffer have not reached the peer, so a sender that parks on a
+    /// flow-control window without flushing is waiting for a WINDOW_UPDATE the
+    /// peer has no reason to send — a deadlock, not just a delay.
+    fn frameBuffered(self: *ConnWriter, ftype: FrameType, flags: u8, sid: u31, payload: []const u8) !void {
+        self.lock();
+        defer self.unlock();
+        try self.frameLocked(ftype, flags, sid, payload);
+    }
+
+    /// Pushes buffered frames to the transport. A no-op when the buffer is
+    /// already empty (`Io.Writer.defaultFlush` returns immediately at end == 0).
+    fn flush(self: *ConnWriter) !void {
+        self.lock();
+        defer self.unlock();
+        try self.w.flush();
+    }
 };
 
 /// One HTTP/2 stream + its request. Lives on the gpa; freed by its worker.
@@ -312,6 +332,9 @@ const H2Stream = struct {
     fn sendBody(self: *H2Stream, data: []const u8) !void {
         const conn = self.conn;
         var off: usize = 0;
+        // Whether everything written so far has reached the transport. Cleared
+        // on each frame written, set before parking — see `frameBuffered`.
+        var flushed = true;
         while (off < data.len) {
             conn.send_mu.lockUncancelable(conn.io);
             const n = blk: while (true) {
@@ -330,12 +353,28 @@ const H2Stream = struct {
                     conn.send_window -= want;
                     break :blk @as(usize, @intCast(want));
                 }
+                if (!flushed) {
+                    // About to park on the window: push what we buffered first,
+                    // or the peer cannot consume it and will never send the
+                    // WINDOW_UPDATE we are waiting for. Drop send_mu across the
+                    // flush (it takes the writer lock) and re-check after.
+                    conn.send_mu.unlock(conn.io);
+                    try conn.cw.flush();
+                    flushed = true;
+                    conn.send_mu.lockUncancelable(conn.io);
+                    continue;
+                }
                 conn.send_cond.waitUncancelable(conn.io, &conn.send_mu);
             };
             conn.send_mu.unlock(conn.io);
-            try conn.cw.frame(.data, 0, self.id, data[off .. off + n]);
+            try conn.cw.frameBuffered(.data, 0, self.id, data[off .. off + n]);
+            flushed = false;
             off += n;
         }
+        // One flush for the whole chunk instead of one per frame. A caller's
+        // single `res.write` still lands on the wire before it returns, so a
+        // streaming handler's messages are not held back.
+        if (!flushed) try conn.cw.flush();
     }
 
     fn endStream(self: *H2Stream) !void {
