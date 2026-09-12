@@ -706,7 +706,12 @@ pub const Client = struct {
             .headers => {
                 var block: std.ArrayList(u8) = .empty;
                 defer block.deinit(self.gpa);
-                try block.appendSlice(self.gpa, stripHeaderPadding(fh, payload));
+                const frag = stripHeaderPadding(fh, payload) orelse {
+                    self.sendGoaway(.protocol_error);
+                    self.kill();
+                    return error.ProtocolError;
+                };
+                try block.appendSlice(self.gpa, frag);
                 if (fh.flags & p2.flag_end_headers == 0) try self.readContinuations(fh.sid, &block);
                 const hs = try self.dec.decode(self.gpa, block.items);
                 try self.deliver(fh.sid, true, hs, &[_]u8{}, fh.flags & p2.flag_end_stream != 0, 0);
@@ -1005,16 +1010,27 @@ fn stripDataPadding(fh: p2.ParsedHeader, payload: []const u8) ?[]const u8 {
     return rest[0 .. rest.len - pad];
 }
 
-/// HEADERS frames may carry PADDED/PRIORITY prefixes; strip them for decoding.
-fn stripHeaderPadding(fh: p2.ParsedHeader, payload: []const u8) []const u8 {
+/// Strips a HEADERS frame's PADDED/PRIORITY prefixes (RFC 9113 §6.2). Returns
+/// null when a prefix does not fit the payload — a connection PROTOCOL_ERROR —
+/// so the caller tears down instead of decoding what is left.
+///
+/// Trimming silently and decoding the remainder anyway is the same desync the
+/// server side had: HPACK's dynamic table is connection-wide state, so one
+/// mis-framed block leaves our table out of step with the peer's and every
+/// later indexed reference resolves to the wrong field, with no error anywhere.
+fn stripHeaderPadding(fh: p2.ParsedHeader, payload: []const u8) ?[]const u8 {
     var frag = payload;
     if (fh.flags & p2.flag_padded != 0) {
-        if (frag.len == 0) return frag;
+        if (frag.len == 0) return null; // PADDED set but no pad-length octet
         const pad = frag[0];
         frag = frag[1..];
-        if (pad <= frag.len) frag = frag[0 .. frag.len - pad];
+        if (pad > frag.len) return null; // padding longer than what remains
+        frag = frag[0 .. frag.len - pad];
     }
-    if (fh.flags & p2.flag_priority != 0 and frag.len >= 5) frag = frag[5..];
+    if (fh.flags & p2.flag_priority != 0) {
+        if (frag.len < 5) return null; // PRIORITY set but no room for its fields
+        frag = frag[5..];
+    }
     return frag;
 }
 
@@ -1997,6 +2013,54 @@ test "client treats a stray CONTINUATION as a connection PROTOCOL_ERROR" {
     try ctWrite(&asw.interface, .settings, 0, 0, "");
 
     try ctWrite(&asw.interface, .continuation, p2.flag_end_headers, 1, "");
+
+    try waitDead(io, &client, 3000);
+    const code = try ctReadGoawayCode(testing.allocator, &asr.interface);
+    try testing.expectEqual(@as(u32, @intFromEnum(p2.ErrorCode.protocol_error)), code);
+}
+
+test "client treats a HEADERS whose padding exceeds the payload as a connection PROTOCOL_ERROR" {
+    // Symmetric with the server's "padding exceeds payload" test. Trimming a bad
+    // prefix and decoding the remainder anyway desyncs HPACK for the rest of the
+    // connection, silently — the same class this PR closed on the server.
+    const io = testing.io;
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var srv = try addr.listen(io, .{ .mode = .stream, .reuse_address = true });
+    defer srv.deinit(io);
+    const port = srv.socket.address.ip4.port;
+    const caddr = try net.IpAddress.parse("127.0.0.1", port);
+    const cstream = try caddr.connect(io, .{ .mode = .stream });
+    defer cstream.close(io);
+    var accepted = try srv.accept(io);
+
+    var crbuf: [4096]u8 = undefined;
+    var cwbuf: [4096]u8 = undefined;
+    var csr = cstream.reader(io, &crbuf);
+    var csw = cstream.writer(io, &cwbuf);
+    var client: Client = undefined;
+    try client.init(io, testing.allocator, &csr.interface, &csw.interface);
+    defer client.deinit();
+    defer accepted.close(io);
+
+    var arbuf: [4096]u8 = undefined;
+    var awbuf: [4096]u8 = undefined;
+    var asr = accepted.reader(io, &arbuf);
+    var asw = accepted.writer(io, &awbuf);
+    var pf: [p2.preface.len]u8 = undefined;
+    try asr.interface.readSliceAll(&pf);
+    var cs = try ctRead(testing.allocator, &asr.interface);
+    cs.deinit(testing.allocator);
+    try ctWrite(&asw.interface, .settings, 0, 0, "");
+
+    const s = try client.openStream(.{ .path = "/x" }, true);
+    _ = s;
+    // PADDED response HEADERS declaring 200 bytes of padding over a 1-byte
+    // fragment. The fragment alone (0x88 = indexed ":status 200") is a complete,
+    // valid block, so on the old silent-trim path the client decodes it happily
+    // and stays alive — the test then fails on waitDead's deadline rather than
+    // passing for the wrong reason or blocking on a GOAWAY that never comes.
+    const padded = [_]u8{ 200, 0x88 };
+    try ctWrite(&asw.interface, .headers, p2.flag_end_headers | p2.flag_padded, 1, &padded);
 
     try waitDead(io, &client, 3000);
     const code = try ctReadGoawayCode(testing.allocator, &asr.interface);
