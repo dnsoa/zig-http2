@@ -38,4 +38,18 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(example_exe);
     const example_step = b.step("example", "Build the example (server + client over a socketpair)");
     example_step.dependOn(&example_exe.step);
+
+    // ---- `zig build bench` ----
+    // Write-path throughput (issue #12). Defaults to ReleaseFast: timing a
+    // debug build measures the safety checks, not the protocol work.
+    const bench_mod = b.createModule(.{
+        .root_source_file = b.path("src/bench.zig"),
+        .target = target,
+        .optimize = if (optimize == .Debug) .ReleaseFast else optimize,
+    });
+    bench_mod.addImport("zig_http2", mod);
+    const bench_exe = b.addExecutable(.{ .name = "zig-http2-bench", .root_module = bench_mod });
+    const bench_run = b.addRunArtifact(bench_exe);
+    const bench_step = b.step("bench", "Run the write-path benchmark");
+    bench_step.dependOn(&bench_run.step);
 }
