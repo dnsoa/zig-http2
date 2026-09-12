@@ -659,6 +659,15 @@ fn readLoop(conn: *Connection, r: *Io.Reader) void {
                 sendGoaway(conn, .protocol_error);
                 return;
             },
+            .push_promise => {
+                // A client cannot push (RFC 9113 §6.6) and we advertised
+                // SETTINGS_ENABLE_PUSH=0: connection PROTOCOL_ERROR. The frame
+                // also carries a header-block fragment, so dropping it silently
+                // would leave our HPACK table one block behind the peer's for
+                // the rest of the connection.
+                sendGoaway(conn, .protocol_error);
+                return;
+            },
             else => {},
         }
     }
@@ -667,39 +676,8 @@ fn readLoop(conn: *Connection, r: *Io.Reader) void {
 
 /// Returns a connection-error code when `fh`/`payload` violate framing rules
 /// (RFC 7540 §4/§6), or null when the frame is structurally acceptable.
-fn validateInboundFrame(fh: ParsedHeader, payload: []const u8) ?ErrorCode {
-    switch (fh.ftype) {
-        .settings => {
-            if (fh.sid != 0) return .protocol_error;
-            if (fh.flags & flag_ack != 0 and payload.len != 0) return .frame_size_error;
-            if (payload.len % 6 != 0) return .frame_size_error;
-        },
-        .ping => {
-            if (fh.sid != 0) return .protocol_error;
-            if (payload.len != 8) return .frame_size_error;
-        },
-        .headers, .data, .continuation => {
-            if (fh.sid == 0) return .protocol_error;
-        },
-        .rst_stream => {
-            if (fh.sid == 0) return .protocol_error;
-            if (payload.len != 4) return .frame_size_error; // RFC 7540 §6.4
-        },
-        .priority => {
-            if (fh.sid == 0) return .protocol_error;
-            if (payload.len != 5) return .frame_size_error; // RFC 7540 §6.3
-        },
-        .goaway => {
-            if (fh.sid != 0) return .protocol_error;
-            if (payload.len < 8) return .frame_size_error;
-        },
-        .window_update => {
-            if (payload.len != 4) return .frame_size_error;
-        },
-        else => {},
-    }
-    return null;
-}
+/// Shared with the client: see `proto.validateInboundFrame`.
+const validateInboundFrame = proto2.validateInboundFrame;
 
 /// Returns false on a connection-fatal SETTINGS (GOAWAY already sent).
 fn handleSettings(conn: *Connection, fh: ParsedHeader, payload: []const u8) bool {
@@ -733,24 +711,39 @@ fn handleSettings(conn: *Connection, fh: ParsedHeader, payload: []const u8) bool
             else => {}, // header_table_size/enable_push/max_concurrent_streams: irrelevant to us
         }
     }
-    if (new_iw) |iw| applyInitialWindow(conn, iw);
+    if (new_iw) |iw| {
+        if (!applyInitialWindow(conn, iw)) return false;
+    }
     conn.cw.frame(.settings, flag_ack, 0, "") catch {};
     return true;
 }
 
 /// Apply a SETTINGS_INITIAL_WINDOW_SIZE change: shift every live stream's send
 /// window by the delta and rebase new-stream initial size (RFC 7540 §6.9.2).
-fn applyInitialWindow(conn: *Connection, new_iw: u32) void {
+/// Returns false (after GOAWAY) when the shift pushes any window past 2^31-1 —
+/// a connection FLOW_CONTROL_ERROR (RFC 7540 §6.9.2).
+fn applyInitialWindow(conn: *Connection, new_iw: u32) bool {
     conn.streams_mu.lockUncancelable(conn.io);
     defer conn.streams_mu.unlock(conn.io);
     const delta: i64 = @as(i64, new_iw) - @as(i64, conn.peer.initial_window_size);
     conn.peer.initial_window_size = new_iw;
-    if (delta == 0) return;
+    if (delta == 0) return true;
     conn.send_mu.lockUncancelable(conn.io);
+    defer conn.send_mu.unlock(conn.io);
+    var overflow = false;
     var it = conn.streams.valueIterator();
-    while (it.next()) |st| st.*.send_window += delta;
+    while (it.next()) |st| {
+        // Each window is <= 2^31-1 and |delta| < 2^31, so the sum cannot
+        // overflow i64; a result over 2^31-1 is the illegal state itself.
+        st.*.send_window += delta;
+        if (st.*.send_window > 0x7fff_ffff) overflow = true;
+    }
     conn.send_cond.broadcast(conn.io);
-    conn.send_mu.unlock(conn.io);
+    if (overflow) {
+        sendGoaway(conn, .flow_control_error);
+        return false;
+    }
+    return true;
 }
 
 /// Returns false on a connection-fatal WINDOW_UPDATE (GOAWAY already sent).
@@ -859,11 +852,22 @@ fn handleData(conn: *Connection, fh: ParsedHeader, payload: []const u8) bool {
     conn.streams_mu.lockUncancelable(conn.io);
     const s = conn.streams.get(fh.sid) orelse {
         conn.streams_mu.unlock(conn.io);
-        // Frame won't reach any handler: return its connection-level credit.
+        // DATA on an id we never opened: idle (above the highest id seen, so
+        // never even refused) is a connection PROTOCOL_ERROR; closed (at or
+        // below it) is a stream error — RST STREAM_CLOSED, keeping the
+        // connection (RFC 9113 §5.1/§6.1). Silently dropping the frame let a
+        // peer stream DATA on idle ids forever.
+        if (fh.sid > conn.last_stream_id) {
+            sendGoaway(conn, .protocol_error);
+            return false;
+        }
+        // The frame still consumed connection-level window even though no
+        // stream will ever read it — return the credit, then reset.
         if (payload.len > 0) {
             const d = creditConn(conn, @intCast(payload.len));
             if (d > 0) sendWindowUpdate(conn, 0, d);
         }
+        rstStreamCode(conn, fh.sid, .stream_closed);
         return true;
     };
     s.rx_mu.lockUncancelable(conn.io);
@@ -1207,7 +1211,10 @@ fn spawnTask(conn: *Connection, comptime f: anytype, args: std.meta.ArgsTuple(@T
 /// Registers worker accounting and spawns the per-stream worker task.
 fn spawnWorker(conn: *Connection, st: *H2Stream) void {
     if (spawnTask(conn, runStream, .{st})) return;
-    // Neither a group task nor a fallback thread could start: reclaim the stream.
+    // Neither a group task nor a fallback thread could start: reclaim the
+    // stream. HEADERS were already decoded and acknowledged, so without an
+    // explicit RST the peer waits for a response that will never come.
+    rstStreamCode(conn, st.id, .refused_stream);
     removeStream(conn, st.id);
     st.rx_buf.deinit(conn.gpa);
     st.arena_state.deinit();
@@ -1258,12 +1265,25 @@ fn buildRequest(arena: std.mem.Allocator, decoded: []const hpack.Header) !types.
         // the request malformed (RFC 9113 §8.2.1). Accepting it lets a peer
         // smuggle a field past any downstream check that compares case-sensitively.
         for (h.name) |ch| if (std.ascii.isUpper(ch)) return error.BadRequest;
+        // NUL/CR/LF in a name or value are also malformed (RFC 9113 §8.2.1): a
+        // CR LF pair in a value is a header-injection primitive against any
+        // downstream hop that concatenates fields back into HTTP/1.
+        for (h.name) |ch| if (ch == 0 or ch == '\r' or ch == '\n') return error.BadRequest;
+        for (h.value) |ch| if (ch == 0 or ch == '\r' or ch == '\n') return error.BadRequest;
         if (isConnectionSpecificHeader(h.name)) return error.BadRequest;
         if (std.ascii.eqlIgnoreCase(h.name, "te") and !std.mem.eql(u8, h.value, "trailers")) return error.BadRequest;
         if (std.ascii.eqlIgnoreCase(h.name, "content-length")) {
             // A content-length that isn't a valid integer makes the request
             // malformed (RFC 7540 §8.1.2.6) — reject rather than silently drop.
-            content_length = std.fmt.parseInt(u64, h.value, 10) catch return error.BadRequest;
+            const cl = std.fmt.parseInt(u64, h.value, 10) catch return error.BadRequest;
+            // Duplicate content-length values must be identical, or the request
+            // is malformed (RFC 9113 §8.1.1); keeping the last would let two
+            // bodies through a size check downstream (request smuggling).
+            if (content_length) |first| {
+                if (first != cl) return error.BadRequest;
+            } else {
+                content_length = cl;
+            }
         }
         if (std.ascii.eqlIgnoreCase(h.name, "host")) {
             host = h.value;
@@ -3337,4 +3357,208 @@ test "buildRequest rejects an uppercase field name" {
     };
 
     try testing.expectError(error.BadRequest, buildRequest(arena_state.allocator(), &decoded));
+}
+
+test "h2: a client-sent PUSH_PROMISE is a connection PROTOCOL_ERROR" {
+    // RFC 9113 §6.6: a client cannot push (and we advertise ENABLE_PUSH=0).
+    // The frame also carries a header-block fragment: dropping it silently
+    // leaves our HPACK table one block behind the peer's.
+    const fds = try newSocketPair();
+    errdefer _ = c.close(fds[1]);
+    var srv: Server = .{
+        .io = testing.io,
+        .gpa = testing.allocator,
+        .handler = markerHandler,
+        .config = .{ .idle_timeout_ms = 2_000 },
+    };
+    const t = try std.Thread.spawn(.{}, serveRawH2OnFd, .{ &srv, fds[0] });
+    defer t.join();
+    defer _ = c.close(fds[1]);
+
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [4096]u8 = undefined;
+    var reader = peerStream(fds[1]).reader(testing.io, &rbuf);
+    var writer = peerStream(fds[1]).writer(testing.io, &wbuf);
+    try writer.interface.writeAll(preface);
+    try writer.interface.flush();
+    var settings = try readFrameOfType(testing.allocator, &reader.interface, .settings);
+    settings.deinit(testing.allocator);
+    try writeFrame(&writer.interface, .settings, 0, 0, "");
+    try writeFrame(&writer.interface, .settings, flag_ack, 0, "");
+
+    // PUSH_PROMISE (promised stream 2) carrying a one-byte block fragment.
+    var pp: [5]u8 = undefined;
+    std.mem.writeInt(u32, pp[0..4], 2, .big);
+    pp[4] = 0x88; // indexed-field: :status 200
+    try writeFrame(&writer.interface, .push_promise, flag_end_headers, 0, &pp);
+
+    var goaway = try readFrameOfType(testing.allocator, &reader.interface, .goaway);
+    defer goaway.deinit(testing.allocator);
+    try testing.expectEqual(@as(u32, @intFromEnum(ErrorCode.protocol_error)), std.mem.readInt(u32, goaway.payload[4..8], .big));
+}
+
+test "h2: DATA on an idle stream is a connection PROTOCOL_ERROR" {
+    // DATA on an id we never opened was silently dropped (window credited
+    // back, no error), letting a peer stream garbage on idle ids forever.
+    const fds = try newSocketPair();
+    errdefer _ = c.close(fds[1]);
+    var srv: Server = .{
+        .io = testing.io,
+        .gpa = testing.allocator,
+        .handler = markerHandler,
+        .config = .{ .idle_timeout_ms = 2_000 },
+    };
+    const t = try std.Thread.spawn(.{}, serveRawH2OnFd, .{ &srv, fds[0] });
+    defer t.join();
+    defer _ = c.close(fds[1]);
+
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [4096]u8 = undefined;
+    var reader = peerStream(fds[1]).reader(testing.io, &rbuf);
+    var writer = peerStream(fds[1]).writer(testing.io, &wbuf);
+    try writer.interface.writeAll(preface);
+    try writer.interface.flush();
+    var settings = try readFrameOfType(testing.allocator, &reader.interface, .settings);
+    settings.deinit(testing.allocator);
+    try writeFrame(&writer.interface, .settings, 0, 0, "");
+    try writeFrame(&writer.interface, .settings, flag_ack, 0, "");
+
+    // No stream was ever opened: sid 1 is idle.
+    try writeFrame(&writer.interface, .data, 0, 1, "xxxx");
+
+    var goaway = try readFrameOfType(testing.allocator, &reader.interface, .goaway);
+    defer goaway.deinit(testing.allocator);
+    try testing.expectEqual(@as(u32, @intFromEnum(ErrorCode.protocol_error)), std.mem.readInt(u32, goaway.payload[4..8], .big));
+}
+
+test "h2: DATA on a closed stream gets RST(STREAM_CLOSED) and keeps the connection" {
+    const fds = try newSocketPair();
+    errdefer _ = c.close(fds[1]);
+    var srv: Server = .{
+        .io = testing.io,
+        .gpa = testing.allocator,
+        .handler = markerHandler,
+        .config = .{ .idle_timeout_ms = 5_000 },
+    };
+    const t = try std.Thread.spawn(.{}, serveRawH2OnFd, .{ &srv, fds[0] });
+    defer t.join();
+    defer _ = c.close(fds[1]);
+
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [4096]u8 = undefined;
+    var reader = peerStream(fds[1]).reader(testing.io, &rbuf);
+    var writer = peerStream(fds[1]).writer(testing.io, &wbuf);
+    try writer.interface.writeAll(preface);
+    try writer.interface.flush();
+    var settings = try readFrameOfType(testing.allocator, &reader.interface, .settings);
+    settings.deinit(testing.allocator);
+    try writeFrame(&writer.interface, .settings, 0, 0, "");
+    try writeFrame(&writer.interface, .settings, flag_ack, 0, "");
+
+    // Complete stream 1 (bodyless GET) and drain its response to END_STREAM.
+    try writeFrame(&writer.interface, .headers, flag_end_headers | flag_end_stream, 1, &trailers_req_block);
+    while (true) {
+        var f = try readFrameAlloc(testing.allocator, &reader.interface);
+        const es = (f.header.ftype == .data or f.header.ftype == .headers) and f.header.flags & flag_end_stream != 0;
+        f.deinit(testing.allocator);
+        if (es) break;
+    }
+
+    // DATA on the now-closed stream: a stream error, not a connection one.
+    try writeFrame(&writer.interface, .data, 0, 1, "xxxx");
+    var rst = try readFrameOfType(testing.allocator, &reader.interface, .rst_stream);
+    defer rst.deinit(testing.allocator);
+    try testing.expectEqual(@as(u31, 1), rst.header.sid);
+    try testing.expectEqual(@as(u32, @intFromEnum(ErrorCode.stream_closed)), std.mem.readInt(u32, rst.payload[0..4], .big));
+}
+
+test "h2: SETTINGS_INITIAL_WINDOW_SIZE that overflows a stream window is a connection FLOW_CONTROL_ERROR" {
+    const fds = try newSocketPair();
+    errdefer _ = c.close(fds[1]);
+    var srv: Server = .{
+        .io = testing.io,
+        .gpa = testing.allocator,
+        .handler = markerHandler,
+        .config = .{ .idle_timeout_ms = 5_000 },
+    };
+    const t = try std.Thread.spawn(.{}, serveRawH2OnFd, .{ &srv, fds[0] });
+    defer t.join();
+    defer _ = c.close(fds[1]);
+
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [4096]u8 = undefined;
+    var reader = peerStream(fds[1]).reader(testing.io, &rbuf);
+    var writer = peerStream(fds[1]).writer(testing.io, &wbuf);
+    try writer.interface.writeAll(preface);
+    try writer.interface.flush();
+    var settings = try readFrameOfType(testing.allocator, &reader.interface, .settings);
+    settings.deinit(testing.allocator);
+    try writeFrame(&writer.interface, .settings, 0, 0, "");
+    try writeFrame(&writer.interface, .settings, flag_ack, 0, "");
+
+    // Keep stream 1 open: no END_STREAM, so its handler blocks reading the body.
+    try writeFrame(&writer.interface, .headers, flag_end_headers, 1, &trailers_req_block);
+    // Push stream 1's send window to exactly 2^31-1, then raise the initial
+    // window by one: the delta shifts every open stream past the ceiling
+    // (RFC 7540 §6.9.2).
+    var wu: [4]u8 = undefined;
+    std.mem.writeInt(u32, &wu, 0x7fff_ffff - 65535, .big);
+    try writeFrame(&writer.interface, .window_update, 0, 1, &wu);
+    var iw: [6]u8 = undefined;
+    putSetting(&iw, set_initial_window_size, 65536);
+    try writeFrame(&writer.interface, .settings, 0, 0, &iw);
+
+    var goaway = try readFrameOfType(testing.allocator, &reader.interface, .goaway);
+    defer goaway.deinit(testing.allocator);
+    try testing.expectEqual(@as(u32, @intFromEnum(ErrorCode.flow_control_error)), std.mem.readInt(u32, goaway.payload[4..8], .big));
+}
+
+test "buildRequest rejects conflicting duplicate content-length" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+
+    const decoded = [_]hpack.Header{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = "/x" },
+        .{ .name = "content-length", .value = "7" },
+        .{ .name = "content-length", .value = "8" }, // differs: smuggling
+    };
+
+    try testing.expectError(error.BadRequest, buildRequest(arena_state.allocator(), &decoded));
+}
+
+test "buildRequest accepts identical duplicate content-length" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+
+    const decoded = [_]hpack.Header{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = "/x" },
+        .{ .name = "content-length", .value = "7" },
+        .{ .name = "content-length", .value = "7" },
+    };
+
+    const req = try buildRequest(arena_state.allocator(), &decoded);
+    try testing.expectEqual(@as(u64, 7), req.content_length.?);
+}
+
+test "buildRequest rejects CTL octets in field names and values" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+
+    const base = [_]hpack.Header{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = "/x" },
+    };
+    {
+        var decoded = base ++ [_]hpack.Header{.{ .name = "x-bad", .value = "a\r\nb" }};
+        try testing.expectError(error.BadRequest, buildRequest(arena_state.allocator(), &decoded));
+    }
+    {
+        var decoded = base ++ [_]hpack.Header{.{ .name = "x-ba\x00d", .value = "ok" }};
+        try testing.expectError(error.BadRequest, buildRequest(arena_state.allocator(), &decoded));
+    }
 }
