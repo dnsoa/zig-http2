@@ -21,6 +21,8 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/lib.zig"),
         .target = target,
         .optimize = optimize,
+        // 0.17: 测试区的 socketpair/close 走 std.c,须显式声明 libc。
+        .link_libc = true,
     });
     const run_tests = b.addRunArtifact(b.addTest(.{ .root_module = test_mod }));
     test_step.dependOn(&run_tests.step);
@@ -32,6 +34,8 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/example.zig"),
         .target = target,
         .optimize = optimize,
+        // 0.17: socketpair/close 走 std.c,须显式声明 libc。
+        .link_libc = true,
     });
     example_mod.addImport("zig_http2", mod);
     const example_exe = b.addExecutable(.{ .name = "zig-http2-example", .root_module = example_mod });

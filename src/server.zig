@@ -1442,10 +1442,14 @@ fn isConnectionSpecificHeader(name: []const u8) bool {
 
 const testing = std.testing;
 
-const c = @cImport({
-    @cInclude("sys/socket.h");
-    @cInclude("unistd.h");
-});
+// 0.17 移除 @cImport。测试只用到 socketpair/close/AF_UNIX/SOCK_STREAM 四个 libc 符号，
+// 映射到 std.c/std.posix。
+const c = struct {
+    const socketpair = std.c.socketpair;
+    const close = std.c.close;
+    const AF_UNIX = std.posix.AF.UNIX;
+    const SOCK_STREAM = std.posix.SOCK.STREAM;
+};
 
 test "buildResponseHeaders injects content-length for known-size responses" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
@@ -2420,7 +2424,7 @@ test "h2: response finish() is idempotent (exactly one END_STREAM trailer)" {
         0x78, 0x61, 0x6d, 0x70, 0x6c, 0x65, 0x2e, 0x63, 0x6f, 0x6d,
     };
     try writeFrame(&writer.interface, .headers, flag_end_headers | flag_end_stream, 1, &req_block);
-    try writeFrame(&writer.interface, .goaway, 0, 0, &[_]u8{0} ** 8);
+    try writeFrame(&writer.interface, .goaway, 0, 0, &@as([8]u8, @splat(0)));
 
     var end_stream: usize = 0;
     while (true) {

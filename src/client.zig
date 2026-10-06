@@ -1158,7 +1158,7 @@ pub const Client = struct {
                         self.kill();
                         return error.ConnectionClosed; // keepalive timeout: peer is dead
                     }
-                    const ping = [_]u8{0} ** 8;
+                    const ping = @as([8]u8, @splat(0));
                     self.writeFrame(.ping, 0, 0, &ping) catch return error.ConnectionClosed;
                     self.ping_outstanding = true;
                 },
@@ -1312,7 +1312,7 @@ const SenderCtx = struct {
     done: std.atomic.Value(bool) = .init(false),
 };
 fn blockedSender(ctx: *SenderCtx) void {
-    const payload = [_]u8{'x'} ** 200;
+    const payload = @as([200]u8, @splat('x'));
     if (ctx.s.send(&payload, false)) |_| {} else |e| {
         ctx.err = e;
     }
@@ -1643,7 +1643,7 @@ test "client defers WINDOW_UPDATE until DATA is consumed (backpressure)" {
     try hpack.Encoder.encodeResponse(henc.allocator(), &blk, 200, &.{});
     try ctWrite(&asw.interface, .headers, p2.flag_end_headers, 1, blk.items);
     try ctWrite(&asw.interface, .data, 0, 1, "hello");
-    const ping = [_]u8{0} ** 8;
+    const ping = @as([8]u8, @splat(0));
     try ctWrite(&asw.interface, .ping, 0, 0, &ping);
 
     // Drain client output up to the PING ack; no WINDOW_UPDATE may appear yet,

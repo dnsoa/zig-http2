@@ -7,10 +7,14 @@
 const std = @import("std");
 const h2 = @import("zig_http2");
 
-const c = @cImport({
-    @cInclude("sys/socket.h");
-    @cInclude("unistd.h");
-});
+// 0.17 移除 @cImport。只用到 socketpair/close/AF_UNIX/SOCK_STREAM 四个 libc 符号，
+// 映射到 std.c/std.posix。
+const c = struct {
+    const socketpair = std.c.socketpair;
+    const close = std.c.close;
+    const AF_UNIX = std.posix.AF.UNIX;
+    const SOCK_STREAM = std.posix.SOCK.STREAM;
+};
 
 fn echoHandler(ctx: *h2.Context) anyerror!void {
     ctx.res.status(200);

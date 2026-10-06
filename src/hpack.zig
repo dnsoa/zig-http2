@@ -624,7 +624,7 @@ test "Huffman decode rejects an unmatchable bit run instead of overflowing" {
     // ever matches, so the decoder would keep accumulating bits; bit_count is a
     // u6, so the 8th byte's `+= 8` overflowed 63→panic. It must now be rejected
     // as a decode error. Single unauthenticated HEADERS frame, remote crash.
-    const bomb = [_]u8{0xFF} ** 8;
+    const bomb = @as([8]u8, @splat(0xFF));
     try testing.expectError(error.InvalidHuffmanCode, hp.HuffmanCodec.decode(&bomb, testing.allocator));
 }
 
