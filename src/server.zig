@@ -45,6 +45,7 @@ const ParsedHeader = proto2.ParsedHeader;
 const putHeader = proto2.putHeader;
 const parseHeader = proto2.parseHeader;
 const putSetting = proto2.putSetting;
+const clampConnWindow = proto2.clampConnWindow;
 
 // Server-only limit (not shared).
 const our_max_concurrent: u32 = 128;
@@ -1403,10 +1404,6 @@ fn sendWindowUpdate(conn: *Connection, sid: u31, incr: i64) void {
     var wu: [4]u8 = undefined;
     std.mem.writeInt(u32, &wu, @intCast(incr & 0x7fff_ffff), .big);
     conn.cw.frame(.window_update, 0, sid, &wu) catch {};
-}
-
-fn clampConnWindow(v: u32) i64 {
-    return @intCast(@min(@max(v, 65535), 0x7fff_ffff));
 }
 
 /// Records `amt` connection-level consumed/returned bytes; returns the

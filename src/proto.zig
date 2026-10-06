@@ -72,6 +72,21 @@ pub fn parseHeader(b: *const [9]u8) ParsedHeader {
     };
 }
 
+/// Clamps a configured connection-level receive window to the RFC 7540 §6.9.1
+/// range. The floor is the protocol's fixed initial window: a connection may
+/// only ever be enlarged from 65535 via WINDOW_UPDATE, never shrunk below it.
+/// Shared so client and server agree on what a configured value means.
+pub fn clampConnWindow(v: u32) i64 {
+    return @intCast(@min(@max(v, 65535), 0x7fff_ffff));
+}
+
+/// Clamps a SETTINGS_INITIAL_WINDOW_SIZE to the RFC 7540 §6.5.2 range. Unlike
+/// the connection window this has no floor — 0 is legal and simply stalls the
+/// peer until a WINDOW_UPDATE arrives.
+pub fn clampInitialWindow(v: u32) i64 {
+    return @intCast(@min(v, 0x7fff_ffff));
+}
+
 pub fn putSetting(buf: *[6]u8, id: u16, value: u32) void {
     std.mem.writeInt(u16, buf[0..2], id, .big);
     std.mem.writeInt(u32, buf[2..6], value, .big);
