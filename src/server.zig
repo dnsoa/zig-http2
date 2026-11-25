@@ -979,8 +979,24 @@ fn handleData(conn: *Connection, fh: ParsedHeader, payload: []const u8) bool {
         return true;
     };
     s.rx_mu.lockUncancelable(conn.io);
-    // Inbound stream flow control: deduct the full frame length (padding counts).
     const fc_len: i64 = @intCast(payload.len);
+    if (s.rx_eof) {
+        // Already half-closed(remote) (END_STREAM seen): RFC 7540 §5.1 requires
+        // RST_STREAM(STREAM_CLOSED) rather than buffering unread DATA. Return
+        // the connection-window credit deducted above and wake the worker.
+        s.reset.store(true, .release);
+        s.rx_cond.broadcast(conn.io);
+        s.rx_mu.unlock(conn.io);
+        conn.streams_mu.unlock(conn.io);
+        conn.wakeSenders();
+        if (fc_len > 0) {
+            const dc = creditConn(conn, fc_len);
+            if (dc > 0) sendWindowUpdate(conn, 0, dc);
+        }
+        rstStreamCode(conn, fh.sid, .stream_closed);
+        return true;
+    }
+    // Inbound stream flow control: deduct the full frame length (padding counts).
     s.recv_window -= fc_len;
     if (s.recv_window < 0) {
         // Peer exceeded the window we advertised: reset just this stream.
@@ -988,6 +1004,7 @@ fn handleData(conn: *Connection, fh: ParsedHeader, payload: []const u8) bool {
         s.rx_cond.broadcast(conn.io);
         s.rx_mu.unlock(conn.io);
         conn.streams_mu.unlock(conn.io);
+        conn.wakeSenders();
         {
             const dc = creditConn(conn, fc_len);
             if (dc > 0) sendWindowUpdate(conn, 0, dc);
@@ -1004,6 +1021,7 @@ fn handleData(conn: *Connection, fh: ParsedHeader, payload: []const u8) bool {
         s.rx_cond.broadcast(conn.io);
         s.rx_mu.unlock(conn.io);
         conn.streams_mu.unlock(conn.io);
+        conn.wakeSenders();
         {
             const dc = creditConn(conn, fc_len);
             if (dc > 0) sendWindowUpdate(conn, 0, dc);
@@ -4003,4 +4021,57 @@ test "h2: fatal peer GOAWAY aborts blocked workers immediately (#17)" {
     t.join();
     _ = c.close(fds[1]);
     try testing.expectEqual(@as(?anyerror, error.StreamReset), fatal_goaway_err);
+}
+
+fn slowOkHandler(ctx: *types.Context) anyerror!void {
+    Io.sleep(ctx.io, .{ .nanoseconds = 200 * std.time.ns_per_ms }, .awake) catch {};
+    try ctx.res.send(200, "text/plain", "ok");
+}
+
+test "h2: DATA on a half-closed(remote) stream gets RST_STREAM(STREAM_CLOSED) (#20)" {
+    const fds = try newSocketPair();
+    var srv: Server = .{ .io = testing.io, .gpa = testing.allocator, .handler = slowOkHandler, .config = .{} };
+    const t = try std.Thread.spawn(.{}, serveRawH2OnFd, .{ &srv, fds[0] });
+    defer t.join();
+    defer _ = c.close(fds[1]);
+
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [4096]u8 = undefined;
+    var reader = peerStream(fds[1]).reader(testing.io, &rbuf);
+    var writer = peerStream(fds[1]).writer(testing.io, &wbuf);
+    try rawHandshake(&reader.interface, &writer.interface);
+
+    // Bodyless GET: stream 1 is half-closed(remote) while its handler is running.
+    try writeFrame(&writer.interface, .headers, flag_end_headers | flag_end_stream, 1, &trailers_req_block);
+    try writeFrame(&writer.interface, .data, 0, 1, "junk");
+
+    // Stream 3: body ended by DATA(END_STREAM), then followed by more DATA while running.
+    try writeFrame(&writer.interface, .headers, flag_end_headers, 3, &trailers_req_block);
+    try writeFrame(&writer.interface, .data, flag_end_stream, 3, "legit");
+    try writeFrame(&writer.interface, .data, 0, 3, "extra");
+
+    // Stream 5: valid request proving the connection survives both stream errors.
+    try writeFrame(&writer.interface, .headers, flag_end_headers | flag_end_stream, 5, &trailers_req_block);
+
+    var rst1: ?u32 = null;
+    var rst3: ?u32 = null;
+    var ok5 = false;
+    for (0..40) |_| {
+        const maybe = nextFrameWithin(testing.allocator, &reader.interface, fds[1], 100) catch break;
+        var f = maybe orelse continue;
+        defer f.deinit(testing.allocator);
+        if (f.header.ftype == .rst_stream and f.header.sid == 1) {
+            rst1 = std.mem.readInt(u32, f.payload[0..4], .big);
+        }
+        if (f.header.ftype == .rst_stream and f.header.sid == 3) {
+            rst3 = std.mem.readInt(u32, f.payload[0..4], .big);
+        }
+        if (f.header.ftype == .data and f.header.sid == 5 and f.header.flags & flag_end_stream != 0) {
+            ok5 = true;
+        }
+        if (rst1 != null and rst3 != null and ok5) break;
+    }
+    try testing.expectEqual(@as(?u32, @intFromEnum(ErrorCode.stream_closed)), rst1);
+    try testing.expectEqual(@as(?u32, @intFromEnum(ErrorCode.stream_closed)), rst3);
+    try testing.expect(ok5);
 }
