@@ -125,6 +125,8 @@ pub const Stream = struct {
         defer c.endOp();
         if (data.len == 0) {
             if (end_stream) {
+                if (c.dead.load(.acquire)) return error.ConnectionClosed;
+                if (self.aborted.load(.acquire)) return error.StreamReset;
                 try c.writeData(self.id, "", true);
                 c.noteEnd(self, true, false); // local half-closed
             }
@@ -861,6 +863,22 @@ pub const Client = struct {
         const st = self.streams.get(sid);
         if (st) |s| {
             s.recv_mu.lockUncancelable(self.io);
+            if (s.reset != null or s.cancelled or s.goaway_refused) {
+                s.recv_mu.unlock(self.io);
+                self.streams_mu.unlock(self.io);
+                if (is_headers) freeHeaders(self.gpa, hs) else self.gpa.free(bytes);
+                // Stream is already closed locally (e.g. reset by us on a
+                // WINDOW_UPDATE overflow or cancelled): ignore later inbound
+                // frames, but still return the connection-level window credit
+                // deducted on arrival (RFC 7540 §6.9).
+                if (fc_cost > 0) {
+                    self.fc_mu.lockUncancelable(self.io);
+                    self.conn_recv_window += @as(i64, fc_cost);
+                    self.fc_mu.unlock(self.io);
+                    self.windowUpdate(0, fc_cost);
+                }
+                return;
+            }
             const item: Queued = if (is_headers) .{ .headers = hs } else .{ .data = .{ .bytes = bytes, .fc_cost = fc_cost } };
             var rst: ?p2.ErrorCode = null;
             if (!is_headers) {
@@ -1014,31 +1032,65 @@ pub const Client = struct {
                 self.sendGoaway(.protocol_error);
                 return error.ProtocolError;
             }
+            self.streams_mu.lockUncancelable(self.io);
+            if (self.streams.get(sid)) |st| {
+                st.aborted.store(true, .release);
+                st.recv_mu.lockUncancelable(self.io);
+                if (st.reset == null) st.reset = @intFromEnum(p2.ErrorCode.protocol_error);
+                st.recv_cond.broadcast(self.io);
+                st.recv_mu.unlock(self.io);
+                self.noteEnd(st, true, true);
+            }
+            self.streams_mu.unlock(self.io);
+            self.wakeSenders();
             var p: [4]u8 = undefined;
             std.mem.writeInt(u32, &p, @intFromEnum(p2.ErrorCode.protocol_error), .big);
             self.writeFrame(.rst_stream, 0, sid, &p) catch {};
             return;
         }
+        var conn_overflow = false;
         var overflow_sid: ?u31 = null;
         {
             self.streams_mu.lockUncancelable(self.io);
             defer self.streams_mu.unlock(self.io);
-            self.send_mu.lockUncancelable(self.io);
-            defer self.send_mu.unlock(self.io);
-            if (sid == 0) {
-                if (self.conn_send_window + incr > 0x7fff_ffff) return error.FlowControlError;
-                self.conn_send_window += incr;
-            } else if (self.streams.get(sid)) |st| {
-                if (st.send_window + incr > 0x7fff_ffff) {
-                    // Stream overflow: reset just that stream (RFC 7540 §6.9.1).
-                    // Defer the RST_STREAM write until the locks are released.
-                    st.send_window = 0;
-                    overflow_sid = sid;
-                } else {
-                    st.send_window += incr;
+            var overflow_st: ?*Stream = null;
+            {
+                self.send_mu.lockUncancelable(self.io);
+                defer self.send_mu.unlock(self.io);
+                if (sid == 0) {
+                    if (self.conn_send_window + incr > 0x7fff_ffff) {
+                        conn_overflow = true;
+                    } else {
+                        self.conn_send_window += incr;
+                    }
+                } else if (self.streams.get(sid)) |st| {
+                    if (!st.aborted.load(.acquire)) {
+                        if (st.send_window + incr > 0x7fff_ffff) {
+                            // Stream overflow: close the stream locally and
+                            // reset just that stream (RFC 7540 §6.9.1). Defer
+                            // the RST_STREAM write until the locks drop.
+                            st.send_window = 0;
+                            st.aborted.store(true, .release);
+                            overflow_st = st;
+                            overflow_sid = sid;
+                        } else {
+                            st.send_window += incr;
+                        }
+                    }
                 }
+                self.send_cond.broadcast(self.io);
             }
-            self.send_cond.broadcast(self.io);
+            if (overflow_st) |st| {
+                st.recv_mu.lockUncancelable(self.io);
+                if (st.reset == null) st.reset = @intFromEnum(p2.ErrorCode.flow_control_error);
+                st.recv_cond.broadcast(self.io);
+                st.recv_mu.unlock(self.io);
+                self.noteEnd(st, true, true);
+            }
+        }
+        if (conn_overflow) {
+            self.sendGoaway(.flow_control_error);
+            return error.FlowControlError;
         }
         // Send the reset outside streams_mu/send_mu: writeFrame takes write_mu,
         // and openStream takes write_mu -> streams_mu, so holding streams_mu
@@ -3240,4 +3292,90 @@ test "cancel() never loses a wake-up against a send() entering the window wait (
     accepted.close(io);
     torn = true;
     try testing.expectEqual(@as(u32, 0), stuck);
+}
+
+test "stream WINDOW_UPDATE overflow closes the stream locally (#19)" {
+    const io = testing.io;
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var srv = try addr.listen(io, .{ .mode = .stream, .reuse_address = true });
+    defer srv.deinit(io);
+    const port = srv.socket.address.ip4.port;
+    const caddr = try net.IpAddress.parse("127.0.0.1", port);
+    const cstream = try caddr.connect(io, .{ .mode = .stream });
+    defer cstream.close(io);
+    var accepted = try srv.accept(io);
+    defer accepted.close(io);
+
+    var crbuf: [4096]u8 = undefined;
+    var cwbuf: [4096]u8 = undefined;
+    var csr = cstream.reader(io, &crbuf);
+    var csw = cstream.writer(io, &cwbuf);
+    var client: Client = undefined;
+    try client.init(io, testing.allocator, &csr.interface, &csw.interface);
+    defer client.deinit();
+
+    var arbuf: [4096]u8 = undefined;
+    var awbuf: [4096]u8 = undefined;
+    var asr = accepted.reader(io, &arbuf);
+    var asw = accepted.writer(io, &awbuf);
+    try ctHandshake(&asr.interface, &asw.interface);
+    var ack1 = try ctRead(testing.allocator, &asr.interface);
+    ack1.deinit(testing.allocator);
+
+    // Limit to 1 concurrent stream to verify the overflow releases the slot.
+    var mcs: [6]u8 = undefined;
+    p2.putSetting(&mcs, p2.set_max_concurrent_streams, 1);
+    try ctWrite(&asw.interface, .settings, 0, 0, &mcs);
+    var ack2 = try ctRead(testing.allocator, &asr.interface);
+    ack2.deinit(testing.allocator);
+
+    const s = try client.openStream(.{ .path = "/x" }, false);
+    defer s.close();
+    var req1 = try ctRead(testing.allocator, &asr.interface);
+    req1.deinit(testing.allocator);
+
+    // 65535 + (2^31 - 1) overflows stream 1's send window.
+    var wu: [4]u8 = undefined;
+    std.mem.writeInt(u32, &wu, 0x7fff_ffff, .big);
+    try ctWrite(&asw.interface, .window_update, 0, 1, &wu);
+
+    var rst = try ctRead(testing.allocator, &asr.interface);
+    defer rst.deinit(testing.allocator);
+    try testing.expectEqual(p2.FrameType.rst_stream, rst.hdr.ftype);
+    try testing.expectEqual(@as(u31, 1), rst.hdr.sid);
+    try testing.expectEqual(@as(u32, @intFromEnum(p2.ErrorCode.flow_control_error)), std.mem.readInt(u32, rst.payload[0..4], .big));
+
+    // 1. send() fails immediately with StreamReset instead of blocking on a 0 window.
+    try testing.expectError(error.StreamReset, s.send("hello", false));
+    try testing.expectError(error.StreamReset, s.send("", true));
+
+    // 2. A later WINDOW_UPDATE must not revive the reset stream.
+    std.mem.writeInt(u32, &wu, 1000, .big);
+    try ctWrite(&asw.interface, .window_update, 0, 1, &wu);
+    // 3. A later HEADERS on the reset stream must not surface as a live .headers event.
+    const resp = [_]u8{ 0x08, 0x03, '2', '0', '0' };
+    try ctWrite(&asw.interface, .headers, p2.flag_end_headers | p2.flag_end_stream, 1, &resp);
+    // Sync with the reader via a PING/ACK so both frames above have been processed.
+    const ping = @as([8]u8, @splat(0x42));
+    try ctWrite(&asw.interface, .ping, 0, 0, &ping);
+    var pong = try ctRead(testing.allocator, &asr.interface);
+    defer pong.deinit(testing.allocator);
+    try testing.expectEqual(p2.FrameType.ping, pong.hdr.ftype);
+
+    try testing.expectError(error.StreamReset, s.send("more", false));
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ev = try s.readEvent(arena.allocator());
+    try testing.expect(ev == .rst);
+    try testing.expectEqual(@as(u32, @intFromEnum(p2.ErrorCode.flow_control_error)), ev.rst.code);
+    try testing.expectError(error.EndOfStream, s.readEvent(arena.allocator()));
+
+    // 4. Admission slot was freed (MAX_CONCURRENT_STREAMS = 1), so a new stream opens immediately.
+    const s3 = try client.openStream(.{ .path = "/y" }, true);
+    defer s3.close();
+    var req3 = try ctRead(testing.allocator, &asr.interface);
+    defer req3.deinit(testing.allocator);
+    try testing.expectEqual(p2.FrameType.headers, req3.hdr.ftype);
+    try testing.expectEqual(@as(u31, 3), req3.hdr.sid);
+    try testing.expect(!client.dead.load(.acquire));
 }
