@@ -289,19 +289,14 @@ pub const Encoder = struct {
         }
     }
 
-    /// Appends an HPACK Dynamic Table Size Update instruction (RFC 7541 §6.3,
-    /// 5-bit prefix `001xxxxx`). Required at the start of the next header block
-    /// after acknowledging a peer's reduced `SETTINGS_HEADER_TABLE_SIZE`
-    /// (RFC 9113 §4.3.1 / RFC 7541 §4.2).
-    pub fn encodeTableSizeUpdate(
-        arena: std.mem.Allocator,
-        out: *std.ArrayList(u8),
-        max_size: usize,
-    ) Error!void {
-        var buf: [10]u8 = undefined;
-        const n = hp.encodeInteger(max_size, 5, &buf) catch unreachable;
+    /// Encodes an HPACK Dynamic Table Size Update instruction (RFC 7541 §6.3,
+    /// 5-bit prefix `001xxxxx`) into `buf` without allocation. Required at the
+    /// start of the next header block after acknowledging a peer's reduced
+    /// `SETTINGS_HEADER_TABLE_SIZE` (RFC 9113 §4.3.1 / RFC 7541 §4.2).
+    pub fn encodeTableSizeUpdate(max_size: usize, buf: *[10]u8) []const u8 {
+        const n = hp.encodeInteger(max_size, 5, buf) catch unreachable;
         buf[0] |= 0x20; // Dynamic Table Size Update flag (001xxxxx).
-        try out.appendSlice(arena, buf[0..n]);
+        return buf[0..n];
     }
 
     fn emitIndexed(arena: std.mem.Allocator, out: *std.ArrayList(u8), idx: usize) Error!void {
@@ -747,7 +742,8 @@ test "encodeTableSizeUpdate emits valid RFC 7541 §6.3 dynamic table size update
     const arena = arena_state.allocator();
 
     var out: std.ArrayList(u8) = .empty;
-    try Encoder.encodeTableSizeUpdate(arena, &out, 0);
+    var tsu_buf: [10]u8 = undefined;
+    try out.appendSlice(arena, Encoder.encodeTableSizeUpdate(0, &tsu_buf));
     try testing.expectEqualSlices(u8, &[_]u8{0x20}, out.items);
     try Encoder.encodeResponse(arena, &out, 200, &.{.{ .name = "x-test", .value = "ok" }});
 
@@ -758,4 +754,3 @@ test "encodeTableSizeUpdate emits valid RFC 7541 §6.3 dynamic table size update
     try testing.expectEqualStrings("200", findHeader(hs, ":status").?);
     try testing.expectEqualStrings("ok", findHeader(hs, "x-test").?);
 }
-

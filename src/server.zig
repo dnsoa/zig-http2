@@ -69,10 +69,12 @@ pub const Config = struct {
     /// Keep-alive: max idle wait for the next frame header before the connection
     /// is closed. 0 = unbounded.
     idle_timeout_ms: u64 = 180_000,
-    /// Optional hard bound (ms) on waiting for in-flight handlers during
-    /// graceful drain. When 0, bodyless handlers may take as long as needed,
-    /// while handlers stalled waiting on peer DATA/WINDOW_UPDATE frames remain
-    /// bounded by head_timeout_ms / idle_timeout_ms.
+    /// Optional deadline (ms, anchored when graceful drain begins) after which
+    /// the drain read loop stops and flips `closing`, aborting any blocked
+    /// stream I/O (`body_reader.read` / response writes) before awaiting
+    /// handler task exit. Pure CPU/sleep handlers that touch no stream I/O
+    /// still run until they return. When 0, bodyless handlers are unbounded
+    /// while peer-stalled streams remain bounded by head/idle timeouts.
     drain_timeout_ms: u64 = 0,
     /// Max concurrent streams we serve — advertised as
     /// SETTINGS_MAX_CONCURRENT_STREAMS and enforced on inbound HEADERS.
@@ -622,6 +624,12 @@ const Connection = struct {
     active_workers: u32 = 0,
     /// Count of workers currently blocked on peer frames (rx DATA or send WINDOW_UPDATE).
     peer_waiters: u32 = 0,
+    /// Monotonic timestamp (ns, `.awake`) when `peer_waiters` rose from 0 to >0;
+    /// cleared when `peer_waiters` returns to 0 so streams making real progress
+    /// reset the window while housekeeping frames (PING, SETTINGS) do not.
+    peer_wait_since_ns: ?i96 = null,
+    /// Monotonic timestamp (ns, `.awake`) when graceful drain started (`enterDraining`).
+    drain_started_ns: ?i96 = null,
     // Worker task group: workers and watchdogs are added as tasks here; drained together via await.
     worker_group: Io.Group = .init,
 
@@ -641,8 +649,20 @@ const Connection = struct {
         self.decoder.deinit();
     }
 
-    fn notePeerWaitBegin(self: *Connection) void {
+    fn enterDraining(self: *Connection) void {
+        if (self.draining) return;
+        self.draining = true;
+        const now = Io.Timestamp.now(self.io, .awake).nanoseconds;
         self.workers_mu.lockUncancelable(self.io);
+        self.drain_started_ns = now;
+        self.workers_cond.broadcast(self.io);
+        self.workers_mu.unlock(self.io);
+    }
+
+    fn notePeerWaitBegin(self: *Connection) void {
+        const now = Io.Timestamp.now(self.io, .awake).nanoseconds;
+        self.workers_mu.lockUncancelable(self.io);
+        if (self.peer_waiters == 0) self.peer_wait_since_ns = now;
         self.peer_waiters += 1;
         self.workers_cond.broadcast(self.io);
         self.workers_mu.unlock(self.io);
@@ -651,6 +671,7 @@ const Connection = struct {
     fn notePeerWaitEnd(self: *Connection) void {
         self.workers_mu.lockUncancelable(self.io);
         self.peer_waiters -= 1;
+        if (self.peer_waiters == 0) self.peer_wait_since_ns = null;
         self.workers_cond.broadcast(self.io);
         self.workers_mu.unlock(self.io);
     }
@@ -686,9 +707,10 @@ const Connection = struct {
         defer self.cw.unlock();
         if (self.cw.broken) return error.WriteFailed;
         if (st.reset.load(.acquire) or self.closing.load(.acquire)) return error.StreamReset;
+        var pbuf: [10]u8 = undefined;
         const prefix: []const u8 = if (self.cw.pending_hpack_zero) blk: {
             self.cw.pending_hpack_zero = false;
-            break :blk &[_]u8{0x20};
+            break :blk hpack.Encoder.encodeTableSizeUpdate(0, &pbuf);
         } else &[_]u8{};
         self.cw.writeHeaderBlockLocked(sid, end_stream, max, prefix, block) catch |err| {
             self.cw.broken = true;
@@ -759,32 +781,59 @@ fn waitWorkersDrained(conn: *Connection) bool {
     return true;
 }
 
-fn effectiveDrainWaitMs(cfg: Config, has_peer_waiter: bool) u64 {
-    if (cfg.drain_timeout_ms > 0) return cfg.drain_timeout_ms;
-    if (!has_peer_waiter) return 0;
+fn peerWaitBoundMs(cfg: Config) u64 {
     if (cfg.head_timeout_ms > 0 and cfg.idle_timeout_ms > 0) return @min(cfg.head_timeout_ms, cfg.idle_timeout_ms);
     return if (cfg.head_timeout_ms > 0) cfg.head_timeout_ms else cfg.idle_timeout_ms;
 }
 
-fn drainTimerThunk(conn: *Connection) bool {
+/// Caller holds `conn.workers_mu`. Returns the earliest anchored deadline (ns,
+/// `.awake`) at which the drain read loop must stop and flip `closing`, or null
+/// when no deadline is currently active.
+fn nextDrainDeadlineNsLocked(conn: *const Connection) ?i96 {
     const cfg = conn.srv.config;
+    var earliest: ?i96 = null;
+    if (cfg.drain_timeout_ms > 0) {
+        if (conn.drain_started_ns) |ds| {
+            earliest = ds + @as(i96, cfg.drain_timeout_ms) * std.time.ns_per_ms;
+        }
+    }
+    if (conn.peer_waiters > 0) {
+        const peer_ms = peerWaitBoundMs(cfg);
+        if (peer_ms > 0) {
+            const since = conn.peer_wait_since_ns.?;
+            const base = if (conn.drain_started_ns) |ds| @max(since, ds) else since;
+            const dl = base + @as(i96, peer_ms) * std.time.ns_per_ms;
+            earliest = if (earliest) |e| @min(e, dl) else dl;
+        }
+    }
+    return earliest;
+}
+
+fn drainTimerThunk(conn: *Connection) bool {
     conn.workers_mu.lockUncancelable(conn.io);
     while (conn.active_workers > 0) {
-        const ms = effectiveDrainWaitMs(cfg, conn.peer_waiters > 0);
-        if (ms == 0) {
+        const dl = nextDrainDeadlineNsLocked(conn) orelse {
             conn.workers_cond.wait(conn.io, &conn.workers_mu) catch {
                 conn.workers_mu.unlock(conn.io);
                 return false;
             };
             continue;
-        }
-        conn.workers_mu.unlock(conn.io);
-        Io.sleep(conn.io, .{ .nanoseconds = @intCast(ms * std.time.ns_per_ms) }, .awake) catch return false;
-        conn.workers_mu.lockUncancelable(conn.io);
-        if (conn.active_workers == 0) break;
-        if (effectiveDrainWaitMs(cfg, conn.peer_waiters > 0) > 0) {
+        };
+        const now = Io.Timestamp.now(conn.io, .awake).nanoseconds;
+        if (now >= dl) {
             conn.workers_mu.unlock(conn.io);
             return true;
+        }
+        const rem_ns = dl - now;
+        conn.workers_mu.unlock(conn.io);
+        Io.sleep(conn.io, .{ .nanoseconds = @intCast(rem_ns) }, .awake) catch return false;
+        conn.workers_mu.lockUncancelable(conn.io);
+        if (conn.active_workers == 0) break;
+        if (nextDrainDeadlineNsLocked(conn)) |cur_dl| {
+            if (Io.Timestamp.now(conn.io, .awake).nanoseconds >= cur_dl) {
+                conn.workers_mu.unlock(conn.io);
+                return true;
+            }
         }
     }
     conn.workers_mu.unlock(conn.io);
@@ -793,18 +842,25 @@ fn drainTimerThunk(conn: *Connection) bool {
 
 /// While draining, reads the next frame header so in-flight streams can still
 /// receive DATA/trailers/WINDOW_UPDATE/RST_STREAM, while exiting promptly the
-/// moment `active_workers` reaches 0. Bodyless handlers are not aborted by
-/// `idle_timeout_ms` unless `drain_timeout_ms > 0`, whereas handlers stalled
-/// waiting for peer DATA / WINDOW_UPDATE frames remain bounded so a silent
-/// peer cannot pin workers and sockets indefinitely.
+/// moment `active_workers` reaches 0. Deadlines are anchored on `Connection`
+/// (`drain_started_ns` for `drain_timeout_ms`, and `peer_wait_since_ns` when
+/// `peer_waiters` rises above 0) rather than per-frame, so housekeeping traffic
+/// like keepalive PINGs cannot extend a stalled drain indefinitely.
 ///
 /// Returns `true` when `hb` holds a frame header, `false` when all workers have
-/// drained, or an error on EOF / read error / stall timeout.
+/// drained, or an error on EOF / read error / drain deadline expiry.
 fn readDrainHeader(conn: *Connection, r: *Io.Reader, hb: *[9]u8) !bool {
     conn.workers_mu.lockUncancelable(conn.io);
     const done_now = conn.active_workers == 0;
+    const expired_now = if (!done_now) blk: {
+        if (nextDrainDeadlineNsLocked(conn)) |dl| {
+            break :blk Io.Timestamp.now(conn.io, .awake).nanoseconds >= dl;
+        }
+        break :blk false;
+    } else false;
     conn.workers_mu.unlock(conn.io);
     if (done_now) return false;
+    if (expired_now) return error.Timeout;
 
     if (r.bufferedLen() >= hb.len) {
         try r.readSliceAll(hb);
@@ -906,7 +962,7 @@ fn readLoop(conn: *Connection, r: *Io.Reader) bool {
     var peer_settings_seen = false;
     while (true) {
         if (!goaway_sent and conn.srv.stop.load(.acquire)) {
-            conn.draining = true;
+            conn.enterDraining();
             sendGoaway(conn, .no_error);
             goaway_sent = true;
         }
@@ -958,7 +1014,7 @@ fn readLoop(conn: *Connection, r: *Io.Reader) bool {
                 // error code tears down immediately.
                 const code = std.mem.readInt(u32, payload[4..8], .big);
                 if (code != @intFromEnum(ErrorCode.no_error)) return false;
-                conn.draining = true;
+                conn.enterDraining();
             },
             .priority => {}, // no-op: we do not implement prioritization
             .continuation => {
@@ -5216,6 +5272,72 @@ test "graceful drain times out a stream stalled waiting on missing peer DATA" {
     t.join(); // must exit promptly after the 80ms stall timeout without closing fds[1]!
     const elapsed_ms = @divFloor(Io.Timestamp.now(testing.io, .awake).nanoseconds - start, std.time.ns_per_ms);
     try testing.expect(elapsed_ms < 2_000);
+}
+
+test "graceful drain bounds stalled stream even when peer sends continuous PINGs" {
+    const RunState = struct {
+        var done = std.atomic.Value(bool).init(false);
+        fn serve(srv: *Server, fd: std.posix.fd_t) void {
+            serveRawH2OnFd(srv, fd);
+            done.store(true, .release);
+        }
+    };
+    const configs = [_]Config{
+        .{ .head_timeout_ms = 120, .idle_timeout_ms = 120 },
+        .{ .head_timeout_ms = 30_000, .idle_timeout_ms = 180_000, .drain_timeout_ms = 120 },
+    };
+    for (configs) |cfg| {
+        RunState.done.store(false, .release);
+        const fds = try newSocketPair();
+        errdefer _ = c.close(fds[1]);
+
+        var srv: Server = .{
+            .io = testing.io,
+            .gpa = testing.allocator,
+            .handler = h2EchoHandler,
+            .config = cfg,
+        };
+        const t = try std.Thread.spawn(.{}, RunState.serve, .{ &srv, fds[0] });
+        defer t.join();
+        defer _ = c.close(fds[1]);
+
+        var rbuf: [4096]u8 = undefined;
+        var wbuf: [4096]u8 = undefined;
+        var reader = peerStream(fds[1]).reader(testing.io, &rbuf);
+        var writer = peerStream(fds[1]).writer(testing.io, &wbuf);
+
+        try writer.interface.writeAll(preface);
+        try writer.interface.flush();
+        var s0 = try readFrameAlloc(testing.allocator, &reader.interface);
+        s0.deinit(testing.allocator);
+        try writeFrame(&writer.interface, .settings, 0, 0, "");
+        try writeFrame(&writer.interface, .settings, flag_ack, 0, "");
+
+        const post_block = [_]u8{ 0x83, 0x87, 0x84 }; // POST / without END_STREAM
+        try writeFrame(&writer.interface, .headers, flag_end_headers, 1, &post_block);
+        const peer_ga: [8]u8 = @splat(0);
+        try writeFrame(&writer.interface, .goaway, 0, 0, &peer_ga);
+
+        // Send PING every 25ms (< 120ms bound) while withholding DATA: server must
+        // still enforce the anchored 120ms deadline and exit during the PING loop.
+        const ping: [8]u8 = @splat(0x42);
+        var exited_during_pings = false;
+        var waited_ms: u64 = 0;
+        while (waited_ms < 1_000) : (waited_ms += 25) {
+            Io.sleep(testing.io, .{ .nanoseconds = 25 * std.time.ns_per_ms }, .awake) catch {};
+            if (RunState.done.load(.acquire)) {
+                exited_during_pings = true;
+                break;
+            }
+            writeFrame(&writer.interface, .ping, 0, 0, &ping) catch {
+                // EPIPE/closed peer socket means server exited right as we wrote.
+                Io.sleep(testing.io, .{ .nanoseconds = 25 * std.time.ns_per_ms }, .awake) catch {};
+                exited_during_pings = RunState.done.load(.acquire);
+                break;
+            };
+        }
+        try testing.expect(exited_during_pings);
+    }
 }
 
 test "ConnWriter poisons subsequent writes after a partial write failure" {

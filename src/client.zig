@@ -775,9 +775,10 @@ pub const Client = struct {
         self.streams_mu.unlock(self.io);
 
         const max: usize = self.peer_max_frame.load(.acquire);
+        var pbuf: [10]u8 = undefined;
         const prefix: []const u8 = if (self.pending_hpack_zero) blk: {
             self.pending_hpack_zero = false;
-            break :blk &[_]u8{0x20};
+            break :blk hpack.Encoder.encodeTableSizeUpdate(0, &pbuf);
         } else &[_]u8{};
         const write_ok = blk: {
             self.writeHeaderBlockLocked(sid, end_stream, max, prefix, block.items) catch break :blk false;
@@ -1670,7 +1671,8 @@ fn validateStreamHeaders(s: *Stream, hs: []const Header, end_stream: bool) bool 
                 if (end_stream) return false; // 1xx informational cannot end the stream
                 return true;
             }
-            if (status == 204 and cl != null and cl.? != 0) return false;
+            // RFC 9113 §8.1.1: 204, 304, and responses to HEAD MAY carry a
+            // non-zero content-length header even though no DATA payload follows.
             if (s.is_head_request or status == 204 or status == 304) {
                 s.resp_content_length = 0;
             } else {
@@ -4349,6 +4351,24 @@ test "client validates response framing, :status, field syntax, 1xx, and Content
     try testing.expect(e7_2 == .headers);
     const e7_3 = try s7.readEvent(arena);
     try testing.expectEqualStrings("ok", e7_3.data.payload);
+
+    // 5. 204 No Content + non-zero content-length with END_STREAM is allowed (RFC 9113 §8.1.1),
+    // while 204 followed by non-empty DATA is rejected with RST_STREAM(PROTOCOL_ERROR).
+    const s9 = try client.openStream(.{ .path = "/204-ok" }, true);
+    defer s9.close();
+    var b204: std.ArrayList(u8) = .empty;
+    try hpack.Encoder.encodeResponse(arena, &b204, 204, &.{.{ .name = "content-length", .value = "5" }});
+    try ctWrite(&asw.interface, .headers, p2.flag_end_headers | p2.flag_end_stream, 9, b204.items);
+    const e9 = try s9.readEvent(arena);
+    try testing.expect(e9 == .headers and e9.headers.end_stream);
+
+    const s11 = try client.openStream(.{ .path = "/204-bad-data" }, true);
+    defer s11.close();
+    try ctWrite(&asw.interface, .headers, p2.flag_end_headers, 11, b204.items);
+    try ctWrite(&asw.interface, .data, p2.flag_end_stream, 11, "x");
+    _ = try s11.readEvent(arena); // .headers
+    const e11 = try s11.readEvent(arena);
+    try testing.expectEqual(@as(u32, @intFromEnum(p2.ErrorCode.protocol_error)), e11.rst.code);
     try testing.expect(!client.dead.load(.acquire));
 }
 

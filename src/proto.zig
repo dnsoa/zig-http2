@@ -206,5 +206,3 @@ test "proto field and token validators enforce RFC 9113 / RFC 9110 rules" {
     try testing.expectEqual(@as(?u64, null), parseContentLength("+42"));
     try testing.expectEqual(@as(?u64, null), parseContentLength("4_2"));
 }
-
-
