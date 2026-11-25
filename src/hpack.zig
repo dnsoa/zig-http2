@@ -28,6 +28,9 @@ pub const Error = error{
     InvalidIndex,
     InvalidZeroIndex,
     TableSizeExceeded,
+    /// A dynamic table size update appeared after a header field representation
+    /// (RFC 7541 §4.2 / §6.3: updates may only occur at the start of a block).
+    InvalidTableSizeUpdate,
     Truncated,
     /// Decoded header list exceeded `Decoder.max_list_size` — an HPACK
     /// decompression bomb (RFC 7540 §6.5.2 SETTINGS_MAX_HEADER_LIST_SIZE).
@@ -96,11 +99,13 @@ pub const Decoder = struct {
             out.deinit(arena);
         }
         var list_size: usize = 0;
+        var saw_field = false;
         var i: usize = 0;
         while (i < block.len) {
             const b = block[i];
             if (b & 0x80 != 0) {
                 // 6.1 Indexed Header Field (7-bit prefix).
+                saw_field = true;
                 const n = try decInt(block[i..], 7);
                 i += n.len;
                 const e = try self.lookup(n.value);
@@ -108,6 +113,7 @@ pub const Decoder = struct {
                 try ownEntry(arena, &out, e);
             } else if (b & 0xC0 == 0x40) {
                 // 6.2.1 Literal with Incremental Indexing (6-bit prefix).
+                saw_field = true;
                 const h = try self.literal(arena, block[i..], 6);
                 i += h.consumed;
                 try own(arena, &out, h.name, h.value);
@@ -115,6 +121,9 @@ pub const Decoder = struct {
                 try self.dyn.add(h.name, h.value);
             } else if (b & 0xE0 == 0x20) {
                 // 6.3 Dynamic Table Size Update (5-bit prefix).
+                // RFC 7541 §4.2: dynamic table size updates MUST occur at the
+                // beginning of a header block, before any header field.
+                if (saw_field) return Error.InvalidTableSizeUpdate;
                 const n = try decInt(block[i..], 5);
                 i += n.len;
                 if (n.value > self.max_table_size) return Error.TableSizeExceeded;
@@ -123,6 +132,7 @@ pub const Decoder = struct {
                 // 6.2.2 Literal without Indexing / 6.2.3 Never Indexed (4-bit prefix).
                 // The never-indexed flag (0x10) only matters for re-encoding, which
                 // a server doesn't do for inbound headers; either way: not indexed.
+                saw_field = true;
                 const h = try self.literal(arena, block[i..], 4);
                 i += h.consumed;
                 try own(arena, &out, h.name, h.value);
@@ -695,4 +705,23 @@ test "encode uses Huffman for a literal header name when it is shorter" {
     defer dec.deinit();
     const hs = try dec.decode(arena, out.items);
     try testing.expectEqualStrings("1", findHeader(hs, "x-custom-long-header-name").?);
+}
+
+test "decode rejects dynamic table size update after a header field (RFC 7541 §4.2, #23)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var dec = Decoder.init(testing.allocator, 4096);
+    defer dec.deinit();
+
+    // Multiple dynamic table size updates at the start of a block are allowed.
+    const valid = [_]u8{ 0x20, 0x3e, 0x82 }; // size=0, size=30, :method GET
+    const hs = try dec.decode(arena, &valid);
+    try testing.expectEqualStrings("GET", findHeader(hs, ":method").?);
+    try testing.expectEqual(@as(usize, 30), dec.dyn.max_size);
+
+    // Dynamic table size update after a header field is a decoding error.
+    const invalid = [_]u8{ 0x82, 0x20 }; // :method GET, then size=0
+    try testing.expectError(Error.InvalidTableSizeUpdate, dec.decode(testing.allocator, &invalid));
 }

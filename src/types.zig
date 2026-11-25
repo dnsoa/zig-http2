@@ -182,8 +182,41 @@ pub const Context = struct {
     /// `grpc-timeout`). No-op if unsupported.
     pub fn setDeadlineIn(self: *Context, ns: u64) void {
         const now = std.Io.Timestamp.now(self.io, .awake);
-        self.setDeadline(.{ .nanoseconds = now.nanoseconds + @as(i64, @intCast(ns)) });
+        self.setDeadline(.{ .nanoseconds = now.nanoseconds + @as(i96, ns) });
     }
 };
 
 pub const Handler = *const fn (ctx: *Context) anyerror!void;
+
+test "Context.setDeadlineIn handles u64 values above maxInt(i64) without panicking (#23)" {
+    const Capture = struct {
+        seen: ?std.Io.Timestamp = null,
+        fn set(ctx: *anyopaque, dl: std.Io.Timestamp) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.seen = dl;
+        }
+    };
+    var cap: Capture = .{};
+    var req: Request = .{
+        .method = "GET",
+        .target = "/",
+        .minor_version = 0,
+        .headers = &.{},
+        .content_length = null,
+        .keep_alive = true,
+    };
+    var res: Response = undefined;
+    var ctx: Context = .{
+        .req = &req,
+        .res = &res,
+        .arena = std.testing.allocator,
+        .io = std.testing.io,
+        .userdata = null,
+        .set_deadline_ctx = &cap,
+        .set_deadline_fn = Capture.set,
+    };
+    const big_ns: u64 = @as(u64, std.math.maxInt(i64)) + 4096;
+    ctx.setDeadlineIn(big_ns);
+    try std.testing.expect(cap.seen != null);
+    try std.testing.expect(cap.seen.?.nanoseconds >= @as(i96, big_ns));
+}

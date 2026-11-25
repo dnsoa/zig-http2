@@ -36,6 +36,7 @@ pub const ErrorCode = enum(u32) {
     frame_size_error = 0x6,
     refused_stream = 0x7,
     cancel = 0x8,
+    compression_error = 0x9,
     enhance_your_calm = 0xb,
     _,
 };

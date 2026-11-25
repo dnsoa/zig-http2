@@ -121,8 +121,11 @@ pub fn runTimed(io: Io, ms: u64, f: anytype, args: anytype) anyerror!void {
     if (ms == 0) return @call(.auto, f, args);
     var buf: [2]TimedOp = undefined;
     var sel = Io.Select(TimedOp).init(io, &buf);
-    sel.concurrent(.work, f, args) catch return @call(.auto, f, args);
-    sel.concurrent(.timer, timerThunk, .{ io, ms }) catch {
+    // Spawn the timer first so if only one concurrency slot is available and
+    // `.work` fails to spawn, `.work` is never cancelled mid-flight after
+    // consuming bytes from the underlying reader.
+    sel.concurrent(.timer, timerThunk, .{ io, ms }) catch return @call(.auto, f, args);
+    sel.concurrent(.work, f, args) catch {
         while (sel.cancel()) |_| {}
         return @call(.auto, f, args);
     };
@@ -178,6 +181,17 @@ const ConnWriter = struct {
         try self.frameLocked(ftype, flags, sid, payload);
         try self.w.flush();
     }
+
+    /// Writes one stream frame while re-checking `st.reset`/`closing` under the
+    /// writer lock so a worker can never emit HEADERS/DATA after the reader
+    /// already wrote RST_STREAM for the same stream (RFC 9113 §5.1).
+    fn frameForStream(self: *ConnWriter, st: *H2Stream, ftype: FrameType, flags: u8, payload: []const u8) !void {
+        self.lock();
+        defer self.unlock();
+        if (st.reset.load(.acquire) or st.conn.closing.load(.acquire)) return error.StreamReset;
+        try self.frameLocked(ftype, flags, st.id, payload);
+        try self.w.flush();
+    }
 };
 
 /// One HTTP/2 stream + its request. Lives on the gpa; freed by its worker.
@@ -189,6 +203,10 @@ const H2Stream = struct {
     /// Flow-control window for DATA we send, guarded by `conn.send_mu`.
     send_window: i64,
     reset: std.atomic.Value(bool) = .init(false),
+    /// True once the server has emitted the response's final END_STREAM. Used
+    /// to distinguish normal client RST_STREAM cleanup after an early response
+    /// (client send half still open) from a rapid-reset flood.
+    response_finished: std.atomic.Value(bool) = .init(false),
     /// Whether the request has a body (no END_STREAM on HEADERS). Set on the
     /// reader thread before the worker is spawned; read once by the worker.
     has_body: bool = false,
@@ -204,6 +222,9 @@ const H2Stream = struct {
     rx_buf: std.ArrayList(u8) = .empty, // gpa-backed; freed by the worker
     rx_off: usize = 0,
     rx_eof: bool = false,
+    /// Total unpadded DATA payload bytes received on this stream, checked
+    /// against `req.content_length` (RFC 9113 §8.1.1). Guarded by `rx_mu`.
+    rx_body_bytes: u64 = 0,
 
     /// Inbound (receive) flow-control window: bytes the peer may still send on
     /// this stream. Initialized to the advertised SETTINGS_INITIAL_WINDOW_SIZE;
@@ -333,14 +354,22 @@ const H2Stream = struct {
                 conn.send_cond.waitUncancelable(conn.io, &conn.send_mu);
             };
             conn.send_mu.unlock(conn.io);
-            try conn.cw.frame(.data, 0, self.id, data[off .. off + n]);
+            conn.cw.frameForStream(self, .data, 0, data[off .. off + n]) catch |err| {
+                if (err == error.StreamReset) {
+                    // Frame was not written on the wire; return connection-level send credit.
+                    conn.send_mu.lockUncancelable(conn.io);
+                    conn.send_window += @as(i64, @intCast(n));
+                    conn.send_cond.broadcast(conn.io);
+                    conn.send_mu.unlock(conn.io);
+                }
+                return err;
+            };
             off += n;
         }
     }
 
     fn endStream(self: *H2Stream) !void {
-        if (self.reset.load(.acquire) or self.conn.closing.load(.acquire)) return error.StreamReset;
-        try self.conn.cw.frame(.data, flag_end_stream, self.id, "");
+        try self.conn.cw.frameForStream(self, .data, flag_end_stream, "");
     }
 };
 
@@ -422,7 +451,7 @@ const H2Sink = struct {
         var block: std.ArrayList(u8) = .empty;
         const hdrs = try buildResponseHeaders(res);
         try hpack.Encoder.encodeResponse(res.arena, &block, res.status_code, hdrs);
-        try self.stream.conn.writeHeaders(self.stream.id, block.items, false);
+        try self.stream.conn.writeHeaders(self.stream, block.items, false);
     }
 
     fn writeBody(ctx: *anyopaque, _: *types.Response, bytes: []const u8) anyerror!void {
@@ -440,10 +469,11 @@ const H2Sink = struct {
             for (items, 0..) |h, i| hdrs[i] = .{ .name = h.name, .value = h.value };
             var block: std.ArrayList(u8) = .empty;
             try hpack.Encoder.encodeTrailers(res.arena, &block, hdrs);
-            try self.stream.conn.writeHeaders(self.stream.id, block.items, true);
+            try self.stream.conn.writeHeaders(self.stream, block.items, true);
         } else {
             try self.stream.endStream();
         }
+        self.stream.response_finished.store(true, .release);
     }
 };
 
@@ -492,6 +522,14 @@ const Connection = struct {
     // Rapid-reset accounting (CVE-2023-44487), guarded by streams_mu.
     streams_opened: u32 = 0,
     streams_reset: u32 = 0,
+    // One-shot fixed-size ring (256 slots, 2x the default max_concurrent_streams)
+    // of stream IDs whose response completed cleanly (END_STREAM sent) while the
+    // client's send half was still open (!rx_eof). A single trailing RST_STREAM
+    // from the client closing that half-closed stream is normal HTTP/2 cleanup
+    // rather than a rapid-reset attack. Entries evicted past the 256-stream
+    // backlog fall back to normal reset counting. Guarded by streams_mu.
+    early_closed: [256]u31 = @splat(0),
+    early_closed_pos: usize = 0,
 
     // Worker accounting (for graceful drain).
     workers_mu: Io.Mutex = .init,
@@ -536,13 +574,16 @@ const Connection = struct {
     }
 
     /// HEADERS (+ CONTINUATION when the block exceeds the peer's max frame size),
-    /// emitted atomically so no other stream's frames interleave.
-    fn writeHeaders(self: *Connection, sid: u31, block: []const u8, end_stream: bool) !void {
+    /// emitted atomically so no other stream's frames interleave. Re-checks
+    /// `st.reset`/`closing` under `cw.mu` so no HEADERS can follow RST_STREAM.
+    fn writeHeaders(self: *Connection, st: *H2Stream, block: []const u8, end_stream: bool) !void {
         const max = self.peer.max_frame_size.load(.acquire);
         // END_STREAM rides the HEADERS frame (never CONTINUATION).
         const es: u8 = if (end_stream) flag_end_stream else 0;
+        const sid = st.id;
         self.cw.lock();
         defer self.cw.unlock();
+        if (st.reset.load(.acquire) or self.closing.load(.acquire)) return error.StreamReset;
         if (block.len <= max) {
             try self.cw.frameLocked(.headers, flag_end_headers | es, sid, block);
         } else {
@@ -720,6 +761,7 @@ pub fn serveConn(srv: *Server, r: *Io.Reader, w: *Io.Writer, client_ip: ?[]const
 fn readLoop(conn: *Connection, r: *Io.Reader) bool {
     const gpa = conn.gpa;
     var goaway_sent = false;
+    var peer_settings_seen = false;
     while (true) {
         if (!goaway_sent and conn.srv.stop.load(.acquire)) {
             conn.draining = true;
@@ -747,6 +789,16 @@ fn readLoop(conn: *Connection, r: *Io.Reader) bool {
         if (validateInboundFrame(fh, payload)) |code| {
             sendGoaway(conn, code);
             return false;
+        }
+
+        // RFC 9113 §3.4: the client connection preface MUST be followed by a
+        // non-ACK SETTINGS frame; any other initial frame is a PROTOCOL_ERROR.
+        if (!peer_settings_seen) {
+            if (fh.ftype != .settings or (fh.flags & flag_ack != 0)) {
+                sendGoaway(conn, .protocol_error);
+                return false;
+            }
+            peer_settings_seen = true;
         }
 
         switch (fh.ftype) {
@@ -823,7 +875,15 @@ fn handleSettings(conn: *Connection, fh: ParsedHeader, payload: []const u8) bool
                 }
                 conn.peer.max_frame_size.store(val, .release);
             },
-            else => {}, // header_table_size/enable_push/max_concurrent_streams: irrelevant to us
+            set_enable_push => {
+                // RFC 9113 §6.5.2: SETTINGS_ENABLE_PUSH must be 0 or 1; any
+                // other value is a connection PROTOCOL_ERROR.
+                if (val > 1) {
+                    sendGoaway(conn, .protocol_error);
+                    return false;
+                }
+            },
+            else => {}, // header_table_size/max_concurrent_streams: irrelevant to us
         }
     }
     if (new_iw) |iw| {
@@ -864,6 +924,12 @@ fn applyInitialWindow(conn: *Connection, new_iw: u32) bool {
 /// Returns false on a connection-fatal WINDOW_UPDATE (GOAWAY already sent).
 fn handleWindowUpdate(conn: *Connection, fh: ParsedHeader, payload: []const u8) bool {
     if (payload.len < 4) return true;
+    // RFC 9113 §5.1 / §6.9: WINDOW_UPDATE on an idle stream (never-opened even
+    // id or id above the highest client stream seen) is a connection PROTOCOL_ERROR.
+    if (fh.sid != 0 and (fh.sid % 2 == 0 or fh.sid > conn.last_stream_id)) {
+        sendGoaway(conn, .protocol_error);
+        return false;
+    }
     const incr: i64 = @intCast(std.mem.readInt(u32, payload[0..4], .big) & 0x7fff_ffff);
     // A 0 increment is a PROTOCOL_ERROR: connection-level -> GOAWAY, stream-level
     // -> RST_STREAM (RFC 7540 §6.9).
@@ -872,33 +938,60 @@ fn handleWindowUpdate(conn: *Connection, fh: ParsedHeader, payload: []const u8) 
             sendGoaway(conn, .protocol_error);
             return false;
         }
+        conn.streams_mu.lockUncancelable(conn.io);
+        if (conn.streams.get(fh.sid)) |st| {
+            st.reset.store(true, .release);
+            st.rx_mu.lockUncancelable(conn.io);
+            st.rx_cond.broadcast(conn.io);
+            st.rx_mu.unlock(conn.io);
+        }
+        conn.streams_mu.unlock(conn.io);
+        conn.wakeSenders();
         rstStreamCode(conn, fh.sid, .protocol_error);
         return true;
     }
-    conn.streams_mu.lockUncancelable(conn.io);
-    defer conn.streams_mu.unlock(conn.io);
-    conn.send_mu.lockUncancelable(conn.io);
-    defer conn.send_mu.unlock(conn.io);
-    // The flow-control window must not exceed 2^31-1 (RFC 7540 §6.9.1):
-    // connection overflow is fatal; stream overflow resets just that stream.
-    // sendGoaway/rstStreamCode only write frames (no lock), so calling them
-    // while holding these locks is safe.
-    if (fh.sid == 0) {
-        if (conn.send_window + incr > 0x7fff_ffff) {
-            sendGoaway(conn, .flow_control_error);
-            return false;
-        }
-        conn.send_window += incr;
-    } else if (conn.streams.get(fh.sid)) |st| {
-        if (st.send_window + incr > 0x7fff_ffff) {
-            st.reset.store(true, .release);
+    var conn_overflow = false;
+    var stream_overflow = false;
+    {
+        conn.streams_mu.lockUncancelable(conn.io);
+        defer conn.streams_mu.unlock(conn.io);
+        var overflow_st: ?*H2Stream = null;
+        {
+            conn.send_mu.lockUncancelable(conn.io);
+            defer conn.send_mu.unlock(conn.io);
+            // The flow-control window must not exceed 2^31-1 (RFC 7540 §6.9.1):
+            // connection overflow is fatal; stream overflow resets just that stream.
+            if (fh.sid == 0) {
+                if (conn.send_window + incr > 0x7fff_ffff) {
+                    conn_overflow = true;
+                } else {
+                    conn.send_window += incr;
+                }
+            } else if (conn.streams.get(fh.sid)) |st| {
+                if (st.send_window + incr > 0x7fff_ffff) {
+                    st.reset.store(true, .release);
+                    overflow_st = st;
+                    stream_overflow = true;
+                } else {
+                    st.send_window += incr;
+                }
+            }
             conn.send_cond.broadcast(conn.io);
-            rstStreamCode(conn, fh.sid, .flow_control_error);
-            return true;
         }
-        st.send_window += incr;
+        // Wake any worker blocked in streamRead (lock order: streams_mu -> rx_mu).
+        if (overflow_st) |st| {
+            st.rx_mu.lockUncancelable(conn.io);
+            st.rx_cond.broadcast(conn.io);
+            st.rx_mu.unlock(conn.io);
+        }
     }
-    conn.send_cond.broadcast(conn.io);
+    if (conn_overflow) {
+        sendGoaway(conn, .flow_control_error);
+        return false;
+    }
+    if (stream_overflow) {
+        rstStreamCode(conn, fh.sid, .flow_control_error);
+    }
     return true;
 }
 
@@ -966,23 +1059,34 @@ fn handleData(conn: *Connection, fh: ParsedHeader, payload: []const u8) bool {
     // streams_mu -> rx_mu.
     conn.streams_mu.lockUncancelable(conn.io);
     const s = conn.streams.get(fh.sid) orelse {
+        var half_closed_local = false;
+        for (&conn.early_closed) |*slot| {
+            if (slot.* == fh.sid) {
+                half_closed_local = true;
+                if (end_stream) slot.* = 0; // peer now closed its send half too
+                break;
+            }
+        }
         conn.streams_mu.unlock(conn.io);
-        // DATA on an id we never opened: idle (above the highest id seen, so
-        // never even refused) is a connection PROTOCOL_ERROR; closed (at or
-        // below it) is a stream error — RST STREAM_CLOSED, keeping the
-        // connection (RFC 9113 §5.1/§6.1). Silently dropping the frame let a
-        // peer stream DATA on idle ids forever.
-        if (fh.sid > conn.last_stream_id) {
+        // DATA on an id we never opened: idle (even push id or above the highest
+        // id seen) is a connection PROTOCOL_ERROR; closed (at or below it) is a
+        // stream error — RST STREAM_CLOSED, keeping the connection (RFC 9113
+        // §5.1/§6.1). Silently dropping the frame let a peer stream DATA on idle
+        // ids forever.
+        if (fh.sid % 2 == 0 or fh.sid > conn.last_stream_id) {
             sendGoaway(conn, .protocol_error);
             return false;
         }
         // The frame still consumed connection-level window even though no
-        // stream will ever read it — return the credit, then reset.
+        // stream will ever read it — return the credit.
         if (payload.len > 0) {
             const d = creditConn(conn, @intCast(payload.len));
             if (d > 0) sendWindowUpdate(conn, 0, d);
         }
-        rstStreamCode(conn, fh.sid, .stream_closed);
+        // If we responded early without reading the request body, the stream is
+        // still half-closed (local) from the client's perspective, so in-flight
+        // DATA is valid and silently discarded instead of reset (RFC 9113 §5.1).
+        if (!half_closed_local) rstStreamCode(conn, fh.sid, .stream_closed);
         return true;
     };
     s.rx_mu.lockUncancelable(conn.io);
@@ -1019,6 +1123,28 @@ fn handleData(conn: *Connection, fh: ParsedHeader, payload: []const u8) bool {
         rstStreamCode(conn, fh.sid, .flow_control_error);
         return true;
     }
+    // RFC 9113 §8.1.1: total unpadded DATA length MUST match content-length.
+    const cl_mismatch = blk: {
+        const new_total = std.math.add(u64, s.rx_body_bytes, data.len) catch break :blk true;
+        if (s.req.content_length) |cl| {
+            if (new_total > cl or (end_stream and new_total != cl)) break :blk true;
+        }
+        s.rx_body_bytes = new_total;
+        break :blk false;
+    };
+    if (cl_mismatch) {
+        s.reset.store(true, .release);
+        s.rx_cond.broadcast(conn.io);
+        s.rx_mu.unlock(conn.io);
+        conn.streams_mu.unlock(conn.io);
+        conn.wakeSenders();
+        if (fc_len > 0) {
+            const dc = creditConn(conn, fc_len);
+            if (dc > 0) sendWindowUpdate(conn, 0, dc);
+        }
+        rstStreamCode(conn, fh.sid, .protocol_error);
+        return true;
+    }
     const append_failed = data.len > 0 and blk: {
         s.rx_buf.appendSlice(conn.gpa, data) catch break :blk true;
         break :blk false;
@@ -1050,22 +1176,44 @@ fn handleData(conn: *Connection, fh: ParsedHeader, payload: []const u8) bool {
 }
 
 /// Handles a peer RST_STREAM. Returns false (after sending GOAWAY) when the
-/// connection has crossed the rapid-reset threshold and must be torn down.
+/// stream is idle (RFC 9113 §6.4) or the connection crossed the rapid-reset threshold.
 fn resetStream(conn: *Connection, sid: u31) bool {
+    if (sid % 2 == 0 or sid > conn.last_stream_id) {
+        sendGoaway(conn, .protocol_error);
+        return false;
+    }
+    var excused = false;
     conn.streams_mu.lockUncancelable(conn.io);
     if (conn.streams.get(sid)) |st| {
-        st.reset.store(true, .release);
+        const prev_reset = st.reset.swap(true, .acq_rel);
         // Wake a streaming worker blocked reading request DATA.
         st.rx_mu.lockUncancelable(conn.io);
+        if (!prev_reset and st.response_finished.load(.acquire) and !st.rx_eof) {
+            excused = true;
+        }
         st.rx_cond.broadcast(conn.io);
         st.rx_mu.unlock(conn.io);
+    } else {
+        // Consume one-shot exemption for a stream whose response already
+        // finished early while the client's request half remained open.
+        for (&conn.early_closed) |*slot| {
+            if (slot.* == sid) {
+                slot.* = 0;
+                excused = true;
+                break;
+            }
+        }
     }
-    // Count every peer reset, even one racing the stream's own teardown — a
-    // rapid-reset attacker's RST often lands after the worker already removed
-    // the stream, so gating on `streams.get` would miss the flood entirely.
-    conn.streams_reset +%= 1;
-    const flood = conn.streams_reset > rapid_reset_floor and
-        conn.streams_reset > conn.streams_opened / 2;
+    var flood = false;
+    if (!excused) {
+        // Count every non-excused peer reset, even one racing the stream's own
+        // teardown — a rapid-reset attacker's RST often lands after the worker
+        // already removed the stream, so gating on `streams.get` would miss
+        // the flood entirely.
+        conn.streams_reset +%= 1;
+        flood = conn.streams_reset > rapid_reset_floor and
+            conn.streams_reset > conn.streams_opened / 2;
+    }
     conn.streams_mu.unlock(conn.io);
     conn.wakeSenders();
     if (flood) {
@@ -1112,6 +1260,11 @@ fn handleHeaders(conn: *Connection, r: *Io.Reader, fh: ParsedHeader, first: []co
             return error.ProtocolError;
         }
         frag = frag[5..];
+    }
+
+    if (frag.len > max_header_block_bytes) {
+        sendGoaway(conn, .enhance_your_calm);
+        return error.ProtocolError;
     }
 
     var block: std.ArrayList(u8) = .empty;
@@ -1172,7 +1325,10 @@ fn handleHeaders(conn: *Connection, r: *Io.Reader, fh: ParsedHeader, first: []co
         return error.ProtocolError;
     }
     // An odd id at or below the highest we've opened but not currently open is a
-    // closed (or idle) stream: RST rather than GOAWAY, keeping the connection.
+    // closed stream (e.g. in-flight trailers arriving after an early response):
+    // RFC 9113 §5.1 requires minimally processing the header block to keep HPACK
+    // in sync without tearing down the connection; we decode and discard via
+    // `refuseStream` (sending RST_STREAM(STREAM_CLOSED)).
     if (fh.sid <= conn.last_stream_id) return refuseStream(conn, fh.sid, block.items, .stream_closed);
     conn.last_stream_id = fh.sid;
 
@@ -1201,10 +1357,10 @@ fn handleHeaders(conn: *Connection, r: *Io.Reader, fh: ParsedHeader, first: []co
         .recv_window = @intCast(conn.srv.config.initial_window_size),
     };
     const arena = st.arena();
-    const decoded = conn.decoder.decode(arena, block.items) catch {
+    const decoded = conn.decoder.decode(arena, block.items) catch |err| {
         st.arena_state.deinit();
         gpa.destroy(st);
-        sendGoaway(conn, .protocol_error);
+        sendGoaway(conn, if (err == error.OutOfMemory) .internal_error else .compression_error);
         return error.ProtocolError;
     };
     st.req = buildRequest(arena, decoded) catch |err| {
@@ -1215,6 +1371,18 @@ fn handleHeaders(conn: *Connection, r: *Io.Reader, fh: ParsedHeader, first: []co
         rstStreamCode(conn, fh.sid, if (err == error.BadRequest) .protocol_error else .internal_error);
         return;
     };
+    // RFC 9113 §8.1.1: a bodyless request (END_STREAM on HEADERS) with a
+    // non-zero content-length is malformed.
+    if (fh.flags & flag_end_stream != 0) {
+        if (st.req.content_length) |cl| {
+            if (cl != 0) {
+                st.arena_state.deinit();
+                gpa.destroy(st);
+                rstStreamCode(conn, fh.sid, .protocol_error);
+                return;
+            }
+        }
+    }
 
     conn.streams_mu.lockUncancelable(conn.io);
     conn.streams.put(gpa, fh.sid, st) catch {
@@ -1250,8 +1418,8 @@ fn handleHeaders(conn: *Connection, r: *Io.Reader, fh: ParsedHeader, first: []co
 /// Returns an error only when the block itself is malformed, which is
 /// connection-fatal (GOAWAY already sent).
 fn refuseStream(conn: *Connection, sid: u31, block: []const u8, code: ErrorCode) !void {
-    decodeDiscard(conn, block) catch {
-        sendGoaway(conn, .protocol_error);
+    decodeDiscard(conn, block) catch |err| {
+        sendGoaway(conn, if (err == error.OutOfMemory) .internal_error else .compression_error);
         return error.ProtocolError;
     };
     rstStreamCode(conn, sid, code);
@@ -1274,17 +1442,36 @@ fn decodeDiscard(conn: *Connection, block: []const u8) !void {
 fn handleTrailingHeaders(conn: *Connection, fh: ParsedHeader, block: []const u8) !void {
     var tmp = std.heap.ArenaAllocator.init(conn.gpa);
     defer tmp.deinit();
-    const decoded = conn.decoder.decode(tmp.allocator(), block) catch {
-        sendGoaway(conn, .protocol_error); // HPACK failure is connection-fatal
+    const decoded = conn.decoder.decode(tmp.allocator(), block) catch |err| {
+        sendGoaway(conn, if (err == error.OutOfMemory) .internal_error else .compression_error); // HPACK failure is connection-fatal (RFC 9113 §4.3)
         return error.ProtocolError;
     };
 
-    // Trailers must carry END_STREAM and must not contain pseudo-headers.
+    // Trailers must carry END_STREAM and must not contain pseudo-headers or
+    // malformed field names/values (RFC 9113 §8.1 / §8.2.1).
     var invalid_code: ?ErrorCode = null;
     if (fh.flags & flag_end_stream == 0) {
         invalid_code = .protocol_error;
     } else for (decoded) |h| {
-        if (h.name.len > 0 and h.name[0] == ':') {
+        if (h.name.len == 0 or h.name[0] == ':') {
+            invalid_code = .protocol_error;
+            break;
+        }
+        for (h.name) |ch| {
+            if (ch <= 0x20 or ch >= 0x7f or std.ascii.isUpper(ch) or ch == ':') {
+                invalid_code = .protocol_error;
+                break;
+            }
+        }
+        if (invalid_code != null) break;
+        for (h.value) |ch| {
+            if (ch == 0 or ch == '\r' or ch == '\n') {
+                invalid_code = .protocol_error;
+                break;
+            }
+        }
+        if (invalid_code != null) break;
+        if (isConnectionSpecificHeader(h.name)) {
             invalid_code = .protocol_error;
             break;
         }
@@ -1298,9 +1485,9 @@ fn handleTrailingHeaders(conn: *Connection, fh: ParsedHeader, block: []const u8)
     };
     s.rx_mu.lockUncancelable(conn.io);
     // Already half-closed (END_STREAM seen) → HEADERS after end is STREAM_CLOSED;
-    // otherwise bad trailers → invalid_code. Either way it's a stream error that
-    // must also terminate the local worker.
-    const rst_code: ?ErrorCode = if (s.rx_eof) .stream_closed else invalid_code;
+    // otherwise bad trailers or content-length mismatch → protocol_error.
+    const cl_bad = if (s.req.content_length) |cl| s.rx_body_bytes != cl else false;
+    const rst_code: ?ErrorCode = if (s.rx_eof) .stream_closed else (invalid_code orelse (if (cl_bad) .protocol_error else null));
     if (rst_code) |code| {
         s.reset.store(true, .release);
         s.rx_cond.broadcast(conn.io);
@@ -1370,13 +1557,12 @@ fn buildRequest(arena: std.mem.Allocator, decoded: []const hpack.Header) !types.
     var seen_authority = false;
 
     for (decoded) |h| {
-        // NUL/CR/LF in any name or value — pseudo-headers included — is
-        // malformed (RFC 9113 §8.2.1): a CR LF pair in :path or a value is a
-        // header-injection primitive against any downstream hop that
-        // concatenates fields back into HTTP/1.
+        // RFC 9113 §8.2.1: field names MUST NOT be empty; NUL/CR/LF in any
+        // name or value — pseudo-headers included — is malformed.
+        if (h.name.len == 0) return error.BadRequest;
         for (h.name) |ch| if (ch == 0 or ch == '\r' or ch == '\n') return error.BadRequest;
         for (h.value) |ch| if (ch == 0 or ch == '\r' or ch == '\n') return error.BadRequest;
-        if (h.name.len > 0 and h.name[0] == ':') {
+        if (h.name[0] == ':') {
             if (saw_regular) return error.BadRequest;
             if (std.mem.eql(u8, h.name, ":method")) {
                 if (seen_method) return error.BadRequest;
@@ -1400,10 +1586,9 @@ fn buildRequest(arena: std.mem.Allocator, decoded: []const hpack.Header) !types.
             continue;
         }
         saw_regular = true;
-        // HTTP/2 field names are lowercase on the wire; an uppercase byte makes
-        // the request malformed (RFC 9113 §8.2.1). Accepting it lets a peer
-        // smuggle a field past any downstream check that compares case-sensitively.
-        for (h.name) |ch| if (std.ascii.isUpper(ch)) return error.BadRequest;
+        // RFC 9113 §8.2.1: regular field names MUST be lowercase and MUST NOT
+        // contain 0x00-0x20, 0x41-0x5a, 0x7f-0xff, or ':' (0x3a).
+        for (h.name) |ch| if (ch <= 0x20 or ch >= 0x7f or std.ascii.isUpper(ch) or ch == ':') return error.BadRequest;
         if (isConnectionSpecificHeader(h.name)) return error.BadRequest;
         if (std.ascii.eqlIgnoreCase(h.name, "te") and !std.mem.eql(u8, h.value, "trailers")) return error.BadRequest;
         if (std.ascii.eqlIgnoreCase(h.name, "content-length")) {
@@ -1420,6 +1605,10 @@ fn buildRequest(arena: std.mem.Allocator, decoded: []const hpack.Header) !types.
             content_length = cl;
         }
         if (std.ascii.eqlIgnoreCase(h.name, "host")) {
+            // RFC 9110 §7.2: duplicate Host headers are invalid and would let a
+            // second matching Host bypass the :authority consistency check while
+            // Request.get("host") returns the first.
+            if (host != null) return error.BadRequest;
             host = h.value;
         }
         try hdrs.append(arena, .{ .name = h.name, .value = h.value });
@@ -1461,7 +1650,7 @@ fn runStream(st: *H2Stream) void {
             // would be a use-after-free. Equivalent to the old `thread.join()`.
             st.watchdog_done.waitUncancelable(conn.io);
         }
-        removeStream(conn, st.id);
+        removeCompletedStream(conn, st);
         // Return connection-level credit for body bytes the handler never
         // consumed (e.g. it returned without draining the request body).
         // After removeStream the stream is unreachable by the reader thread,
@@ -1522,7 +1711,24 @@ fn runStream(st: *H2Stream) void {
         if (!res.finished) rstStreamCode(conn, st.id, .cancel);
         return;
     }
-    res.finish() catch {};
+    res.finish() catch |err| {
+        if (!st.reset.load(.acquire) and !conn.closing.load(.acquire) and !res.finished) {
+            log.warn("h2 response finish error: {t}", .{err});
+            rstStreamCode(conn, st.id, .internal_error);
+        }
+    };
+}
+
+fn removeCompletedStream(conn: *Connection, st: *H2Stream) void {
+    conn.streams_mu.lockUncancelable(conn.io);
+    _ = conn.streams.remove(st.id);
+    // After streams.remove, the reader can no longer deliver DATA/trailers to
+    // `st`, so `rx_eof` is stable here.
+    if (st.response_finished.load(.acquire) and !st.reset.load(.acquire) and !st.rx_eof) {
+        conn.early_closed[conn.early_closed_pos] = st.id;
+        conn.early_closed_pos = (conn.early_closed_pos + 1) % conn.early_closed.len;
+    }
+    conn.streams_mu.unlock(conn.io);
 }
 
 fn removeStream(conn: *Connection, sid: u31) void {
@@ -3383,6 +3589,20 @@ test "h2: HEADERS on a closed stream is RST(STREAM_CLOSED), not GOAWAY" {
     defer rst.deinit(testing.allocator);
     try testing.expectEqual(@as(u31, 1), rst.header.sid);
     try testing.expectEqual(@as(u32, @intFromEnum(ErrorCode.stream_closed)), std.mem.readInt(u32, rst.payload[0..4], .big));
+
+    // Connection must stay alive for subsequent stream 3.
+    try writeFrame(&writer.interface, .headers, flag_end_headers | flag_end_stream, 3, &trailers_req_block);
+    var ok3 = false;
+    while (true) {
+        var f = try readFrameAlloc(testing.allocator, &reader.interface);
+        const es = f.header.sid == 3 and f.header.flags & flag_end_stream != 0 and (f.header.ftype == .data or f.header.ftype == .headers);
+        f.deinit(testing.allocator);
+        if (es) {
+            ok3 = true;
+            break;
+        }
+    }
+    try testing.expect(ok3);
 }
 
 /// Responds with the value of `x-marker`, or "MISSING" — a probe for whether a
@@ -4193,4 +4413,435 @@ test "Response.finish leaves finished false if sink.finish fails (#16)" {
     try testing.expectError(error.OutOfMemory, res.finish());
     try testing.expect(res.head_sent);
     try testing.expect(!res.finished);
+}
+
+test "buildRequest rejects duplicate host headers and invalid field names (#23)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Duplicate host headers: second matches :authority while first differs.
+    const dup_host = [_]hpack.Header{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = "/" },
+        .{ .name = ":authority", .value = "evil.example" },
+        .{ .name = "host", .value = "victim.example" },
+        .{ .name = "host", .value = "evil.example" },
+    };
+    try testing.expectError(error.BadRequest, buildRequest(arena, &dup_host));
+
+    // Empty field name (RFC 9113 §8.2.1).
+    const empty_name = [_]hpack.Header{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = "/" },
+        .{ .name = "", .value = "val" },
+    };
+    try testing.expectError(error.BadRequest, buildRequest(arena, &empty_name));
+
+    // Regular field names containing colon, space, or DEL (0x7f).
+    const bad_names = [_][]const u8{ "foo:bar", "foo bar", "foo\x7fbar" };
+    for (bad_names) |bad| {
+        const hs = [_]hpack.Header{
+            .{ .name = ":method", .value = "GET" },
+            .{ .name = ":scheme", .value = "https" },
+            .{ .name = ":path", .value = "/" },
+            .{ .name = bad, .value = "val" },
+        };
+        try testing.expectError(error.BadRequest, buildRequest(arena, &hs));
+    }
+}
+
+test "h2: content-length mismatch with DATA resets stream with PROTOCOL_ERROR (#23)" {
+    const fds = try newSocketPair();
+    errdefer _ = c.close(fds[1]);
+    var srv: Server = .{
+        .io = testing.io,
+        .gpa = testing.allocator,
+        .handler = markerHandler,
+        .config = .{ .idle_timeout_ms = 5_000 },
+    };
+    const t = try std.Thread.spawn(.{}, serveRawH2OnFd, .{ &srv, fds[0] });
+    defer t.join();
+    defer _ = c.close(fds[1]);
+
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [4096]u8 = undefined;
+    var reader = peerStream(fds[1]).reader(testing.io, &rbuf);
+    var writer = peerStream(fds[1]).writer(testing.io, &wbuf);
+    try rawHandshake(&reader.interface, &writer.interface);
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var cl5_block: std.ArrayList(u8) = .empty;
+    try hpack.Encoder.encodeRequest(
+        arena_state.allocator(),
+        &cl5_block,
+        "POST",
+        "https",
+        "/upload",
+        "example.com",
+        &.{.{ .name = "content-length", .value = "5" }},
+    );
+
+    // Stream 1: bodyless HEADERS(END_STREAM) with content-length: 5 -> RST(PROTOCOL_ERROR).
+    try writeFrame(&writer.interface, .headers, flag_end_headers | flag_end_stream, 1, cl5_block.items);
+    // Stream 3: DATA exceeds content-length (6 > 5) -> RST(PROTOCOL_ERROR).
+    try writeFrame(&writer.interface, .headers, flag_end_headers, 3, cl5_block.items);
+    try writeFrame(&writer.interface, .data, flag_end_stream, 3, "123456");
+    // Stream 5: DATA shorter than content-length at END_STREAM (3 < 5) -> RST(PROTOCOL_ERROR).
+    try writeFrame(&writer.interface, .headers, flag_end_headers, 5, cl5_block.items);
+    try writeFrame(&writer.interface, .data, flag_end_stream, 5, "123");
+    // Stream 7: exact match (5 == 5) succeeds.
+    try writeFrame(&writer.interface, .headers, flag_end_headers, 7, cl5_block.items);
+    try writeFrame(&writer.interface, .data, flag_end_stream, 7, "12345");
+
+    var rst1: ?u32 = null;
+    var rst3: ?u32 = null;
+    var rst5: ?u32 = null;
+    var ok7 = false;
+    for (0..40) |_| {
+        const maybe = nextFrameWithin(testing.allocator, &reader.interface, fds[1], 100) catch break;
+        var f = maybe orelse continue;
+        defer f.deinit(testing.allocator);
+        if (f.header.ftype == .rst_stream) {
+            const code = std.mem.readInt(u32, f.payload[0..4], .big);
+            if (f.header.sid == 1) rst1 = code;
+            if (f.header.sid == 3) rst3 = code;
+            if (f.header.sid == 5) rst5 = code;
+        } else if (f.header.sid == 7 and f.header.flags & flag_end_stream != 0) {
+            ok7 = true;
+        }
+        if (rst1 != null and rst3 != null and rst5 != null and ok7) break;
+    }
+    try testing.expectEqual(@as(?u32, @intFromEnum(ErrorCode.protocol_error)), rst1);
+    try testing.expectEqual(@as(?u32, @intFromEnum(ErrorCode.protocol_error)), rst3);
+    try testing.expectEqual(@as(?u32, @intFromEnum(ErrorCode.protocol_error)), rst5);
+    try testing.expect(ok7);
+}
+
+fn blockingReadHandler(ctx: *types.Context) anyerror!void {
+    const flag: *std.atomic.Value(bool) = @ptrCast(@alignCast(ctx.userdata.?));
+    var tmp: [64]u8 = undefined;
+    _ = ctx.body_reader.?.read(&tmp) catch |err| {
+        if (err == error.StreamReset) flag.store(true, .release);
+        return err;
+    };
+}
+
+test "h2: stream WINDOW_UPDATE overflow wakes handler blocked in body_reader.read (#23)" {
+    const fds = try newSocketPair();
+    errdefer _ = c.close(fds[1]);
+    var woke_with_reset = std.atomic.Value(bool).init(false);
+    var srv: Server = .{
+        .io = testing.io,
+        .gpa = testing.allocator,
+        .handler = blockingReadHandler,
+        .userdata = &woke_with_reset,
+        .config = .{ .idle_timeout_ms = 5_000 },
+    };
+    const t = try std.Thread.spawn(.{}, serveRawH2OnFd, .{ &srv, fds[0] });
+    defer t.join();
+    defer _ = c.close(fds[1]);
+
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [4096]u8 = undefined;
+    var reader = peerStream(fds[1]).reader(testing.io, &rbuf);
+    var writer = peerStream(fds[1]).writer(testing.io, &wbuf);
+    try rawHandshake(&reader.interface, &writer.interface);
+
+    // Open stream 1 with body (no END_STREAM) so handler blocks in body_reader.read.
+    try writeFrame(&writer.interface, .headers, flag_end_headers, 1, &trailers_req_block);
+    Io.sleep(testing.io, .{ .nanoseconds = 30 * std.time.ns_per_ms }, .awake) catch {};
+
+    // Overflow stream 1's send window: server must RST(FLOW_CONTROL_ERROR) and wake rx_cond.
+    var wu: [4]u8 = undefined;
+    std.mem.writeInt(u32, &wu, 0x7fff_ffff, .big);
+    try writeFrame(&writer.interface, .window_update, 0, 1, &wu);
+
+    var rst = try readFrameOfType(testing.allocator, &reader.interface, .rst_stream);
+    defer rst.deinit(testing.allocator);
+    try testing.expectEqual(@as(u31, 1), rst.header.sid);
+    try testing.expectEqual(@as(u32, @intFromEnum(ErrorCode.flow_control_error)), std.mem.readInt(u32, rst.payload[0..4], .big));
+
+    // Graceful GOAWAY must drain promptly because the blocked worker woke up.
+    var ga: [8]u8 = undefined;
+    std.mem.writeInt(u32, ga[0..4], 1, .big);
+    std.mem.writeInt(u32, ga[4..8], @intFromEnum(ErrorCode.no_error), .big);
+    try writeFrame(&writer.interface, .goaway, 0, 0, &ga);
+
+    var waited: u64 = 0;
+    while (waited < 2000 and !woke_with_reset.load(.acquire)) : (waited += 20) {
+        Io.sleep(testing.io, .{ .nanoseconds = 20 * std.time.ns_per_ms }, .awake) catch {};
+    }
+    try testing.expect(woke_with_reset.load(.acquire));
+}
+
+test "h2: idle RST_STREAM, WINDOW_UPDATE, even DATA, bad ENABLE_PUSH, non-SETTINGS preface, and bad HPACK (#23)" {
+    // 1. First frame after preface is PING instead of SETTINGS -> GOAWAY(PROTOCOL_ERROR).
+    {
+        const fds = try newSocketPair();
+        errdefer _ = c.close(fds[1]);
+        var srv: Server = .{ .io = testing.io, .gpa = testing.allocator, .handler = markerHandler };
+        const t = try std.Thread.spawn(.{}, serveRawH2OnFd, .{ &srv, fds[0] });
+        defer t.join();
+        defer _ = c.close(fds[1]);
+
+        var rbuf: [4096]u8 = undefined;
+        var wbuf: [4096]u8 = undefined;
+        var reader = peerStream(fds[1]).reader(testing.io, &rbuf);
+        var writer = peerStream(fds[1]).writer(testing.io, &wbuf);
+        try writer.interface.writeAll(preface);
+        const ping = @as([8]u8, @splat(0));
+        try writeFrame(&writer.interface, .ping, 0, 0, &ping);
+        var ga = try readFrameOfType(testing.allocator, &reader.interface, .goaway);
+        defer ga.deinit(testing.allocator);
+        try testing.expectEqual(@as(u32, @intFromEnum(ErrorCode.protocol_error)), std.mem.readInt(u32, ga.payload[4..8], .big));
+    }
+
+    // 2. SETTINGS_ENABLE_PUSH = 2 -> GOAWAY(PROTOCOL_ERROR).
+    {
+        const fds = try newSocketPair();
+        errdefer _ = c.close(fds[1]);
+        var srv: Server = .{ .io = testing.io, .gpa = testing.allocator, .handler = markerHandler };
+        const t = try std.Thread.spawn(.{}, serveRawH2OnFd, .{ &srv, fds[0] });
+        defer t.join();
+        defer _ = c.close(fds[1]);
+
+        var rbuf: [4096]u8 = undefined;
+        var wbuf: [4096]u8 = undefined;
+        var reader = peerStream(fds[1]).reader(testing.io, &rbuf);
+        var writer = peerStream(fds[1]).writer(testing.io, &wbuf);
+        try writer.interface.writeAll(preface);
+        var bad_push: [6]u8 = undefined;
+        putSetting(&bad_push, set_enable_push, 2);
+        try writeFrame(&writer.interface, .settings, 0, 0, &bad_push);
+        var ga = try readFrameOfType(testing.allocator, &reader.interface, .goaway);
+        defer ga.deinit(testing.allocator);
+        try testing.expectEqual(@as(u32, @intFromEnum(ErrorCode.protocol_error)), std.mem.readInt(u32, ga.payload[4..8], .big));
+    }
+
+    // 3. RST_STREAM on idle stream -> GOAWAY(PROTOCOL_ERROR).
+    {
+        const fds = try newSocketPair();
+        errdefer _ = c.close(fds[1]);
+        var srv: Server = .{ .io = testing.io, .gpa = testing.allocator, .handler = markerHandler };
+        const t = try std.Thread.spawn(.{}, serveRawH2OnFd, .{ &srv, fds[0] });
+        defer t.join();
+        defer _ = c.close(fds[1]);
+
+        var rbuf: [4096]u8 = undefined;
+        var wbuf: [4096]u8 = undefined;
+        var reader = peerStream(fds[1]).reader(testing.io, &rbuf);
+        var writer = peerStream(fds[1]).writer(testing.io, &wbuf);
+        try rawHandshake(&reader.interface, &writer.interface);
+        var rst: [4]u8 = undefined;
+        std.mem.writeInt(u32, &rst, @intFromEnum(ErrorCode.cancel), .big);
+        try writeFrame(&writer.interface, .rst_stream, 0, 99, &rst);
+        var ga = try readFrameOfType(testing.allocator, &reader.interface, .goaway);
+        defer ga.deinit(testing.allocator);
+        try testing.expectEqual(@as(u32, @intFromEnum(ErrorCode.protocol_error)), std.mem.readInt(u32, ga.payload[4..8], .big));
+    }
+
+    // 4. WINDOW_UPDATE on idle stream -> GOAWAY(PROTOCOL_ERROR).
+    {
+        const fds = try newSocketPair();
+        errdefer _ = c.close(fds[1]);
+        var srv: Server = .{ .io = testing.io, .gpa = testing.allocator, .handler = markerHandler };
+        const t = try std.Thread.spawn(.{}, serveRawH2OnFd, .{ &srv, fds[0] });
+        defer t.join();
+        defer _ = c.close(fds[1]);
+
+        var rbuf: [4096]u8 = undefined;
+        var wbuf: [4096]u8 = undefined;
+        var reader = peerStream(fds[1]).reader(testing.io, &rbuf);
+        var writer = peerStream(fds[1]).writer(testing.io, &wbuf);
+        try rawHandshake(&reader.interface, &writer.interface);
+        var wu: [4]u8 = undefined;
+        std.mem.writeInt(u32, &wu, 100, .big);
+        try writeFrame(&writer.interface, .window_update, 0, 99, &wu);
+        var ga = try readFrameOfType(testing.allocator, &reader.interface, .goaway);
+        defer ga.deinit(testing.allocator);
+        try testing.expectEqual(@as(u32, @intFromEnum(ErrorCode.protocol_error)), std.mem.readInt(u32, ga.payload[4..8], .big));
+    }
+
+    // 5. DATA on even stream 2 after stream 3 opened -> GOAWAY(PROTOCOL_ERROR).
+    {
+        const fds = try newSocketPair();
+        errdefer _ = c.close(fds[1]);
+        var srv: Server = .{ .io = testing.io, .gpa = testing.allocator, .handler = markerHandler };
+        const t = try std.Thread.spawn(.{}, serveRawH2OnFd, .{ &srv, fds[0] });
+        defer t.join();
+        defer _ = c.close(fds[1]);
+
+        var rbuf: [4096]u8 = undefined;
+        var wbuf: [4096]u8 = undefined;
+        var reader = peerStream(fds[1]).reader(testing.io, &rbuf);
+        var writer = peerStream(fds[1]).writer(testing.io, &wbuf);
+        try rawHandshake(&reader.interface, &writer.interface);
+        try writeFrame(&writer.interface, .headers, flag_end_headers | flag_end_stream, 3, &trailers_req_block);
+        try writeFrame(&writer.interface, .data, flag_end_stream, 2, "x");
+        var ga = try readFrameOfType(testing.allocator, &reader.interface, .goaway);
+        defer ga.deinit(testing.allocator);
+        try testing.expectEqual(@as(u32, @intFromEnum(ErrorCode.protocol_error)), std.mem.readInt(u32, ga.payload[4..8], .big));
+    }
+
+    // 6. Malformed HPACK block -> GOAWAY(COMPRESSION_ERROR) (RFC 9113 §4.3).
+    {
+        const fds = try newSocketPair();
+        errdefer _ = c.close(fds[1]);
+        var srv: Server = .{ .io = testing.io, .gpa = testing.allocator, .handler = markerHandler };
+        const t = try std.Thread.spawn(.{}, serveRawH2OnFd, .{ &srv, fds[0] });
+        defer t.join();
+        defer _ = c.close(fds[1]);
+
+        var rbuf: [4096]u8 = undefined;
+        var wbuf: [4096]u8 = undefined;
+        var reader = peerStream(fds[1]).reader(testing.io, &rbuf);
+        var writer = peerStream(fds[1]).writer(testing.io, &wbuf);
+        try rawHandshake(&reader.interface, &writer.interface);
+        const bad_hpack = [_]u8{ 0x82, 0x20 }; // mid-block dynamic table size update
+        try writeFrame(&writer.interface, .headers, flag_end_headers | flag_end_stream, 1, &bad_hpack);
+        var ga = try readFrameOfType(testing.allocator, &reader.interface, .goaway);
+        defer ga.deinit(testing.allocator);
+        try testing.expectEqual(@as(u32, @intFromEnum(ErrorCode.compression_error)), std.mem.readInt(u32, ga.payload[4..8], .big));
+    }
+
+    // 7. Single oversized HEADERS(END_HEADERS) respects max_header_block_bytes.
+    {
+        const fds = try newSocketPair();
+        errdefer _ = c.close(fds[1]);
+        var srv: Server = .{
+            .io = testing.io,
+            .gpa = testing.allocator,
+            .handler = markerHandler,
+            .config = .{ .max_frame_size = 512 * 1024 },
+        };
+        const t = try std.Thread.spawn(.{}, serveRawH2OnFd, .{ &srv, fds[0] });
+        defer t.join();
+        defer _ = c.close(fds[1]);
+
+        var rbuf: [4096]u8 = undefined;
+        var wbuf: [4096]u8 = undefined;
+        var reader = peerStream(fds[1]).reader(testing.io, &rbuf);
+        var writer = peerStream(fds[1]).writer(testing.io, &wbuf);
+        try rawHandshake(&reader.interface, &writer.interface);
+        const huge = try testing.allocator.alloc(u8, max_header_block_bytes + 1);
+        defer testing.allocator.free(huge);
+        @memset(huge, 0x20);
+        writeFrame(&writer.interface, .headers, flag_end_headers | flag_end_stream, 1, huge) catch {};
+        var ga = try readFrameOfType(testing.allocator, &reader.interface, .goaway);
+        defer ga.deinit(testing.allocator);
+        try testing.expectEqual(@as(u32, @intFromEnum(ErrorCode.enhance_your_calm)), std.mem.readInt(u32, ga.payload[4..8], .big));
+    }
+}
+
+fn earlyRespondHandler(ctx: *types.Context) anyerror!void {
+    try ctx.res.send(200, "text/plain", "early");
+}
+
+test "h2: in-flight DATA and trailers after early response keep connection alive and HPACK in sync (#23)" {
+    const fds = try newSocketPair();
+    errdefer _ = c.close(fds[1]);
+    var srv: Server = .{
+        .io = testing.io,
+        .gpa = testing.allocator,
+        .handler = earlyRespondHandler,
+        .config = .{ .idle_timeout_ms = 5_000 },
+    };
+    const t = try std.Thread.spawn(.{}, serveRawH2OnFd, .{ &srv, fds[0] });
+    defer t.join();
+    defer _ = c.close(fds[1]);
+
+    var rbuf: [8192]u8 = undefined;
+    var wbuf: [8192]u8 = undefined;
+    var reader = peerStream(fds[1]).reader(testing.io, &rbuf);
+    var writer = peerStream(fds[1]).writer(testing.io, &wbuf);
+    try rawHandshake(&reader.interface, &writer.interface);
+
+    // Stream 1: request with body (no END_STREAM); server replies immediately without reading body.
+    try writeFrame(&writer.interface, .headers, flag_end_headers, 1, &trailers_req_block);
+    while (true) {
+        var f = try readFrameAlloc(testing.allocator, &reader.interface);
+        const es = f.header.sid == 1 and f.header.flags & flag_end_stream != 0 and (f.header.ftype == .data or f.header.ftype == .headers);
+        f.deinit(testing.allocator);
+        if (es) break;
+    }
+
+    // Wait briefly so worker removes stream 1, then send in-flight DATA + trailers (with incremental indexing).
+    Io.sleep(testing.io, .{ .nanoseconds = 20 * std.time.ns_per_ms }, .awake) catch {};
+    try writeFrame(&writer.interface, .data, 0, 1, "in-flight-body");
+    // Literal with incremental indexing: "x-trailer": "v" -> becomes dynamic index 62,
+    // shifting stream 1's ":authority: www.example.com" to dynamic index 63.
+    const trailer_block = [_]u8{ 0x40, 9, 'x', '-', 't', 'r', 'a', 'i', 'l', 'e', 'r', 1, 'v' };
+    try writeFrame(&writer.interface, .headers, flag_end_headers | flag_end_stream, 1, &trailer_block);
+
+    // Subsequent stream 3 uses dynamic index 63 (:authority) and 62 (x-trailer).
+    // If the trailer block was NOT HPACK-decoded, index 63 would be out-of-range
+    // (COMPRESSION_ERROR); if closed-stream HEADERS GOAWAY'd, stream 3 would fail.
+    const req3 = [_]u8{ 0x82, 0x86, 0x84, 0x80 | 63, 0x80 | 62 };
+    try writeFrame(&writer.interface, .headers, flag_end_headers | flag_end_stream, 3, &req3);
+
+    var ok3 = false;
+    for (0..30) |_| {
+        var f = try readFrameAlloc(testing.allocator, &reader.interface);
+        defer f.deinit(testing.allocator);
+        try testing.expect(f.header.ftype != .goaway);
+        if (f.header.sid == 3 and f.header.flags & flag_end_stream != 0 and (f.header.ftype == .data or f.header.ftype == .headers)) {
+            ok3 = true;
+            break;
+        }
+    }
+    try testing.expect(ok3);
+}
+
+test "h2: duplicate RST_STREAM on early-answered streams is one-shot and still trips ENHANCE_YOUR_CALM (#23)" {
+    const fds = try newSocketPair();
+    errdefer _ = c.close(fds[1]);
+    var srv: Server = .{
+        .io = testing.io,
+        .gpa = testing.allocator,
+        .handler = earlyRespondHandler,
+        .config = .{ .idle_timeout_ms = 5_000 },
+    };
+    const t = try std.Thread.spawn(.{}, serveRawH2OnFd, .{ &srv, fds[0] });
+    defer t.join();
+    defer _ = c.close(fds[1]);
+
+    var rbuf: [8192]u8 = undefined;
+    var wbuf: [8192]u8 = undefined;
+    var reader = peerStream(fds[1]).reader(testing.io, &rbuf);
+    var writer = peerStream(fds[1]).writer(testing.io, &wbuf);
+    try rawHandshake(&reader.interface, &writer.interface);
+
+    var rst_payload: [4]u8 = undefined;
+    std.mem.writeInt(u32, &rst_payload, @intFromEnum(ErrorCode.cancel), .big);
+
+    var saw_goaway: ?u32 = null;
+    for (1..121) |i| {
+        const sid: u31 = @intCast(2 * i - 1);
+        writeFrame(&writer.interface, .headers, flag_end_headers, sid, &trailers_req_block) catch break;
+        while (true) {
+            var f = readFrameAlloc(testing.allocator, &reader.interface) catch break;
+            const go = f.header.ftype == .goaway;
+            if (go) saw_goaway = std.mem.readInt(u32, f.payload[4..8], .big);
+            const es = f.header.sid == sid and f.header.flags & flag_end_stream != 0 and
+                (f.header.ftype == .data or f.header.ftype == .headers);
+            f.deinit(testing.allocator);
+            if (go or es) break;
+        }
+        if (saw_goaway != null) break;
+        // First RST_STREAM is excused (one-shot); duplicate must still be counted.
+        writeFrame(&writer.interface, .rst_stream, 0, sid, &rst_payload) catch break;
+        writeFrame(&writer.interface, .rst_stream, 0, sid, &rst_payload) catch break;
+    }
+    if (saw_goaway == null) {
+        if (readFrameOfType(testing.allocator, &reader.interface, .goaway)) |ga| {
+            var g = ga;
+            defer g.deinit(testing.allocator);
+            saw_goaway = std.mem.readInt(u32, g.payload[4..8], .big);
+        } else |_| {}
+    }
+    try testing.expectEqual(@as(?u32, @intFromEnum(ErrorCode.enhance_your_calm)), saw_goaway);
 }
