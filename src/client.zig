@@ -810,7 +810,7 @@ pub const Client = struct {
 
     /// Wakes every opener blocked at `MAX_CONCURRENT_STREAMS`. Holding
     /// `admit_mu` across the broadcast closes the lost-wake window against
-    /// `openStream` checking `dead`/`goaway_seen` before waiting.
+    /// `openStream` checking `dead`/`goaway_state` before waiting.
     fn wakeAdmit(self: *Client) void {
         self.admit_mu.lockUncancelable(self.io);
         self.admit_cond.broadcast(self.io);

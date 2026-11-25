@@ -69,3 +69,71 @@ test "Stream re-export names the client stream type" {
     // re-export must be exactly the type openStream hands out.
     if (Stream != client_mod.Stream) @compileError("h2.Stream must be the client stream type");
 }
+
+test "client close() after early server response does not trip rapid-reset limit (#23)" {
+    const std = @import("std");
+    const testing = std.testing;
+    const Helper = struct {
+        fn serve(srv: *Server, fd: std.posix.fd_t) void {
+            defer _ = std.c.close(fd);
+            const s: std.Io.net.Stream = .{ .socket = .{
+                .handle = fd,
+                .address = std.Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable,
+            } };
+            var rbuf: [4096]u8 = undefined;
+            var wbuf: [4096]u8 = undefined;
+            var sr = s.reader(srv.io, &rbuf);
+            var sw = s.writer(srv.io, &wbuf);
+            serveConn(srv, &sr.interface, &sw.interface, null, "https");
+        }
+        fn earlyOk(ctx: *Context) anyerror!void {
+            try ctx.res.send(200, "text/plain", "ok");
+        }
+    };
+
+    var fds: [2]c_int = undefined;
+    if (std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds) != 0) return error.SocketPairFailed;
+    errdefer _ = std.c.close(fds[1]);
+
+    var srv: Server = .{
+        .io = testing.io,
+        .gpa = testing.allocator,
+        .handler = Helper.earlyOk,
+        .config = .{ .idle_timeout_ms = 10_000 },
+    };
+    const th = try std.Thread.spawn(.{}, Helper.serve, .{ &srv, fds[0] });
+    defer th.join();
+    defer _ = std.c.close(fds[1]);
+
+    const peer: std.Io.net.Stream = .{ .socket = .{
+        .handle = fds[1],
+        .address = std.Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable,
+    } };
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [4096]u8 = undefined;
+    var sr = peer.reader(testing.io, &rbuf);
+    var sw = peer.writer(testing.io, &wbuf);
+
+    var client: Client = undefined;
+    try client.init(testing.io, testing.allocator, &sr.interface, &sw.interface);
+    defer client.deinit();
+
+    // 200 sequential streams where client never half-closes (end_stream=false),
+    // server responds early without reading body, and client closes each stream
+    // (emitting RST_STREAM(CANCEL)). Must complete 200/200 without ENHANCE_YOUR_CALM.
+    for (0..200) |_| {
+        const s = try client.openStream(.{ .path = "/early" }, false);
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        while (true) {
+            const ev = s.readEvent(arena_state.allocator()) catch |err| switch (err) {
+                error.EndOfStream => break,
+                else => return err,
+            };
+            try testing.expect(ev != .rst and ev != .goaway);
+        }
+        s.close();
+    }
+    try testing.expect(client.goAway() == null);
+    try testing.expect(!client.dead.load(.acquire));
+}

@@ -203,6 +203,10 @@ const H2Stream = struct {
     /// Flow-control window for DATA we send, guarded by `conn.send_mu`.
     send_window: i64,
     reset: std.atomic.Value(bool) = .init(false),
+    /// True once the server has emitted the response's final END_STREAM. Used
+    /// to distinguish normal client RST_STREAM cleanup after an early response
+    /// (client send half still open) from a rapid-reset flood.
+    response_finished: std.atomic.Value(bool) = .init(false),
     /// Whether the request has a body (no END_STREAM on HEADERS). Set on the
     /// reader thread before the worker is spawned; read once by the worker.
     has_body: bool = false,
@@ -469,6 +473,7 @@ const H2Sink = struct {
         } else {
             try self.stream.endStream();
         }
+        self.stream.response_finished.store(true, .release);
     }
 };
 
@@ -517,6 +522,12 @@ const Connection = struct {
     // Rapid-reset accounting (CVE-2023-44487), guarded by streams_mu.
     streams_opened: u32 = 0,
     streams_reset: u32 = 0,
+    // One-shot ring of stream IDs whose response completed cleanly (END_STREAM
+    // sent) while the client's send half was still open (!rx_eof). A single
+    // trailing RST_STREAM from the client closing that half-closed stream is
+    // normal HTTP/2 cleanup rather than a rapid-reset attack. Guarded by streams_mu.
+    early_closed: [256]u31 = @splat(0),
+    early_closed_pos: usize = 0,
 
     // Worker accounting (for graceful drain).
     workers_mu: Io.Mutex = .init,
@@ -1158,20 +1169,38 @@ fn resetStream(conn: *Connection, sid: u31) bool {
         sendGoaway(conn, .protocol_error);
         return false;
     }
+    var excused = false;
     conn.streams_mu.lockUncancelable(conn.io);
     if (conn.streams.get(sid)) |st| {
-        st.reset.store(true, .release);
+        const prev_reset = st.reset.swap(true, .acq_rel);
         // Wake a streaming worker blocked reading request DATA.
         st.rx_mu.lockUncancelable(conn.io);
+        if (!prev_reset and st.response_finished.load(.acquire) and !st.rx_eof) {
+            excused = true;
+        }
         st.rx_cond.broadcast(conn.io);
         st.rx_mu.unlock(conn.io);
+    } else {
+        // Consume one-shot exemption for a stream whose response already
+        // finished early while the client's request half remained open.
+        for (&conn.early_closed) |*slot| {
+            if (slot.* == sid) {
+                slot.* = 0;
+                excused = true;
+                break;
+            }
+        }
     }
-    // Count every peer reset, even one racing the stream's own teardown — a
-    // rapid-reset attacker's RST often lands after the worker already removed
-    // the stream, so gating on `streams.get` would miss the flood entirely.
-    conn.streams_reset +%= 1;
-    const flood = conn.streams_reset > rapid_reset_floor and
-        conn.streams_reset > conn.streams_opened / 2;
+    var flood = false;
+    if (!excused) {
+        // Count every non-excused peer reset, even one racing the stream's own
+        // teardown — a rapid-reset attacker's RST often lands after the worker
+        // already removed the stream, so gating on `streams.get` would miss
+        // the flood entirely.
+        conn.streams_reset +%= 1;
+        flood = conn.streams_reset > rapid_reset_floor and
+            conn.streams_reset > conn.streams_opened / 2;
+    }
     conn.streams_mu.unlock(conn.io);
     conn.wakeSenders();
     if (flood) {
@@ -1283,12 +1312,10 @@ fn handleHeaders(conn: *Connection, r: *Io.Reader, fh: ParsedHeader, first: []co
         return error.ProtocolError;
     }
     // An odd id at or below the highest we've opened but not currently open is a
-    // closed or non-monotonic stream: RFC 9113 §5.1 / §5.1.1 require a connection
-    // error (GOAWAY), not a stream reset.
-    if (fh.sid <= conn.last_stream_id) {
-        sendGoaway(conn, .stream_closed);
-        return error.ProtocolError;
-    }
+    // closed stream (e.g. in-flight trailers arriving after an early response):
+    // RFC 9113 §5.1 requires minimal processing (updating HPACK) and permits
+    // RST_STREAM(STREAM_CLOSED) rather than tearing down the whole connection.
+    if (fh.sid <= conn.last_stream_id) return refuseStream(conn, fh.sid, block.items, .stream_closed);
     conn.last_stream_id = fh.sid;
 
     // Graceful shutdown: stop accepting new streams once the server is stopping
@@ -1609,7 +1636,7 @@ fn runStream(st: *H2Stream) void {
             // would be a use-after-free. Equivalent to the old `thread.join()`.
             st.watchdog_done.waitUncancelable(conn.io);
         }
-        removeStream(conn, st.id);
+        removeCompletedStream(conn, st);
         // Return connection-level credit for body bytes the handler never
         // consumed (e.g. it returned without draining the request body).
         // After removeStream the stream is unreachable by the reader thread,
@@ -1676,6 +1703,18 @@ fn runStream(st: *H2Stream) void {
             rstStreamCode(conn, st.id, .internal_error);
         }
     };
+}
+
+fn removeCompletedStream(conn: *Connection, st: *H2Stream) void {
+    conn.streams_mu.lockUncancelable(conn.io);
+    _ = conn.streams.remove(st.id);
+    // After streams.remove, the reader can no longer deliver DATA/trailers to
+    // `st`, so `rx_eof` is stable here.
+    if (st.response_finished.load(.acquire) and !st.reset.load(.acquire) and !st.rx_eof) {
+        conn.early_closed[conn.early_closed_pos] = st.id;
+        conn.early_closed_pos = (conn.early_closed_pos + 1) % conn.early_closed.len;
+    }
+    conn.streams_mu.unlock(conn.io);
 }
 
 fn removeStream(conn: *Connection, sid: u31) void {
@@ -3502,7 +3541,7 @@ test "h2: trailers containing a pseudo-header reset the stream (protocol_error)"
     try testing.expectEqual(@as(u32, @intFromEnum(ErrorCode.protocol_error)), std.mem.readInt(u32, rst.payload[0..4], .big));
 }
 
-test "h2: HEADERS on a closed stream is GOAWAY(STREAM_CLOSED) (RFC 9113 §5.1, #23)" {
+test "h2: HEADERS on a closed stream is RST(STREAM_CLOSED), not GOAWAY" {
     const fds = try newSocketPair();
     errdefer _ = c.close(fds[1]);
     var srv: Server = .{ .io = testing.io, .gpa = testing.allocator, .handler = h2TestHandler, .config = .{} };
@@ -3530,11 +3569,26 @@ test "h2: HEADERS on a closed stream is GOAWAY(STREAM_CLOSED) (RFC 9113 §5.1, #
         f.deinit(testing.allocator);
         if (es) break;
     }
-    // A fresh HEADERS on the now-closed stream 1: connection GOAWAY(STREAM_CLOSED).
+    // A fresh HEADERS on the now-closed stream 1: RST(STREAM_CLOSED), connection alive.
     try writeFrame(&writer.interface, .headers, flag_end_headers | flag_end_stream, 1, &trailers_req_block);
-    var goaway = try readFrameOfType(testing.allocator, &reader.interface, .goaway);
-    defer goaway.deinit(testing.allocator);
-    try testing.expectEqual(@as(u32, @intFromEnum(ErrorCode.stream_closed)), std.mem.readInt(u32, goaway.payload[4..8], .big));
+    var rst = try readFrameOfType(testing.allocator, &reader.interface, .rst_stream);
+    defer rst.deinit(testing.allocator);
+    try testing.expectEqual(@as(u31, 1), rst.header.sid);
+    try testing.expectEqual(@as(u32, @intFromEnum(ErrorCode.stream_closed)), std.mem.readInt(u32, rst.payload[0..4], .big));
+
+    // Connection must stay alive for subsequent stream 3.
+    try writeFrame(&writer.interface, .headers, flag_end_headers | flag_end_stream, 3, &trailers_req_block);
+    var ok3 = false;
+    while (true) {
+        var f = try readFrameAlloc(testing.allocator, &reader.interface);
+        const es = f.header.sid == 3 and f.header.flags & flag_end_stream != 0 and (f.header.ftype == .data or f.header.ftype == .headers);
+        f.deinit(testing.allocator);
+        if (es) {
+            ok3 = true;
+            break;
+        }
+    }
+    try testing.expect(ok3);
 }
 
 /// Responds with the value of `x-marker`, or "MISSING" — a probe for whether a
@@ -4667,4 +4721,63 @@ test "h2: idle RST_STREAM, WINDOW_UPDATE, even DATA, bad ENABLE_PUSH, non-SETTIN
         defer ga.deinit(testing.allocator);
         try testing.expectEqual(@as(u32, @intFromEnum(ErrorCode.enhance_your_calm)), std.mem.readInt(u32, ga.payload[4..8], .big));
     }
+}
+
+fn earlyRespondHandler(ctx: *types.Context) anyerror!void {
+    try ctx.res.send(200, "text/plain", "early");
+}
+
+test "h2: in-flight DATA and trailers after early response keep connection alive and HPACK in sync (#23)" {
+    const fds = try newSocketPair();
+    errdefer _ = c.close(fds[1]);
+    var srv: Server = .{
+        .io = testing.io,
+        .gpa = testing.allocator,
+        .handler = earlyRespondHandler,
+        .config = .{ .idle_timeout_ms = 5_000 },
+    };
+    const t = try std.Thread.spawn(.{}, serveRawH2OnFd, .{ &srv, fds[0] });
+    defer t.join();
+    defer _ = c.close(fds[1]);
+
+    var rbuf: [8192]u8 = undefined;
+    var wbuf: [8192]u8 = undefined;
+    var reader = peerStream(fds[1]).reader(testing.io, &rbuf);
+    var writer = peerStream(fds[1]).writer(testing.io, &wbuf);
+    try rawHandshake(&reader.interface, &writer.interface);
+
+    // Stream 1: request with body (no END_STREAM); server replies immediately without reading body.
+    try writeFrame(&writer.interface, .headers, flag_end_headers, 1, &trailers_req_block);
+    while (true) {
+        var f = try readFrameAlloc(testing.allocator, &reader.interface);
+        const es = f.header.sid == 1 and f.header.flags & flag_end_stream != 0 and (f.header.ftype == .data or f.header.ftype == .headers);
+        f.deinit(testing.allocator);
+        if (es) break;
+    }
+
+    // Wait briefly so worker removes stream 1, then send in-flight DATA + trailers (with incremental indexing).
+    Io.sleep(testing.io, .{ .nanoseconds = 20 * std.time.ns_per_ms }, .awake) catch {};
+    try writeFrame(&writer.interface, .data, 0, 1, "in-flight-body");
+    // Literal with incremental indexing: "x-trailer": "v" -> becomes dynamic index 62,
+    // shifting stream 1's ":authority: www.example.com" to dynamic index 63.
+    const trailer_block = [_]u8{ 0x40, 9, 'x', '-', 't', 'r', 'a', 'i', 'l', 'e', 'r', 1, 'v' };
+    try writeFrame(&writer.interface, .headers, flag_end_headers | flag_end_stream, 1, &trailer_block);
+
+    // Subsequent stream 3 uses dynamic index 63 (:authority) and 62 (x-trailer).
+    // If the trailer block was NOT HPACK-decoded, index 63 would be out-of-range
+    // (COMPRESSION_ERROR); if closed-stream HEADERS GOAWAY'd, stream 3 would fail.
+    const req3 = [_]u8{ 0x82, 0x86, 0x84, 0x80 | 63, 0x80 | 62 };
+    try writeFrame(&writer.interface, .headers, flag_end_headers | flag_end_stream, 3, &req3);
+
+    var ok3 = false;
+    for (0..30) |_| {
+        var f = try readFrameAlloc(testing.allocator, &reader.interface);
+        defer f.deinit(testing.allocator);
+        try testing.expect(f.header.ftype != .goaway);
+        if (f.header.sid == 3 and f.header.flags & flag_end_stream != 0 and (f.header.ftype == .data or f.header.ftype == .headers)) {
+            ok3 = true;
+            break;
+        }
+    }
+    try testing.expect(ok3);
 }
