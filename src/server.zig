@@ -522,10 +522,12 @@ const Connection = struct {
     // Rapid-reset accounting (CVE-2023-44487), guarded by streams_mu.
     streams_opened: u32 = 0,
     streams_reset: u32 = 0,
-    // One-shot ring of stream IDs whose response completed cleanly (END_STREAM
-    // sent) while the client's send half was still open (!rx_eof). A single
-    // trailing RST_STREAM from the client closing that half-closed stream is
-    // normal HTTP/2 cleanup rather than a rapid-reset attack. Guarded by streams_mu.
+    // One-shot fixed-size ring (256 slots, 2x the default max_concurrent_streams)
+    // of stream IDs whose response completed cleanly (END_STREAM sent) while the
+    // client's send half was still open (!rx_eof). A single trailing RST_STREAM
+    // from the client closing that half-closed stream is normal HTTP/2 cleanup
+    // rather than a rapid-reset attack. Entries evicted past the 256-stream
+    // backlog fall back to normal reset counting. Guarded by streams_mu.
     early_closed: [256]u31 = @splat(0),
     early_closed_pos: usize = 0,
 
@@ -1057,23 +1059,34 @@ fn handleData(conn: *Connection, fh: ParsedHeader, payload: []const u8) bool {
     // streams_mu -> rx_mu.
     conn.streams_mu.lockUncancelable(conn.io);
     const s = conn.streams.get(fh.sid) orelse {
+        var half_closed_local = false;
+        for (&conn.early_closed) |*slot| {
+            if (slot.* == fh.sid) {
+                half_closed_local = true;
+                if (end_stream) slot.* = 0; // peer now closed its send half too
+                break;
+            }
+        }
         conn.streams_mu.unlock(conn.io);
-        // DATA on an id we never opened: idle (above the highest id seen, so
-        // never even refused) is a connection PROTOCOL_ERROR; closed (at or
-        // below it) is a stream error — RST STREAM_CLOSED, keeping the
-        // connection (RFC 9113 §5.1/§6.1). Silently dropping the frame let a
-        // peer stream DATA on idle ids forever.
+        // DATA on an id we never opened: idle (even push id or above the highest
+        // id seen) is a connection PROTOCOL_ERROR; closed (at or below it) is a
+        // stream error — RST STREAM_CLOSED, keeping the connection (RFC 9113
+        // §5.1/§6.1). Silently dropping the frame let a peer stream DATA on idle
+        // ids forever.
         if (fh.sid % 2 == 0 or fh.sid > conn.last_stream_id) {
             sendGoaway(conn, .protocol_error);
             return false;
         }
         // The frame still consumed connection-level window even though no
-        // stream will ever read it — return the credit, then reset.
+        // stream will ever read it — return the credit.
         if (payload.len > 0) {
             const d = creditConn(conn, @intCast(payload.len));
             if (d > 0) sendWindowUpdate(conn, 0, d);
         }
-        rstStreamCode(conn, fh.sid, .stream_closed);
+        // If we responded early without reading the request body, the stream is
+        // still half-closed (local) from the client's perspective, so in-flight
+        // DATA is valid and silently discarded instead of reset (RFC 9113 §5.1).
+        if (!half_closed_local) rstStreamCode(conn, fh.sid, .stream_closed);
         return true;
     };
     s.rx_mu.lockUncancelable(conn.io);
@@ -1313,8 +1326,9 @@ fn handleHeaders(conn: *Connection, r: *Io.Reader, fh: ParsedHeader, first: []co
     }
     // An odd id at or below the highest we've opened but not currently open is a
     // closed stream (e.g. in-flight trailers arriving after an early response):
-    // RFC 9113 §5.1 requires minimal processing (updating HPACK) and permits
-    // RST_STREAM(STREAM_CLOSED) rather than tearing down the whole connection.
+    // RFC 9113 §5.1 requires minimally processing the header block to keep HPACK
+    // in sync without tearing down the connection; we decode and discard via
+    // `refuseStream` (sending RST_STREAM(STREAM_CLOSED)).
     if (fh.sid <= conn.last_stream_id) return refuseStream(conn, fh.sid, block.items, .stream_closed);
     conn.last_stream_id = fh.sid;
 
@@ -4780,4 +4794,54 @@ test "h2: in-flight DATA and trailers after early response keep connection alive
         }
     }
     try testing.expect(ok3);
+}
+
+test "h2: duplicate RST_STREAM on early-answered streams is one-shot and still trips ENHANCE_YOUR_CALM (#23)" {
+    const fds = try newSocketPair();
+    errdefer _ = c.close(fds[1]);
+    var srv: Server = .{
+        .io = testing.io,
+        .gpa = testing.allocator,
+        .handler = earlyRespondHandler,
+        .config = .{ .idle_timeout_ms = 5_000 },
+    };
+    const t = try std.Thread.spawn(.{}, serveRawH2OnFd, .{ &srv, fds[0] });
+    defer t.join();
+    defer _ = c.close(fds[1]);
+
+    var rbuf: [8192]u8 = undefined;
+    var wbuf: [8192]u8 = undefined;
+    var reader = peerStream(fds[1]).reader(testing.io, &rbuf);
+    var writer = peerStream(fds[1]).writer(testing.io, &wbuf);
+    try rawHandshake(&reader.interface, &writer.interface);
+
+    var rst_payload: [4]u8 = undefined;
+    std.mem.writeInt(u32, &rst_payload, @intFromEnum(ErrorCode.cancel), .big);
+
+    var saw_goaway: ?u32 = null;
+    for (1..121) |i| {
+        const sid: u31 = @intCast(2 * i - 1);
+        writeFrame(&writer.interface, .headers, flag_end_headers, sid, &trailers_req_block) catch break;
+        while (true) {
+            var f = readFrameAlloc(testing.allocator, &reader.interface) catch break;
+            const go = f.header.ftype == .goaway;
+            if (go) saw_goaway = std.mem.readInt(u32, f.payload[4..8], .big);
+            const es = f.header.sid == sid and f.header.flags & flag_end_stream != 0 and
+                (f.header.ftype == .data or f.header.ftype == .headers);
+            f.deinit(testing.allocator);
+            if (go or es) break;
+        }
+        if (saw_goaway != null) break;
+        // First RST_STREAM is excused (one-shot); duplicate must still be counted.
+        writeFrame(&writer.interface, .rst_stream, 0, sid, &rst_payload) catch break;
+        writeFrame(&writer.interface, .rst_stream, 0, sid, &rst_payload) catch break;
+    }
+    if (saw_goaway == null) {
+        if (readFrameOfType(testing.allocator, &reader.interface, .goaway)) |ga| {
+            var g = ga;
+            defer g.deinit(testing.allocator);
+            saw_goaway = std.mem.readInt(u32, g.payload[4..8], .big);
+        } else |_| {}
+    }
+    try testing.expectEqual(@as(?u32, @intFromEnum(ErrorCode.enhance_your_calm)), saw_goaway);
 }
