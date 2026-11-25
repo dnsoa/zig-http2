@@ -502,6 +502,9 @@ const Connection = struct {
     conn_recv_window: i64 = 65535,
     conn_recv_pending: i64 = 0,
 
+    /// Set on graceful shutdown (peer GOAWAY(NO_ERROR) or Server.stop). Reader-
+    /// thread-only: new streams are refused while in-flight workers finish.
+    draining: bool = false,
     closing: std.atomic.Value(bool) = .init(false),
 
     fn deinit(self: *Connection) void {
@@ -566,13 +569,22 @@ const Connection = struct {
         self.streams_mu.unlock(self.io);
     }
 
-    fn drainWorkers(self: *Connection) void {
-        self.closing.store(true, .release);
-        self.wakeSenders(); // release any window-blocked workers
-        self.wakeReceivers(); // release any rx-blocked streaming workers
+    /// Waits for all in-flight workers/watchdogs to exit. On real teardown
+    /// (`graceful == false`: EOF, read error, idle timeout, fatal GOAWAY/error),
+    /// flips `closing` immediately so blocked workers abort; on graceful
+    /// shutdown (`graceful == true`: peer GOAWAY(NO_ERROR) or Server.stop),
+    /// leaves `closing` clear until `active_workers` reaches 0 so in-flight
+    /// handlers can finish reading buffered bodies and writing responses.
+    fn drainWorkers(self: *Connection, graceful: bool) void {
+        if (!graceful) {
+            self.closing.store(true, .release);
+            self.wakeSenders(); // release any window-blocked workers
+            self.wakeReceivers(); // release any rx-blocked streaming workers
+        }
         self.workers_mu.lockUncancelable(self.io);
         while (self.active_workers > 0) self.workers_cond.waitUncancelable(self.io, &self.workers_mu);
         self.workers_mu.unlock(self.io);
+        self.closing.store(true, .release);
         // All tasks have exited (counter hit 0); await releases the group's own resources and returns immediately.
         self.worker_group.await(self.io) catch {};
     }
@@ -587,6 +599,81 @@ fn readSliceThunk(r: *Io.Reader, buf: []u8) anyerror!void {
 fn readSliceTimed(conn: *Connection, r: *Io.Reader, buf: []u8, ms: u64) !void {
     if (r.bufferedLen() >= buf.len) return r.readSliceAll(buf);
     return runTimed(conn.io, ms, readSliceThunk, .{ r, buf });
+}
+
+const DrainOp = union(enum) { work: anyerror!void, drained: bool, timer: void };
+
+fn waitWorkersDrained(conn: *Connection) bool {
+    conn.workers_mu.lockUncancelable(conn.io);
+    defer conn.workers_mu.unlock(conn.io);
+    while (conn.active_workers > 0) {
+        conn.workers_cond.wait(conn.io, &conn.workers_mu) catch return false;
+    }
+    return true;
+}
+
+/// While draining, reads the next frame header so in-flight streams can still
+/// receive DATA/trailers/WINDOW_UPDATE/RST_STREAM, while exiting promptly the
+/// moment `active_workers` reaches 0. Returns `true` when `hb` holds a frame
+/// header, `false` when all workers have drained (or concurrency is unavailable
+/// and the caller should fall through to `drainWorkers(true)`), or an error on
+/// EOF / read error / idle timeout.
+fn readDrainHeader(conn: *Connection, r: *Io.Reader, hb: *[9]u8) !bool {
+    conn.workers_mu.lockUncancelable(conn.io);
+    const done_now = conn.active_workers == 0;
+    conn.workers_mu.unlock(conn.io);
+    if (done_now) return false;
+
+    if (r.bufferedLen() >= hb.len) {
+        try r.readSliceAll(hb);
+        return true;
+    }
+
+    var buf: [3]DrainOp = undefined;
+    var sel = Io.Select(DrainOp).init(conn.io, &buf);
+    sel.concurrent(.work, readSliceThunk, .{ r, hb }) catch return false;
+    sel.concurrent(.drained, waitWorkersDrained, .{conn}) catch {
+        while (sel.cancel()) |_| {}
+        return false;
+    };
+    const ms = conn.srv.config.idle_timeout_ms;
+    if (ms > 0) {
+        sel.concurrent(.timer, timerThunk, .{ conn.io, ms }) catch {
+            while (sel.cancel()) |_| {}
+            return false;
+        };
+    }
+    const first = try sel.await();
+    var work_ok = switch (first) {
+        .work => |res| if (res) |_| true else |_| false,
+        else => false,
+    };
+    var work_err: ?anyerror = switch (first) {
+        .work => |res| if (res) |_| null else |e| e,
+        else => null,
+    };
+    var drained = switch (first) {
+        .drained => |d| d,
+        else => false,
+    };
+    while (sel.cancel()) |leftover| switch (leftover) {
+        .work => |res| if (res) |_| {
+            work_ok = true;
+        } else |e| {
+            if (work_err == null) work_err = e;
+        },
+        .drained => |d| if (d) {
+            drained = true;
+        },
+        .timer => {},
+    };
+    if (drained) return false;
+    if (work_ok) return true;
+    return switch (first) {
+        .timer => error.Timeout,
+        .work => work_err.?,
+        .drained => false,
+    };
 }
 
 /// Entry point: drive an HTTP/2 connection over `r`/`w` (any duplex transport).
@@ -616,41 +703,62 @@ pub fn serveConn(srv: *Server, r: *Io.Reader, w: *Io.Writer, client_ip: ?[]const
         conn.conn_recv_window = cwnd;
         if (cwnd > 65535) sendWindowUpdate(&conn, 0, cwnd - 65535);
     }
-    readLoop(&conn, r);
-    conn.drainWorkers();
+    const graceful = readLoop(&conn, r);
+    conn.drainWorkers(graceful);
 }
 
-fn readLoop(conn: *Connection, r: *Io.Reader) void {
+/// Returns true on graceful shutdown (peer GOAWAY(NO_ERROR) or Server.stop)
+/// so in-flight workers finish cleanly; returns false on teardown (EOF, read
+/// error, idle timeout, fatal protocol error, or non-NO_ERROR GOAWAY).
+fn readLoop(conn: *Connection, r: *Io.Reader) bool {
     const gpa = conn.gpa;
-    while (!conn.srv.stop.load(.acquire)) {
+    var goaway_sent = false;
+    while (true) {
+        if (!goaway_sent and conn.srv.stop.load(.acquire)) {
+            conn.draining = true;
+            sendGoaway(conn, .no_error);
+            goaway_sent = true;
+        }
         // Idle deadline on the next frame header; a shorter deadline on the
         // payload it announces (a header without its payload is a slowloris).
         var hb: [9]u8 = undefined;
-        readSliceTimed(conn, r, &hb, conn.srv.config.idle_timeout_ms) catch return; // EOF / error / idle -> done
+        if (conn.draining) {
+            const has_frame = readDrainHeader(conn, r, &hb) catch return false;
+            if (!has_frame) return true;
+        } else {
+            readSliceTimed(conn, r, &hb, conn.srv.config.idle_timeout_ms) catch return false; // EOF / error / idle -> done
+        }
         const fh = parseHeader(&hb);
         if (fh.length > effectiveMaxFrameSize(conn.srv.config)) {
             sendGoaway(conn, .frame_size_error);
-            return;
+            return false;
         }
-        const payload = gpa.alloc(u8, fh.length) catch return;
+        const payload = gpa.alloc(u8, fh.length) catch return false;
         defer gpa.free(payload);
-        readSliceTimed(conn, r, payload, conn.srv.config.head_timeout_ms) catch return;
+        readSliceTimed(conn, r, payload, conn.srv.config.head_timeout_ms) catch return false;
 
         if (validateInboundFrame(fh, payload)) |code| {
             sendGoaway(conn, code);
-            return;
+            return false;
         }
 
         switch (fh.ftype) {
-            .settings => if (!handleSettings(conn, fh, payload)) return,
-            .window_update => if (!handleWindowUpdate(conn, fh, payload)) return,
+            .settings => if (!handleSettings(conn, fh, payload)) return false,
+            .window_update => if (!handleWindowUpdate(conn, fh, payload)) return false,
             .ping => {
-                if (fh.flags & flag_ack == 0) conn.cw.frame(.ping, flag_ack, 0, payload) catch return;
+                if (fh.flags & flag_ack == 0) conn.cw.frame(.ping, flag_ack, 0, payload) catch return false;
             },
-            .headers => handleHeaders(conn, r, fh, payload) catch return,
-            .data => if (!handleData(conn, fh, payload)) return,
-            .rst_stream => if (!resetStream(conn, fh.sid)) return,
-            .goaway => return, // peer is leaving; stop reading, drain workers
+            .headers => handleHeaders(conn, r, fh, payload) catch return false,
+            .data => if (!handleData(conn, fh, payload)) return false,
+            .rst_stream => if (!resetStream(conn, fh.sid)) return false,
+            .goaway => {
+                // RFC 7540 §6.8: GOAWAY(NO_ERROR) is graceful — stop accepting
+                // new streams and let in-flight streams finish. Any non-zero
+                // error code tears down immediately.
+                const code = std.mem.readInt(u32, payload[4..8], .big);
+                if (code != @intFromEnum(ErrorCode.no_error)) return false;
+                conn.draining = true;
+            },
             .priority => {}, // no-op: we do not implement prioritization
             .continuation => {
                 // handleHeaders consumes an in-sequence CONTINUATION inline, so
@@ -658,7 +766,7 @@ fn readLoop(conn: *Connection, r: *Io.Reader) void {
                 // PROTOCOL_ERROR (RFC 9113 §6.10). Ignoring it also dropped a
                 // header-block fragment on the floor, desyncing HPACK.
                 sendGoaway(conn, .protocol_error);
-                return;
+                return false;
             },
             .push_promise => {
                 // A client cannot push (RFC 9113 §6.6) and we advertised
@@ -667,12 +775,11 @@ fn readLoop(conn: *Connection, r: *Io.Reader) void {
                 // would leave our HPACK table one block behind the peer's for
                 // the rest of the connection.
                 sendGoaway(conn, .protocol_error);
-                return;
+                return false;
             },
             else => {},
         }
     }
-    sendGoaway(conn, .no_error);
 }
 
 /// Returns a connection-error code when `fh`/`payload` violate framing rules
@@ -1044,10 +1151,10 @@ fn handleHeaders(conn: *Connection, r: *Io.Reader, fh: ParsedHeader, first: []co
     if (fh.sid <= conn.last_stream_id) return refuseStream(conn, fh.sid, block.items, .stream_closed);
     conn.last_stream_id = fh.sid;
 
-    // Graceful shutdown: stop accepting new streams once the server is stopping.
-    // Refuse this one; in-flight streams keep draining and readLoop sends the
-    // connection GOAWAY when it exits.
-    if (conn.srv.stop.load(.acquire)) return refuseStream(conn, fh.sid, block.items, .refused_stream);
+    // Graceful shutdown: stop accepting new streams once the server is stopping
+    // or the peer sent a graceful GOAWAY. Refuse this one while in-flight
+    // streams keep draining.
+    if (conn.srv.stop.load(.acquire) or conn.draining) return refuseStream(conn, fh.sid, block.items, .refused_stream);
 
     // Concurrency cap.
     conn.streams_mu.lockUncancelable(conn.io);
@@ -3689,4 +3796,211 @@ test "h2: handler catching DeadlineExceeded can still finish with trailers (#16)
     }
     try testing.expect(saw_end_headers);
     try testing.expect(!saw_rst);
+}
+
+fn goawayWaitReadHandler(ctx: *types.Context) anyerror!void {
+    Io.sleep(ctx.io, .{ .nanoseconds = 150 * std.time.ns_per_ms }, .awake) catch {};
+    var buf: [64]u8 = undefined;
+    var total: usize = 0;
+    while (total < buf.len) {
+        const n = try ctx.body_reader.?.read(buf[total..]);
+        if (n == 0) break;
+        total += n;
+    }
+    try ctx.res.send(200, "text/plain", buf[0..total]);
+}
+
+fn goawayWaitWriteHandler(ctx: *types.Context) anyerror!void {
+    Io.sleep(ctx.io, .{ .nanoseconds = 150 * std.time.ns_per_ms }, .awake) catch {};
+    try ctx.res.send(200, "text/plain", "pong");
+}
+
+fn runGracefulGoawayCase(comptime with_body: bool) !void {
+    const fds = try newSocketPair();
+    var srv: Server = .{
+        .io = testing.io,
+        .gpa = testing.allocator,
+        .handler = if (with_body) goawayWaitReadHandler else goawayWaitWriteHandler,
+        .config = .{},
+    };
+    const t = try std.Thread.spawn(.{}, serveRawH2OnFd, .{ &srv, fds[0] });
+    defer t.join();
+    defer _ = c.close(fds[1]);
+
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [4096]u8 = undefined;
+    var reader = peerStream(fds[1]).reader(testing.io, &rbuf);
+    var writer = peerStream(fds[1]).writer(testing.io, &wbuf);
+    try rawHandshake(&reader.interface, &writer.interface);
+
+    if (with_body) {
+        try writeFrame(&writer.interface, .headers, flag_end_headers, 1, &trailers_req_block);
+        try writeFrame(&writer.interface, .data, flag_end_stream, 1, "hello");
+    } else {
+        try writeFrame(&writer.interface, .headers, flag_end_headers | flag_end_stream, 1, &trailers_req_block);
+    }
+    var goaway: [8]u8 = @splat(0);
+    std.mem.writeInt(u32, goaway[0..4], 1, .big); // NO_ERROR
+    try writeFrame(&writer.interface, .goaway, 0, 0, &goaway);
+
+    var body: [64]u8 = undefined;
+    var body_len: usize = 0;
+    var ended = false;
+    for (0..30) |_| {
+        const maybe = nextFrameWithin(testing.allocator, &reader.interface, fds[1], 100) catch break;
+        var f = maybe orelse continue;
+        defer f.deinit(testing.allocator);
+        if (f.header.ftype != .data or f.header.sid != 1) continue;
+        @memcpy(body[body_len..][0..f.payload.len], f.payload);
+        body_len += f.payload.len;
+        if (f.header.flags & flag_end_stream != 0) {
+            ended = true;
+            break;
+        }
+    }
+    try testing.expect(ended);
+    try testing.expectEqualStrings(if (with_body) "hello" else "pong", body[0..body_len]);
+}
+
+test "h2: peer graceful GOAWAY drains in-flight stream with buffered body (#17)" {
+    try runGracefulGoawayCase(true);
+}
+
+test "h2: peer graceful GOAWAY drains in-flight bodyless stream (#17)" {
+    try runGracefulGoawayCase(false);
+}
+
+var stop_case_started = std.atomic.Value(bool).init(false);
+
+fn stopDrainHandler(ctx: *types.Context) anyerror!void {
+    stop_case_started.store(true, .release);
+    Io.sleep(ctx.io, .{ .nanoseconds = 150 * std.time.ns_per_ms }, .awake) catch {};
+    try ctx.res.send(200, "text/plain", "pong");
+}
+
+test "h2: Server.stop drains in-flight stream instead of aborting it (#17)" {
+    stop_case_started.store(false, .release);
+    const fds = try newSocketPair();
+    var srv: Server = .{ .io = testing.io, .gpa = testing.allocator, .handler = stopDrainHandler, .config = .{} };
+    const t = try std.Thread.spawn(.{}, serveRawH2OnFd, .{ &srv, fds[0] });
+    defer t.join();
+    defer _ = c.close(fds[1]);
+
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [4096]u8 = undefined;
+    var reader = peerStream(fds[1]).reader(testing.io, &rbuf);
+    var writer = peerStream(fds[1]).writer(testing.io, &wbuf);
+    try rawHandshake(&reader.interface, &writer.interface);
+    try writeFrame(&writer.interface, .headers, flag_end_headers | flag_end_stream, 1, &trailers_req_block);
+
+    var spins: u32 = 0;
+    while (!stop_case_started.load(.acquire) and spins < 2000) : (spins += 1) {
+        Io.sleep(testing.io, .{ .nanoseconds = std.time.ns_per_ms }, .awake) catch {};
+    }
+    try testing.expect(stop_case_started.load(.acquire));
+    srv.stop.store(true, .release);
+    try writeFrame(&writer.interface, .ping, 0, 0, &@as([8]u8, @splat(0)));
+
+    var body: [64]u8 = undefined;
+    var body_len: usize = 0;
+    var ended = false;
+    var saw_goaway = false;
+    for (0..30) |_| {
+        const maybe = nextFrameWithin(testing.allocator, &reader.interface, fds[1], 100) catch break;
+        var f = maybe orelse continue;
+        defer f.deinit(testing.allocator);
+        if (f.header.ftype == .goaway) {
+            try testing.expectEqual(@as(u32, @intFromEnum(ErrorCode.no_error)), std.mem.readInt(u32, f.payload[4..8], .big));
+            saw_goaway = true;
+        }
+        if (f.header.ftype == .data and f.header.sid == 1) {
+            @memcpy(body[body_len..][0..f.payload.len], f.payload);
+            body_len += f.payload.len;
+            if (f.header.flags & flag_end_stream != 0) ended = true;
+        }
+        if (ended and saw_goaway) break;
+    }
+    try testing.expect(saw_goaway);
+    try testing.expect(ended);
+    try testing.expectEqualStrings("pong", body[0..body_len]);
+}
+
+test "h2: graceful GOAWAY delivers remaining body DATA and refuses new streams (#17)" {
+    const fds = try newSocketPair();
+    var srv: Server = .{ .io = testing.io, .gpa = testing.allocator, .handler = h2EchoHandler, .config = .{} };
+    const t = try std.Thread.spawn(.{}, serveRawH2OnFd, .{ &srv, fds[0] });
+    defer t.join();
+    defer _ = c.close(fds[1]);
+
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [4096]u8 = undefined;
+    var reader = peerStream(fds[1]).reader(testing.io, &rbuf);
+    var writer = peerStream(fds[1]).writer(testing.io, &wbuf);
+    try rawHandshake(&reader.interface, &writer.interface);
+
+    // Open stream 1 without END_STREAM, then send graceful GOAWAY(NO_ERROR).
+    try writeFrame(&writer.interface, .headers, flag_end_headers, 1, &trailers_req_block);
+    var goaway: [8]u8 = @splat(0);
+    try writeFrame(&writer.interface, .goaway, 0, 0, &goaway);
+    // A new stream opened while draining must be refused.
+    try writeFrame(&writer.interface, .headers, flag_end_headers | flag_end_stream, 3, &trailers_req_block);
+    // Stream 1's remaining body arrives after GOAWAY and must still complete.
+    try writeFrame(&writer.interface, .data, flag_end_stream, 1, "late-body");
+
+    var body: [64]u8 = undefined;
+    var body_len: usize = 0;
+    var ended = false;
+    var refused_sid3 = false;
+    for (0..30) |_| {
+        const maybe = nextFrameWithin(testing.allocator, &reader.interface, fds[1], 100) catch break;
+        var f = maybe orelse continue;
+        defer f.deinit(testing.allocator);
+        if (f.header.ftype == .rst_stream and f.header.sid == 3) {
+            try testing.expectEqual(@as(u32, @intFromEnum(ErrorCode.refused_stream)), std.mem.readInt(u32, f.payload[0..4], .big));
+            refused_sid3 = true;
+        }
+        if (f.header.ftype == .data and f.header.sid == 1) {
+            @memcpy(body[body_len..][0..f.payload.len], f.payload);
+            body_len += f.payload.len;
+            if (f.header.flags & flag_end_stream != 0) ended = true;
+        }
+        if (ended and refused_sid3) break;
+    }
+    try testing.expect(refused_sid3);
+    try testing.expect(ended);
+    try testing.expectEqualStrings("late-body", body[0..body_len]);
+}
+
+var fatal_goaway_err: ?anyerror = null;
+
+fn fatalGoawayBlockedReadHandler(ctx: *types.Context) anyerror!void {
+    var buf: [64]u8 = undefined;
+    _ = ctx.body_reader.?.read(&buf) catch |err| {
+        fatal_goaway_err = err;
+        return;
+    };
+}
+
+test "h2: fatal peer GOAWAY aborts blocked workers immediately (#17)" {
+    fatal_goaway_err = null;
+    const fds = try newSocketPair();
+    var srv: Server = .{ .io = testing.io, .gpa = testing.allocator, .handler = fatalGoawayBlockedReadHandler, .config = .{} };
+    const t = try std.Thread.spawn(.{}, serveRawH2OnFd, .{ &srv, fds[0] });
+
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [4096]u8 = undefined;
+    var reader = peerStream(fds[1]).reader(testing.io, &rbuf);
+    var writer = peerStream(fds[1]).writer(testing.io, &wbuf);
+    try rawHandshake(&reader.interface, &writer.interface);
+
+    // Stream 1 blocks in body_reader.read() forever unless aborted.
+    try writeFrame(&writer.interface, .headers, flag_end_headers, 1, &trailers_req_block);
+    var goaway: [8]u8 = @splat(0);
+    std.mem.writeInt(u32, goaway[4..8], @intFromEnum(ErrorCode.protocol_error), .big);
+    try writeFrame(&writer.interface, .goaway, 0, 0, &goaway);
+
+    // Server thread must exit promptly even before the peer closes its socket.
+    t.join();
+    _ = c.close(fds[1]);
+    try testing.expectEqual(@as(?anyerror, error.StreamReset), fatal_goaway_err);
 }
