@@ -349,12 +349,13 @@ fn h2SetDeadline(opaque_ctx: *anyopaque, deadline: Io.Timestamp) void {
     st.armDeadline(deadline);
 }
 
-/// Fires the timeout: flips `timed_out`+`reset` and wakes any body/response
-/// I/O blocked on `rx_cond`/`send_cond` (same effect as the old watchdog).
+/// Fires the timeout: flips `timed_out` and wakes any body/response I/O
+/// blocked on `rx_cond`/`send_cond`. Kept distinct from `reset` (which means
+/// the peer or protocol layer already RST the stream) so `runStream` still
+/// closes the stream on the wire when the handler exits unfinished.
 fn fireDeadline(st: *H2Stream) void {
     const conn = st.conn;
     st.timed_out.store(true, .release);
-    st.reset.store(true, .release);
     st.rx_mu.lockUncancelable(conn.io);
     st.rx_cond.broadcast(conn.io);
     st.rx_mu.unlock(conn.io);
@@ -1373,12 +1374,22 @@ fn runStream(st: *H2Stream) void {
         // either case. Skipping the RST when the head is already out leaves the
         // client blocked forever waiting for an END_STREAM that never arrives.
         if (st.reset.load(.acquire) or conn.closing.load(.acquire)) return;
+        if (st.timed_out.load(.acquire)) {
+            if (!res.finished) rstStreamCode(conn, st.id, .cancel);
+            return;
+        }
         log.warn("h2 handler error: {t}", .{err});
-        rstStreamCode(conn, st.id, .internal_error);
+        if (!res.finished) rstStreamCode(conn, st.id, .internal_error);
         return;
     };
-    // Normal completion: ensure the response head + END_STREAM are emitted.
+    // Normal completion: ensure the response head + END_STREAM are emitted, or
+    // RST_STREAM(CANCEL) if the deadline expired without the handler finishing
+    // the response itself (e.g. via gRPC DEADLINE_EXCEEDED trailers).
     if (st.reset.load(.acquire) or conn.closing.load(.acquire)) return;
+    if (st.timed_out.load(.acquire)) {
+        if (!res.finished) rstStreamCode(conn, st.id, .cancel);
+        return;
+    }
     res.finish() catch {};
 }
 
@@ -3575,4 +3586,107 @@ test "buildRequest rejects CTL octets in field names and values" {
         var decoded = base ++ [_]hpack.Header{.{ .name = ":path", .value = "/x\r\nGET / HTTP/1.1" }};
         try testing.expectError(error.BadRequest, buildRequest(arena_state.allocator(), &decoded));
     }
+}
+
+fn nextFrameWithin(a: std.mem.Allocator, r: *Io.Reader, fd: c_int, ms: i32) !?TestFrame {
+    if (r.bufferedLen() == 0) {
+        var pfd = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 }};
+        if ((try std.posix.poll(&pfd, ms)) == 0) return null;
+    }
+    return try readFrameAlloc(a, r);
+}
+
+fn rawHandshake(reader: *Io.Reader, writer: *Io.Writer) !void {
+    try writer.writeAll(preface);
+    try writer.flush();
+    var settings = try readFrameAlloc(testing.allocator, reader);
+    settings.deinit(testing.allocator);
+    try writeFrame(writer, .settings, 0, 0, "");
+    try writeFrame(writer, .settings, flag_ack, 0, "");
+}
+
+fn deadlinePropagateHandler(ctx: *types.Context) anyerror!void {
+    ctx.setDeadlineIn(60 * std.time.ns_per_ms);
+    var tmp: [64]u8 = undefined;
+    _ = try ctx.body_reader.?.read(&tmp);
+}
+
+fn deadlineSwallowHandler(ctx: *types.Context) anyerror!void {
+    ctx.setDeadlineIn(60 * std.time.ns_per_ms);
+    var tmp: [64]u8 = undefined;
+    _ = ctx.body_reader.?.read(&tmp) catch return;
+}
+
+fn deadlineTrailersHandler(ctx: *types.Context) anyerror!void {
+    ctx.setDeadlineIn(60 * std.time.ns_per_ms);
+    var tmp: [64]u8 = undefined;
+    _ = ctx.body_reader.?.read(&tmp) catch |err| {
+        if (err == error.DeadlineExceeded) {
+            ctx.res.status(200);
+            try ctx.res.trailer("grpc-status", "4");
+            try ctx.res.finish();
+            return;
+        }
+        return err;
+    };
+}
+
+test "h2: expired per-RPC deadline closes the stream with RST_STREAM(CANCEL) (#16)" {
+    inline for (.{ deadlinePropagateHandler, deadlineSwallowHandler }) |h| {
+        const fds = try newSocketPair();
+        var srv: Server = .{ .io = testing.io, .gpa = testing.allocator, .handler = h, .config = .{} };
+        const t = try std.Thread.spawn(.{}, serveRawH2OnFd, .{ &srv, fds[0] });
+        defer t.join();
+        defer _ = c.close(fds[1]);
+
+        var rbuf: [4096]u8 = undefined;
+        var wbuf: [4096]u8 = undefined;
+        var reader = peerStream(fds[1]).reader(testing.io, &rbuf);
+        var writer = peerStream(fds[1]).writer(testing.io, &wbuf);
+        try rawHandshake(&reader.interface, &writer.interface);
+        try writeFrame(&writer.interface, .headers, flag_end_headers, 1, &trailers_req_block);
+
+        var rst_code: ?u32 = null;
+        for (0..20) |_| {
+            const maybe = nextFrameWithin(testing.allocator, &reader.interface, fds[1], 100) catch break;
+            var f = maybe orelse continue;
+            defer f.deinit(testing.allocator);
+            if (f.header.sid == 1 and f.header.ftype == .rst_stream) {
+                rst_code = std.mem.readInt(u32, f.payload[0..4], .big);
+                break;
+            }
+        }
+        try testing.expectEqual(@as(?u32, @intFromEnum(ErrorCode.cancel)), rst_code);
+    }
+}
+
+test "h2: handler catching DeadlineExceeded can still finish with trailers (#16)" {
+    const fds = try newSocketPair();
+    var srv: Server = .{ .io = testing.io, .gpa = testing.allocator, .handler = deadlineTrailersHandler, .config = .{} };
+    const t = try std.Thread.spawn(.{}, serveRawH2OnFd, .{ &srv, fds[0] });
+    defer t.join();
+    defer _ = c.close(fds[1]);
+
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [4096]u8 = undefined;
+    var reader = peerStream(fds[1]).reader(testing.io, &rbuf);
+    var writer = peerStream(fds[1]).writer(testing.io, &wbuf);
+    try rawHandshake(&reader.interface, &writer.interface);
+    try writeFrame(&writer.interface, .headers, flag_end_headers, 1, &trailers_req_block);
+
+    var saw_end_headers = false;
+    var saw_rst = false;
+    for (0..20) |_| {
+        const maybe = nextFrameWithin(testing.allocator, &reader.interface, fds[1], 50) catch break;
+        var f = maybe orelse {
+            if (saw_end_headers) break;
+            continue;
+        };
+        defer f.deinit(testing.allocator);
+        if (f.header.sid != 1) continue;
+        if (f.header.ftype == .headers and f.header.flags & flag_end_stream != 0) saw_end_headers = true;
+        if (f.header.ftype == .rst_stream) saw_rst = true;
+    }
+    try testing.expect(saw_end_headers);
+    try testing.expect(!saw_rst);
 }
