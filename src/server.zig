@@ -365,6 +365,8 @@ const H2Stream = struct {
     fn streamRead(ctx: *anyopaque, buf: []u8) anyerror!usize {
         const self: *H2Stream = @ptrCast(@alignCast(ctx));
         const conn = self.conn;
+        var waiting = false;
+        defer if (waiting) conn.notePeerWaitEnd();
         self.rx_mu.lockUncancelable(conn.io);
         while (true) {
             if (self.timed_out.load(.acquire)) {
@@ -387,6 +389,10 @@ const H2Stream = struct {
                 // Credit the stream flow-control window for consumed bytes.
                 const d = self.creditStreamLocked(@intCast(n));
                 self.rx_mu.unlock(conn.io);
+                if (waiting) {
+                    conn.notePeerWaitEnd();
+                    waiting = false;
+                }
                 const dc = creditConn(conn, @intCast(n));
                 if (d > 0) sendWindowUpdate(conn, self.id, d);
                 if (dc > 0) sendWindowUpdate(conn, 0, dc);
@@ -396,8 +402,10 @@ const H2Stream = struct {
                 self.rx_mu.unlock(conn.io);
                 return 0;
             }
-            conn.notePeerWaitBegin();
-            defer conn.notePeerWaitEnd();
+            if (!waiting) {
+                conn.notePeerWaitBegin();
+                waiting = true;
+            }
             self.rx_cond.waitUncancelable(conn.io, &self.rx_mu);
         }
     }
@@ -413,25 +421,31 @@ const H2Stream = struct {
         var off: usize = 0;
         while (off < data.len) {
             conn.send_mu.lockUncancelable(conn.io);
-            const n = blk: while (true) {
-                if (self.timed_out.load(.acquire)) {
-                    conn.send_mu.unlock(conn.io);
-                    return error.DeadlineExceeded;
+            const n = blk: {
+                var waiting = false;
+                defer if (waiting) conn.notePeerWaitEnd();
+                while (true) {
+                    if (self.timed_out.load(.acquire)) {
+                        conn.send_mu.unlock(conn.io);
+                        return error.DeadlineExceeded;
+                    }
+                    if (self.reset.load(.acquire) or conn.closing.load(.acquire)) {
+                        conn.send_mu.unlock(conn.io);
+                        return error.StreamReset;
+                    }
+                    const avail = @min(self.send_window, conn.send_window);
+                    if (avail > 0) {
+                        const want: i64 = @min(@as(i64, @intCast(data.len - off)), @min(avail, @as(i64, conn.peer.max_frame_size.load(.acquire))));
+                        self.send_window -= want;
+                        conn.send_window -= want;
+                        break :blk @as(usize, @intCast(want));
+                    }
+                    if (!waiting) {
+                        conn.notePeerWaitBegin();
+                        waiting = true;
+                    }
+                    conn.send_cond.waitUncancelable(conn.io, &conn.send_mu);
                 }
-                if (self.reset.load(.acquire) or conn.closing.load(.acquire)) {
-                    conn.send_mu.unlock(conn.io);
-                    return error.StreamReset;
-                }
-                const avail = @min(self.send_window, conn.send_window);
-                if (avail > 0) {
-                    const want: i64 = @min(@as(i64, @intCast(data.len - off)), @min(avail, @as(i64, conn.peer.max_frame_size.load(.acquire))));
-                    self.send_window -= want;
-                    conn.send_window -= want;
-                    break :blk @as(usize, @intCast(want));
-                }
-                conn.notePeerWaitBegin();
-                defer conn.notePeerWaitEnd();
-                conn.send_cond.waitUncancelable(conn.io, &conn.send_mu);
             };
             conn.send_mu.unlock(conn.io);
             conn.cw.frameForStream(self, .data, 0, data[off .. off + n]) catch |err| {
@@ -5337,6 +5351,82 @@ test "graceful drain bounds stalled stream even when peer sends continuous PINGs
             };
         }
         try testing.expect(exited_during_pings);
+    }
+}
+
+test "graceful drain bounds sendBody stall even when peer trickles conn WINDOW_UPDATEs" {
+    const BigHandler = struct {
+        fn handle(ctx: *types.Context) anyerror!void {
+            const body = try ctx.arena.alloc(u8, 200 * 1024);
+            @memset(body, 'a');
+            try ctx.res.send(200, "application/octet-stream", body);
+        }
+    };
+    const RunState = struct {
+        var done = std.atomic.Value(bool).init(false);
+        fn serve(srv: *Server, fd: std.posix.fd_t) void {
+            serveRawH2OnFd(srv, fd);
+            done.store(true, .release);
+        }
+    };
+    const configs = [_]Config{
+        .{ .head_timeout_ms = 120, .idle_timeout_ms = 120 },
+        .{ .head_timeout_ms = 30_000, .idle_timeout_ms = 180_000, .drain_timeout_ms = 120 },
+    };
+    for (configs) |cfg| {
+        RunState.done.store(false, .release);
+        const fds = try newSocketPair();
+        errdefer _ = c.close(fds[1]);
+
+        var srv: Server = .{
+            .io = testing.io,
+            .gpa = testing.allocator,
+            .handler = BigHandler.handle,
+            .config = cfg,
+        };
+        const t = try std.Thread.spawn(.{}, RunState.serve, .{ &srv, fds[0] });
+        defer t.join();
+        defer _ = c.close(fds[1]);
+
+        var rbuf: [8192]u8 = undefined;
+        var wbuf: [4096]u8 = undefined;
+        var reader = peerStream(fds[1]).reader(testing.io, &rbuf);
+        var writer = peerStream(fds[1]).writer(testing.io, &wbuf);
+        try rawHandshake(&reader.interface, &writer.interface);
+
+        // Request a 200 KiB response and drain the initial 65535-byte window so
+        // the stream's send_window hits 0 and the worker blocks in sendBody.
+        try writeFrame(&writer.interface, .headers, flag_end_headers | flag_end_stream, 1, &trailers_req_block);
+        var rx_data: usize = 0;
+        while (rx_data < 65535) {
+            var f = try readFrameAlloc(testing.allocator, &reader.interface);
+            defer f.deinit(testing.allocator);
+            if (f.header.ftype == .data and f.header.sid == 1) rx_data += f.payload.len;
+        }
+
+        const peer_ga: [8]u8 = @splat(0);
+        try writeFrame(&writer.interface, .goaway, 0, 0, &peer_ga);
+
+        // Trickle WINDOW_UPDATE(0, 1) on connection stream 0 every 25ms (< 120ms bound)
+        // without crediting stream 1: send_cond wakes each time while avail stays 0,
+        // which must NOT reset peer_wait_since_ns.
+        var wu_one: [4]u8 = undefined;
+        std.mem.writeInt(u32, &wu_one, 1, .big);
+        var exited_during_trickle = false;
+        var waited_ms: u64 = 0;
+        while (waited_ms < 1_000) : (waited_ms += 25) {
+            Io.sleep(testing.io, .{ .nanoseconds = 25 * std.time.ns_per_ms }, .awake) catch {};
+            if (RunState.done.load(.acquire)) {
+                exited_during_trickle = true;
+                break;
+            }
+            writeFrame(&writer.interface, .window_update, 0, 0, &wu_one) catch {
+                Io.sleep(testing.io, .{ .nanoseconds = 25 * std.time.ns_per_ms }, .awake) catch {};
+                exited_during_trickle = RunState.done.load(.acquire);
+                break;
+            };
+        }
+        try testing.expect(exited_during_trickle);
     }
 }
 
