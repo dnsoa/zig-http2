@@ -115,3 +115,96 @@ pub fn validateInboundFrame(fh: ParsedHeader, payload: []const u8) ?ErrorCode {
     }
     return null;
 }
+
+/// RFC 9113 §8.2.1: regular HTTP/2 field names MUST be non-empty, lowercase,
+/// and contain no 0x00-0x20, 0x41-0x5a, 0x7f-0xff, or ':' (0x3a).
+pub fn isValidFieldName(name: []const u8) bool {
+    if (name.len == 0) return false;
+    for (name) |ch| {
+        if (ch <= 0x20 or ch >= 0x7f or std.ascii.isUpper(ch) or ch == ':') return false;
+    }
+    return true;
+}
+
+/// RFC 9113 §8.2.1 & RFC 9110 §5.5: field values MUST NOT start or end with
+/// SP (0x20) or HTAB (0x09), and MUST NOT contain NUL, CR, LF, or other CTLs
+/// (0x00-0x08, 0x0a-0x1f, 0x7f).
+pub fn isValidFieldValue(value: []const u8) bool {
+    if (value.len == 0) return true;
+    if (value[0] == ' ' or value[0] == '\t') return false;
+    if (value[value.len - 1] == ' ' or value[value.len - 1] == '\t') return false;
+    for (value) |ch| {
+        if ((ch < 0x20 and ch != '\t') or ch == 0x7f) return false;
+    }
+    return true;
+}
+
+/// RFC 9113 §8.2.2: connection-specific header fields forbidden in HTTP/2.
+pub fn isConnectionSpecificHeader(name: []const u8) bool {
+    const banned = [_][]const u8{ "connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade" };
+    for (banned) |b| {
+        if (std.ascii.eqlIgnoreCase(name, b)) return true;
+    }
+    return false;
+}
+
+/// RFC 9110 §5.6.2 token (`tchar+`): used to validate `:method`.
+pub fn isValidToken(s: []const u8) bool {
+    if (s.len == 0) return false;
+    for (s) |ch| {
+        const ok = std.ascii.isAlphanumeric(ch) or switch (ch) {
+            '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~' => true,
+            else => false,
+        };
+        if (!ok) return false;
+    }
+    return true;
+}
+
+/// RFC 3986 §3.1 scheme (`ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )`).
+pub fn isValidScheme(s: []const u8) bool {
+    if (s.len == 0 or !std.ascii.isAlphabetic(s[0])) return false;
+    for (s[1..]) |ch| {
+        const ok = std.ascii.isAlphanumeric(ch) or ch == '+' or ch == '-' or ch == '.';
+        if (!ok) return false;
+    }
+    return true;
+}
+
+/// RFC 9110 §8.6 Content-Length (`1*DIGIT`; rejects empty, signs, and `_`).
+pub fn parseContentLength(s: []const u8) ?u64 {
+    if (s.len == 0) return null;
+    for (s) |ch| {
+        if (!std.ascii.isDigit(ch)) return null;
+    }
+    return std.fmt.parseInt(u64, s, 10) catch null;
+}
+
+test "proto field and token validators enforce RFC 9113 / RFC 9110 rules" {
+    const testing = std.testing;
+    try testing.expect(isValidFieldName("x-custom-1"));
+    try testing.expect(!isValidFieldName(""));
+    try testing.expect(!isValidFieldName("X-Upper"));
+    try testing.expect(!isValidFieldName(":pseudo"));
+    try testing.expect(!isValidFieldName("bad name"));
+
+    try testing.expect(isValidFieldValue(""));
+    try testing.expect(isValidFieldValue("a\tb c"));
+    try testing.expect(!isValidFieldValue(" leading"));
+    try testing.expect(!isValidFieldValue("trailing\t"));
+    try testing.expect(!isValidFieldValue("ctl\x07val"));
+    try testing.expect(!isValidFieldValue("del\x7fval"));
+
+    try testing.expect(isValidToken("GET"));
+    try testing.expect(!isValidToken("GET /"));
+    try testing.expect(isValidScheme("https"));
+    try testing.expect(isValidScheme("coap+tcp"));
+    try testing.expect(!isValidScheme("1http"));
+    try testing.expect(!isValidScheme("ht_tp"));
+
+    try testing.expectEqual(@as(?u64, 42), parseContentLength("42"));
+    try testing.expectEqual(@as(?u64, null), parseContentLength("+42"));
+    try testing.expectEqual(@as(?u64, null), parseContentLength("4_2"));
+}
+
+
