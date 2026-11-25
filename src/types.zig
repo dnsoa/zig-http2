@@ -100,8 +100,8 @@ pub const Response = struct {
 
     fn ensureHead(self: *Response) !void {
         if (self.head_sent) return;
-        self.head_sent = true;
         try self.sink.vtable.sendHead(self.sink.ctx, self);
+        self.head_sent = true;
     }
 
     /// Writes a body chunk, streaming it to the client immediately.
@@ -127,9 +127,9 @@ pub const Response = struct {
 
     pub fn finish(self: *Response) !void {
         if (self.finished) return;
-        self.finished = true;
         try self.ensureHead();
         try self.sink.vtable.finish(self.sink.ctx, self);
+        self.finished = true;
     }
 };
 

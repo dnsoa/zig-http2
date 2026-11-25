@@ -339,6 +339,7 @@ const H2Stream = struct {
     }
 
     fn endStream(self: *H2Stream) !void {
+        if (self.reset.load(.acquire) or self.conn.closing.load(.acquire)) return error.StreamReset;
         try self.conn.cw.frame(.data, flag_end_stream, self.id, "");
     }
 };
@@ -417,6 +418,7 @@ const H2Sink = struct {
 
     fn sendHead(ctx: *anyopaque, res: *types.Response) anyerror!void {
         const self: *H2Sink = @ptrCast(@alignCast(ctx));
+        if (self.stream.reset.load(.acquire) or self.stream.conn.closing.load(.acquire)) return error.StreamReset;
         var block: std.ArrayList(u8) = .empty;
         const hdrs = try buildResponseHeaders(res);
         try hpack.Encoder.encodeResponse(res.arena, &block, res.status_code, hdrs);
@@ -430,6 +432,7 @@ const H2Sink = struct {
 
     fn finish(ctx: *anyopaque, res: *types.Response) anyerror!void {
         const self: *H2Sink = @ptrCast(@alignCast(ctx));
+        if (self.stream.reset.load(.acquire) or self.stream.conn.closing.load(.acquire)) return error.StreamReset;
         if (res.trailers.items.len > 0) {
             // Trailing HEADERS carry END_STREAM (e.g. gRPC grpc-status).
             const items = res.trailers.items;
@@ -601,7 +604,7 @@ fn readSliceTimed(conn: *Connection, r: *Io.Reader, buf: []u8, ms: u64) !void {
     return runTimed(conn.io, ms, readSliceThunk, .{ r, buf });
 }
 
-const DrainOp = union(enum) { work: anyerror!void, drained: bool, timer: void };
+const DrainOp = union(enum) { work: anyerror!void, drained: bool };
 
 fn waitWorkersDrained(conn: *Connection) bool {
     conn.workers_mu.lockUncancelable(conn.io);
@@ -614,10 +617,13 @@ fn waitWorkersDrained(conn: *Connection) bool {
 
 /// While draining, reads the next frame header so in-flight streams can still
 /// receive DATA/trailers/WINDOW_UPDATE/RST_STREAM, while exiting promptly the
-/// moment `active_workers` reaches 0. Returns `true` when `hb` holds a frame
-/// header, `false` when all workers have drained (or concurrency is unavailable
-/// and the caller should fall through to `drainWorkers(true)`), or an error on
-/// EOF / read error / idle timeout.
+/// moment `active_workers` reaches 0. Does not arm `idle_timeout_ms`: after a
+/// graceful GOAWAY or Server.stop the peer is expected to stop sending while
+/// in-flight handlers finish, so silence is handler runtime rather than an idle
+/// connection.
+///
+/// Returns `true` when `hb` holds a frame header, `false` when all workers have
+/// drained, or an error on EOF / read error.
 fn readDrainHeader(conn: *Connection, r: *Io.Reader, hb: *[9]u8) !bool {
     conn.workers_mu.lockUncancelable(conn.io);
     const done_now = conn.active_workers == 0;
@@ -629,32 +635,35 @@ fn readDrainHeader(conn: *Connection, r: *Io.Reader, hb: *[9]u8) !bool {
         return true;
     }
 
-    var buf: [3]DrainOp = undefined;
+    var buf: [2]DrainOp = undefined;
     var sel = Io.Select(DrainOp).init(conn.io, &buf);
-    sel.concurrent(.work, readSliceThunk, .{ r, hb }) catch return false;
     sel.concurrent(.drained, waitWorkersDrained, .{conn}) catch {
-        while (sel.cancel()) |_| {}
-        return false;
+        // Backend has no concurrency support: keep reading frames synchronously
+        // so in-flight workers blocked on DATA or WINDOW_UPDATE can still make
+        // progress until the peer closes (EOF) or a frame arrives.
+        try r.readSliceAll(hb);
+        return true;
     };
-    const ms = conn.srv.config.idle_timeout_ms;
-    if (ms > 0) {
-        sel.concurrent(.timer, timerThunk, .{ conn.io, ms }) catch {
-            while (sel.cancel()) |_| {}
-            return false;
+    sel.concurrent(.work, readSliceThunk, .{ r, hb }) catch {
+        while (sel.cancel()) |leftover| switch (leftover) {
+            .drained => |d| if (d) return false,
+            .work => {},
         };
-    }
+        try r.readSliceAll(hb);
+        return true;
+    };
     const first = try sel.await();
     var work_ok = switch (first) {
         .work => |res| if (res) |_| true else |_| false,
-        else => false,
+        .drained => false,
     };
     var work_err: ?anyerror = switch (first) {
         .work => |res| if (res) |_| null else |e| e,
-        else => null,
+        .drained => null,
     };
     var drained = switch (first) {
         .drained => |d| d,
-        else => false,
+        .work => false,
     };
     while (sel.cancel()) |leftover| switch (leftover) {
         .work => |res| if (res) |_| {
@@ -665,15 +674,13 @@ fn readDrainHeader(conn: *Connection, r: *Io.Reader, hb: *[9]u8) !bool {
         .drained => |d| if (d) {
             drained = true;
         },
-        .timer => {},
     };
-    if (drained) return false;
+    // Prefer a completed header read over the drained signal so the 9 bytes
+    // already consumed into `hb` (e.g. a fatal GOAWAY) are parsed rather than
+    // discarded; the next loop iteration observes `active_workers == 0`.
     if (work_ok) return true;
-    return switch (first) {
-        .timer => error.Timeout,
-        .work => work_err.?,
-        .drained => false,
-    };
+    if (drained) return false;
+    return work_err.?;
 }
 
 /// Entry point: drive an HTTP/2 connection over `r`/`w` (any duplex transport).
@@ -4056,15 +4063,17 @@ test "h2: DATA on a half-closed(remote) stream gets RST_STREAM(STREAM_CLOSED) (#
     var rst1: ?u32 = null;
     var rst3: ?u32 = null;
     var ok5 = false;
+    var post_rst_frame = false;
     for (0..40) |_| {
         const maybe = nextFrameWithin(testing.allocator, &reader.interface, fds[1], 100) catch break;
         var f = maybe orelse continue;
         defer f.deinit(testing.allocator);
         if (f.header.ftype == .rst_stream and f.header.sid == 1) {
             rst1 = std.mem.readInt(u32, f.payload[0..4], .big);
-        }
-        if (f.header.ftype == .rst_stream and f.header.sid == 3) {
+        } else if (f.header.ftype == .rst_stream and f.header.sid == 3) {
             rst3 = std.mem.readInt(u32, f.payload[0..4], .big);
+        } else if ((f.header.sid == 1 and rst1 != null) or (f.header.sid == 3 and rst3 != null)) {
+            post_rst_frame = true;
         }
         if (f.header.ftype == .data and f.header.sid == 5 and f.header.flags & flag_end_stream != 0) {
             ok5 = true;
@@ -4074,4 +4083,114 @@ test "h2: DATA on a half-closed(remote) stream gets RST_STREAM(STREAM_CLOSED) (#
     try testing.expectEqual(@as(?u32, @intFromEnum(ErrorCode.stream_closed)), rst1);
     try testing.expectEqual(@as(?u32, @intFromEnum(ErrorCode.stream_closed)), rst3);
     try testing.expect(ok5);
+    // Neither stream 1 nor stream 3 may emit HEADERS/DATA after its RST_STREAM.
+    try testing.expect(!post_rst_frame);
+}
+
+test "h2: graceful GOAWAY does not abort a handler that outlives idle_timeout_ms (#17)" {
+    const fds = try newSocketPair();
+    var srv: Server = .{
+        .io = testing.io,
+        .gpa = testing.allocator,
+        .handler = goawayWaitWriteHandler, // sleeps 150 ms before responding
+        .config = .{ .idle_timeout_ms = 40 },
+    };
+    const t = try std.Thread.spawn(.{}, serveRawH2OnFd, .{ &srv, fds[0] });
+    defer t.join();
+    defer _ = c.close(fds[1]);
+
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [4096]u8 = undefined;
+    var reader = peerStream(fds[1]).reader(testing.io, &rbuf);
+    var writer = peerStream(fds[1]).writer(testing.io, &wbuf);
+    try rawHandshake(&reader.interface, &writer.interface);
+
+    try writeFrame(&writer.interface, .headers, flag_end_headers | flag_end_stream, 1, &trailers_req_block);
+    var goaway: [8]u8 = @splat(0);
+    std.mem.writeInt(u32, goaway[0..4], 1, .big); // NO_ERROR
+    try writeFrame(&writer.interface, .goaway, 0, 0, &goaway);
+
+    var body: [64]u8 = undefined;
+    var body_len: usize = 0;
+    var ended = false;
+    for (0..30) |_| {
+        const maybe = nextFrameWithin(testing.allocator, &reader.interface, fds[1], 100) catch break;
+        var f = maybe orelse continue;
+        defer f.deinit(testing.allocator);
+        if (f.header.ftype != .data or f.header.sid != 1) continue;
+        @memcpy(body[body_len..][0..f.payload.len], f.payload);
+        body_len += f.payload.len;
+        if (f.header.flags & flag_end_stream != 0) {
+            ended = true;
+            break;
+        }
+    }
+    try testing.expect(ended);
+    try testing.expectEqualStrings("pong", body[0..body_len]);
+}
+
+test "h2: graceful GOAWAY drain works under ConcurrencyUnavailable fallback (#17)" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{ .concurrent_limit = .nothing });
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const fds = try newSocketPair();
+    var srv: Server = .{ .io = io, .gpa = testing.allocator, .handler = h2EchoHandler, .config = .{} };
+    const t = try std.Thread.spawn(.{}, serveRawH2OnFd, .{ &srv, fds[0] });
+    defer t.join();
+    defer _ = c.close(fds[1]);
+
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [4096]u8 = undefined;
+    var reader = peerStream(fds[1]).reader(io, &rbuf);
+    var writer = peerStream(fds[1]).writer(io, &wbuf);
+    try rawHandshake(&reader.interface, &writer.interface);
+
+    // Open stream 1 without END_STREAM, send graceful GOAWAY, then send the body:
+    // readDrainHeader's synchronous fallback must keep reading DATA instead of
+    // handing off to drainWorkers(true) and hanging the blocked worker.
+    try writeFrame(&writer.interface, .headers, flag_end_headers, 1, &trailers_req_block);
+    var goaway: [8]u8 = @splat(0);
+    try writeFrame(&writer.interface, .goaway, 0, 0, &goaway);
+    try writeFrame(&writer.interface, .data, flag_end_stream, 1, "sync-body");
+
+    var body: [64]u8 = undefined;
+    var body_len: usize = 0;
+    var ended = false;
+    for (0..30) |_| {
+        const maybe = nextFrameWithin(testing.allocator, &reader.interface, fds[1], 100) catch break;
+        var f = maybe orelse continue;
+        defer f.deinit(testing.allocator);
+        if (f.header.ftype != .data or f.header.sid != 1) continue;
+        @memcpy(body[body_len..][0..f.payload.len], f.payload);
+        body_len += f.payload.len;
+        if (f.header.flags & flag_end_stream != 0) {
+            ended = true;
+            break;
+        }
+    }
+    try testing.expect(ended);
+    try testing.expectEqualStrings("sync-body", body[0..body_len]);
+}
+
+test "Response.finish leaves finished false if sink.finish fails (#16)" {
+    const FailingSink = struct {
+        fn sendHead(_: *anyopaque, _: *types.Response) anyerror!void {}
+        fn writeBody(_: *anyopaque, _: *types.Response, _: []const u8) anyerror!void {}
+        fn finish(_: *anyopaque, _: *types.Response) anyerror!void {
+            return error.OutOfMemory;
+        }
+        const vtable: types.Sink.Vtable = .{ .sendHead = sendHead, .writeBody = writeBody, .finish = finish };
+    };
+    var dummy: u8 = 0;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var res: types.Response = .{
+        .arena = arena_state.allocator(),
+        .sink = .{ .ctx = &dummy, .vtable = &FailingSink.vtable },
+        .minor_version = 0,
+    };
+    try testing.expectError(error.OutOfMemory, res.finish());
+    try testing.expect(res.head_sent);
+    try testing.expect(!res.finished);
 }
