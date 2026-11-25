@@ -1211,16 +1211,18 @@ pub const Client = struct {
     }
 
     /// Reads the next 9-byte frame header, racing a deadline so `deinit` (via
-    /// `dead`) and keepalive can make progress. Any inbound frame clears an
+    /// `dead`) and keepalive can make progress. Any inbound bytes clear an
     /// outstanding keepalive probe; silence past the probe means a dead peer.
     ///
     /// Reads incrementally so a timer firing mid-header never discards bytes
     /// already received (e.g. a header split across TCP segments or TLS
-    /// records). Keepalive idleness only applies while `got == 0` (between
-    /// frames); once bytes of the next header have arrived we are mid-frame
-    /// and only wake to recheck `dead`.
+    /// records). While `got > 0` (mid-header) no keepalive PING is emitted,
+    /// but when keepalive is enabled the mid-header stall is still bounded by
+    /// `keepalive_timeout_ms` so a peer that sends a partial header and stalls
+    /// is declared dead instead of hanging forever.
     fn readFrameHeader(self: *Client, hb: *[9]u8) !void {
         var got: usize = 0;
+        var last_progress_ns: i96 = 0;
         while (got < hb.len) {
             // Drain bytes already in `self.r`'s buffer synchronously first:
             // `Io.Reader.readVec` copies buffered bytes out of `r.buffer`
@@ -1232,21 +1234,46 @@ pub const Client = struct {
                 @memcpy(hb[got..][0..take], avail[0..take]);
                 self.r.toss(take);
                 got += take;
+                self.ping_outstanding = false;
+                last_progress_ns = Io.Timestamp.now(self.io, .awake).nanoseconds;
                 continue;
             }
             const ka = self.keepalive_time_ms != 0;
-            const ms: u64 = if (got > 0)
-                reader_wake_ms
-            else if (ka)
-                (if (self.ping_outstanding) self.keepalive_timeout_ms else self.keepalive_time_ms)
-            else
-                reader_wake_ms;
+            var ms: u64 = reader_wake_ms;
+            if (got > 0) {
+                if (ka) {
+                    const stall_ms = if (self.keepalive_timeout_ms != 0) self.keepalive_timeout_ms else self.keepalive_time_ms;
+                    const limit_ns: i96 = @as(i96, stall_ms) * std.time.ns_per_ms;
+                    const elapsed_ns = Io.Timestamp.now(self.io, .awake).nanoseconds - last_progress_ns;
+                    if (elapsed_ns >= limit_ns) {
+                        self.kill();
+                        return error.ConnectionClosed;
+                    }
+                    const rem_ms: u64 = @intCast(@divTrunc(limit_ns - elapsed_ns + std.time.ns_per_ms - 1, std.time.ns_per_ms));
+                    ms = @min(reader_wake_ms, @max(@as(u64, 1), rem_ms));
+                }
+            } else if (ka) {
+                ms = if (self.ping_outstanding) self.keepalive_timeout_ms else self.keepalive_time_ms;
+            }
             if (self.timedReadChunk(hb[got..], ms)) |n| {
-                got += n;
+                if (n > 0) {
+                    got += n;
+                    self.ping_outstanding = false;
+                    last_progress_ns = Io.Timestamp.now(self.io, .awake).nanoseconds;
+                }
             } else |err| switch (err) {
                 error.Timeout => {
                     if (self.dead.load(.acquire)) return error.ConnectionClosed;
-                    if (got > 0 or !ka) continue; // mid-header or no keepalive: just recheck `dead`
+                    if (!ka) continue; // no keepalive: just recheck `dead`
+                    if (got > 0) {
+                        const stall_ms = if (self.keepalive_timeout_ms != 0) self.keepalive_timeout_ms else self.keepalive_time_ms;
+                        const limit_ns: i96 = @as(i96, stall_ms) * std.time.ns_per_ms;
+                        if (Io.Timestamp.now(self.io, .awake).nanoseconds - last_progress_ns >= limit_ns) {
+                            self.kill();
+                            return error.ConnectionClosed; // stalled mid-header past keepalive_timeout_ms
+                        }
+                        continue;
+                    }
                     if (self.ping_outstanding) {
                         self.kill();
                         return error.ConnectionClosed; // keepalive timeout: peer is dead
@@ -1273,19 +1300,15 @@ pub const Client = struct {
     fn timedReadChunk(self: *Client, dst: []u8, timeout_ms: u64) !usize {
         var buf: [2]TimedChunk = undefined;
         var sel = Io.Select(TimedChunk).init(self.io, &buf);
-        sel.concurrent(.work, readChunkThunk, .{ self, dst }) catch {
+        // Spawn the timer first so if concurrency is unavailable (or only one
+        // slot is available and `.work` fails to spawn), `.work` is never
+        // cancelled mid-flight and no read result/error can be discarded.
+        sel.concurrent(.timer, keepaliveTimer, .{ self.io, timeout_ms }) catch {
             var bufs = [_][]u8{dst};
             return self.r.readVec(&bufs);
         };
-        sel.concurrent(.timer, keepaliveTimer, .{ self.io, timeout_ms }) catch {
-            var got_n: ?usize = null;
-            while (sel.cancel()) |leftover| switch (leftover) {
-                .work => |r| if (r) |n| {
-                    got_n = n;
-                } else |_| {},
-                .timer => {},
-            };
-            if (got_n) |n| return n;
+        sel.concurrent(.work, readChunkThunk, .{ self, dst }) catch {
+            while (sel.cancel()) |_| {}
             var bufs = [_][]u8{dst};
             return self.r.readVec(&bufs);
         };
@@ -3139,7 +3162,7 @@ test "client with keepalive does not drop or PING mid-header (#15)" {
     var client: Client = undefined;
     try client.init(io, testing.allocator, &csr.interface, &csw.interface);
     client.keepalive_time_ms = 80;
-    client.keepalive_timeout_ms = 80;
+    client.keepalive_timeout_ms = 500;
 
     var arbuf: [4096]u8 = undefined;
     var awbuf: [4096]u8 = undefined;
@@ -3153,14 +3176,14 @@ test "client with keepalive does not drop or PING mid-header (#15)" {
     var req = try ctRead(testing.allocator, &asr.interface);
     req.deinit(testing.allocator);
 
-    // Split the response header across 220 ms (> keepalive_time_ms + keepalive_timeout_ms).
+    // Split the response header across 200 ms (> keepalive_time_ms, < keepalive_timeout_ms).
     const resp = [_]u8{ 0x08, 0x03, '2', '0', '0' };
     var hdr_frame: [9 + resp.len]u8 = undefined;
     p2.putHeader(hdr_frame[0..9], resp.len, .headers, p2.flag_end_headers | p2.flag_end_stream, 1);
     @memcpy(hdr_frame[9..], &resp);
     try asw.interface.writeAll(hdr_frame[0..4]);
     try asw.interface.flush();
-    Io.sleep(io, .{ .nanoseconds = 220 * std.time.ns_per_ms }, .awake) catch {};
+    Io.sleep(io, .{ .nanoseconds = 200 * std.time.ns_per_ms }, .awake) catch {};
     try asw.interface.writeAll(hdr_frame[4..]);
     try asw.interface.flush();
 
@@ -3177,6 +3200,56 @@ test "client with keepalive does not drop or PING mid-header (#15)" {
     client.deinit();
     cstream.close(io);
     try testing.expectError(error.EndOfStream, ctRead(testing.allocator, &asr.interface));
+}
+
+test "client with keepalive kills a peer that stalls mid-header (#15)" {
+    const io = testing.io;
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var srv = try addr.listen(io, .{ .mode = .stream, .reuse_address = true });
+    defer srv.deinit(io);
+    const port = srv.socket.address.ip4.port;
+    const caddr = try net.IpAddress.parse("127.0.0.1", port);
+    const cstream = try caddr.connect(io, .{ .mode = .stream });
+    defer cstream.close(io);
+    var accepted = try srv.accept(io);
+    defer accepted.close(io);
+
+    var crbuf: [4096]u8 = undefined;
+    var cwbuf: [4096]u8 = undefined;
+    var csr = cstream.reader(io, &crbuf);
+    var csw = cstream.writer(io, &cwbuf);
+    var client: Client = undefined;
+    try client.init(io, testing.allocator, &csr.interface, &csw.interface);
+    defer client.deinit();
+    client.keepalive_time_ms = 5_000;
+    client.keepalive_timeout_ms = 120;
+
+    var arbuf: [4096]u8 = undefined;
+    var awbuf: [4096]u8 = undefined;
+    var asr = accepted.reader(io, &arbuf);
+    var asw = accepted.writer(io, &awbuf);
+    try ctHandshake(&asr.interface, &asw.interface);
+    var ack = try ctRead(testing.allocator, &asr.interface);
+    ack.deinit(testing.allocator);
+
+    const s = try client.openStream(.{ .path = "/stall" }, true);
+    defer s.close();
+    var req = try ctRead(testing.allocator, &asr.interface);
+    req.deinit(testing.allocator);
+
+    // Deliver 4 bytes of a frame header and stall forever: keepalive_timeout_ms
+    // must still declare the peer dead instead of spinning indefinitely.
+    var partial: [9]u8 = undefined;
+    p2.putHeader(&partial, 5, .headers, p2.flag_end_headers | p2.flag_end_stream, 1);
+    try asw.interface.writeAll(partial[0..4]);
+    try asw.interface.flush();
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const start = Io.Timestamp.now(io, .awake).nanoseconds;
+    try testing.expectError(error.ConnectionClosed, s.readEvent(arena.allocator()));
+    const elapsed_ms = @divFloor(Io.Timestamp.now(io, .awake).nanoseconds - start, std.time.ns_per_ms);
+    try testing.expect(elapsed_ms < 2_000);
 }
 
 const CancelRaceCtx = struct {
