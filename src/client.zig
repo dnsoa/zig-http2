@@ -262,7 +262,7 @@ pub const Stream = struct {
         self.cancelled = true;
         self.recv_cond.broadcast(c.io);
         self.recv_mu.unlock(c.io);
-        c.send_cond.broadcast(c.io);
+        c.wakeSenders();
     }
 
     /// Releases the stream: deregisters it from the client and frees it.
@@ -424,8 +424,8 @@ pub const Client = struct {
         // observe `dead` and return. (This wakes cond-waiters; the I/O-blocked
         // reader still needs the transport closed by the caller — see doc above.)
         self.dead.store(true, .release);
-        self.send_cond.broadcast(self.io);
-        self.admit_cond.broadcast(self.io); // release a blocked openStream
+        self.wakeSenders();
+        self.wakeAdmit(); // release a blocked openStream
         self.streams_mu.lockUncancelable(self.io);
         var it = self.streams.valueIterator();
         while (it.next()) |s| s.*.shutdown(self.io);
@@ -702,11 +702,29 @@ pub const Client = struct {
         }
     }
 
+    /// Wakes every sender blocked on a flow-control window. Holding `send_mu`
+    /// across the broadcast closes the lost-wake window against `Stream.send`
+    /// checking `dead`/`aborted` before entering `waitUncancelable`.
+    fn wakeSenders(self: *Client) void {
+        self.send_mu.lockUncancelable(self.io);
+        self.send_cond.broadcast(self.io);
+        self.send_mu.unlock(self.io);
+    }
+
+    /// Wakes every opener blocked at `MAX_CONCURRENT_STREAMS`. Holding
+    /// `admit_mu` across the broadcast closes the lost-wake window against
+    /// `openStream` checking `dead`/`goaway_seen` before waiting.
+    fn wakeAdmit(self: *Client) void {
+        self.admit_mu.lockUncancelable(self.io);
+        self.admit_cond.broadcast(self.io);
+        self.admit_mu.unlock(self.io);
+    }
+
     /// Marks the connection dead and releases every blocked stream/sender.
     fn kill(self: *Client) void {
         self.dead.store(true, .release);
-        self.send_cond.broadcast(self.io);
-        self.admit_cond.broadcast(self.io); // release a blocked openStream
+        self.wakeSenders();
+        self.wakeAdmit(); // release a blocked openStream
         self.streams_mu.lockUncancelable(self.io);
         var it = self.streams.valueIterator();
         while (it.next()) |s| s.*.shutdown(self.io);
@@ -749,8 +767,8 @@ pub const Client = struct {
                     }
                 }
                 self.streams_mu.unlock(self.io);
-                self.send_cond.broadcast(self.io); // release refused senders
-                self.admit_cond.broadcast(self.io); // and a blocked openStream
+                self.wakeSenders(); // release refused senders
+                self.wakeAdmit(); // and a blocked openStream
             },
             .rst_stream => {
                 const code: u32 = if (payload.len >= 4) std.mem.readInt(u32, payload[0..4], .big) else 0;
@@ -766,8 +784,8 @@ pub const Client = struct {
                 self.streams_mu.unlock(self.io);
                 // Wake any sender blocked on this stream's flow-control window;
                 // it checks `aborted` and returns error.StreamReset.
-                self.send_cond.broadcast(self.io);
-                self.admit_cond.broadcast(self.io);
+                self.wakeSenders();
+                self.wakeAdmit();
             },
             .headers => {
                 var block: std.ArrayList(u8) = .empty;
@@ -890,7 +908,7 @@ pub const Client = struct {
                 s.recv_mu.unlock(self.io);
                 self.noteEnd(s, true, true); // reset frees its slot
                 self.streams_mu.unlock(self.io);
-                self.send_cond.broadcast(self.io); // release a sender blocked on the window
+                self.wakeSenders(); // release a sender blocked on the window
                 var p: [4]u8 = undefined;
                 std.mem.writeInt(u32, &p, @intFromEnum(code), .big);
                 self.writeFrame(.rst_stream, 0, sid, &p) catch {};
@@ -3107,4 +3125,119 @@ test "client with keepalive does not drop or PING mid-header (#15)" {
     client.deinit();
     cstream.close(io);
     try testing.expectError(error.EndOfStream, ctRead(testing.allocator, &asr.interface));
+}
+
+const CancelRaceCtx = struct {
+    stop: std.atomic.Value(bool) = .init(false),
+    seq: std.atomic.Value(u32) = .init(0),
+    send_done: std.atomic.Value(u32) = .init(0),
+    cur: *Stream = undefined,
+};
+
+fn cancelRaceSender(ctx: *CancelRaceCtx) void {
+    const payload = @as([50]u8, @splat('x'));
+    var last: u32 = 0;
+    while (!ctx.stop.load(.acquire)) {
+        const seq = ctx.seq.load(.acquire);
+        if (seq == last) {
+            std.atomic.spinLoopHint();
+            continue;
+        }
+        last = seq;
+        _ = ctx.cur.send(&payload, false) catch {};
+        ctx.send_done.store(seq, .release);
+    }
+}
+
+fn cancelRaceDrain(r: *Io.Reader, stop: *std.atomic.Value(bool)) void {
+    var tmp: [65536]u8 = undefined;
+    while (!stop.load(.acquire)) {
+        _ = r.readSliceShort(&tmp) catch return;
+    }
+}
+
+test "cancel() never loses a wake-up against a send() entering the window wait (#18)" {
+    const io = testing.io;
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var srv = try addr.listen(io, .{ .mode = .stream, .reuse_address = true });
+    defer srv.deinit(io);
+    const port = srv.socket.address.ip4.port;
+    const caddr = try net.IpAddress.parse("127.0.0.1", port);
+    const cstream = try caddr.connect(io, .{ .mode = .stream });
+    var accepted = try srv.accept(io);
+
+    var crbuf: [65536]u8 = undefined;
+    var cwbuf: [65536]u8 = undefined;
+    var csr = cstream.reader(io, &crbuf);
+    var csw = cstream.writer(io, &cwbuf);
+    var client: Client = undefined;
+    try client.init(io, testing.allocator, &csr.interface, &csw.interface);
+    var torn = false;
+    defer if (!torn) {
+        client.deinit();
+        accepted.close(io);
+        cstream.close(io);
+    };
+
+    var arbuf: [65536]u8 = undefined;
+    var awbuf: [65536]u8 = undefined;
+    var asr = accepted.reader(io, &arbuf);
+    var asw = accepted.writer(io, &awbuf);
+    try ctHandshake(&asr.interface, &asw.interface);
+    var ack1 = try ctRead(testing.allocator, &asr.interface);
+    ack1.deinit(testing.allocator);
+
+    // Zero initial stream window so every send() enters the send_cond wait.
+    var iw: [6]u8 = undefined;
+    p2.putSetting(&iw, p2.set_initial_window_size, 0);
+    try ctWrite(&asw.interface, .settings, 0, 0, &iw);
+    var ack2 = try ctRead(testing.allocator, &asr.interface);
+    ack2.deinit(testing.allocator);
+
+    var drain_stop = std.atomic.Value(bool).init(false);
+    const drain_th = try std.Thread.spawn(.{}, cancelRaceDrain, .{ &asr.interface, &drain_stop });
+    var ctx: CancelRaceCtx = .{};
+    const sender_th = try std.Thread.spawn(.{}, cancelRaceSender, .{&ctx});
+
+    var rng: u64 = 0x9e3779b97f4a7c15;
+    const rounds: u32 = 2_000;
+    var stuck: u32 = 0;
+    var seq: u32 = 0;
+    while (seq < rounds) : (seq += 1) {
+        const s = try client.openStream(.{ .path = "/s" }, false);
+        ctx.cur = s;
+        ctx.seq.store(seq + 1, .release);
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        var spin: u32 = @intCast(rng % 2000);
+        while (spin > 0) : (spin -= 1) std.atomic.spinLoopHint();
+        try s.cancel();
+
+        var waited: u32 = 0;
+        while (ctx.send_done.load(.acquire) != seq + 1 and waited < 50) : (waited += 1) {
+            Io.sleep(io, .{ .nanoseconds = std.time.ns_per_ms }, .awake) catch {};
+        }
+        if (ctx.send_done.load(.acquire) != seq + 1) {
+            stuck += 1;
+            var wu: [4]u8 = undefined;
+            std.mem.writeInt(u32, &wu, 65535, .big);
+            try ctWrite(&asw.interface, .window_update, 0, s.id, &wu);
+            waited = 0;
+            while (ctx.send_done.load(.acquire) != seq + 1 and waited < 200) : (waited += 1) {
+                Io.sleep(io, .{ .nanoseconds = std.time.ns_per_ms }, .awake) catch {};
+            }
+        }
+        s.close();
+    }
+
+    ctx.stop.store(true, .release);
+    sender_th.join();
+    drain_stop.store(true, .release);
+    client.deinit();
+    cstream.close(io);
+    drain_th.join();
+    accepted.close(io);
+    torn = true;
+    try testing.expectEqual(@as(u32, 0), stuck);
 }
