@@ -225,14 +225,13 @@ pub const Encoder = struct {
             try emitIndexed(arena, out, idx);
         } else {
             // name index 8 == ":status" (first :status entry in the static table).
-            try emitLiteral(arena, out, 8, ":status", status_str);
+            try emitLiteral(arena, out, 8, ":status", status_str, false);
         }
 
         for (headers) |h| {
-            const lname = try lower(arena, h.name);
-            if (isConnectionSpecific(lname)) continue;
-            const nidx = hp.StaticTable.findName(lname) orelse 0;
-            try emitLiteral(arena, out, nidx, lname, h.value);
+            // RFC 9113 §8.2.2: drop connection-specific headers and any `te` on responses.
+            if (isConnectionSpecific(h.name) or std.ascii.eqlIgnoreCase(h.name, "te")) continue;
+            try emitField(arena, out, h.name, h.value);
         }
     }
 
@@ -255,10 +254,11 @@ pub const Encoder = struct {
         try emitPseudo(arena, out, ":path", path);
         if (authority.len > 0) try emitPseudo(arena, out, ":authority", authority);
         for (headers) |h| {
-            const lname = try lower(arena, h.name);
-            if (isConnectionSpecific(lname)) continue;
-            const nidx = hp.StaticTable.findName(lname) orelse 0;
-            try emitLiteral(arena, out, nidx, lname, h.value);
+            // RFC 9113 §8.2.2: drop connection-specific headers; in requests
+            // `te` is permitted only with the exact value "trailers".
+            if (isConnectionSpecific(h.name)) continue;
+            if (std.ascii.eqlIgnoreCase(h.name, "te") and !std.mem.eql(u8, h.value, "trailers")) continue;
+            try emitField(arena, out, h.name, h.value);
         }
     }
 
@@ -269,7 +269,7 @@ pub const Encoder = struct {
             try emitIndexed(arena, out, idx);
         } else {
             const nidx = hp.StaticTable.findName(name) orelse 0;
-            try emitLiteral(arena, out, nidx, name, value);
+            try emitLiteral(arena, out, nidx, name, value, false);
         }
     }
 
@@ -283,9 +283,31 @@ pub const Encoder = struct {
         headers: []const Header,
     ) Error!void {
         for (headers) |h| {
-            const lname = try lower(arena, h.name);
-            const nidx = hp.StaticTable.findName(lname) orelse 0;
-            try emitLiteral(arena, out, nidx, lname, h.value);
+            try emitField(arena, out, h.name, h.value);
+        }
+    }
+
+    /// Emits a regular header field, avoiding lowercasing allocations whenever
+    /// the name matches the static table, is already lowercase, or fits a small
+    /// stack buffer. Marks sensitive headers as Never Indexed (RFC 7541 §6.2.3).
+    fn emitField(arena: std.mem.Allocator, out: *std.ArrayList(u8), name: []const u8, value: []const u8) Error!void {
+        const nidx = hp.StaticTable.findName(name) orelse 0;
+        const never_index = isSensitiveHeader(name);
+        if (nidx != 0) {
+            try emitLiteral(arena, out, nidx, "", value, never_index);
+            return;
+        }
+        if (!hasUpper(name)) {
+            try emitLiteral(arena, out, 0, name, value, never_index);
+            return;
+        }
+        var stack_buf: [256]u8 = undefined;
+        if (name.len <= stack_buf.len) {
+            for (name, 0..) |ch, i| stack_buf[i] = std.ascii.toLower(ch);
+            try emitLiteral(arena, out, 0, stack_buf[0..name.len], value, never_index);
+        } else {
+            const lname = try lower(arena, name);
+            try emitLiteral(arena, out, 0, lname, value, never_index);
         }
     }
 
@@ -306,24 +328,31 @@ pub const Encoder = struct {
         try out.appendSlice(arena, buf[0..n]);
     }
 
-    /// Literal without Indexing (0x00 pattern). `name_idx == 0` ⇒ literal name.
+    /// Literal without Indexing (`0x00` pattern) or Never Indexed (`0x10`
+    /// pattern, RFC 7541 §6.2.3). `name_idx == 0` ⇒ literal name.
     fn emitLiteral(
         arena: std.mem.Allocator,
         out: *std.ArrayList(u8),
         name_idx: usize,
         name: []const u8,
         value: []const u8,
+        never_index: bool,
     ) Error!void {
         var buf: [10]u8 = undefined;
         const n = hp.encodeInteger(name_idx, 4, &buf) catch unreachable;
-        // High nibble already 0x0 ⇒ "literal without indexing"; nothing to OR in.
+        if (never_index) buf[0] |= 0x10;
         try out.appendSlice(arena, buf[0..n]);
         // Shorter-of-two: Huffman-encode only when it is strictly smaller than
         // the raw octets (RFC 7541 §5.2); never larger than raw.
-        if (name_idx == 0) try hp.encodeString(name, hp.huffmanLen(name) < name.len, arena, out);
-        try hp.encodeString(value, hp.huffmanLen(value) < value.len, arena, out);
+        if (name_idx == 0) try hp.encodeStringShortest(name, arena, out);
+        try hp.encodeStringShortest(value, arena, out);
     }
 };
+
+fn hasUpper(s: []const u8) bool {
+    for (s) |ch| if (std.ascii.isUpper(ch)) return true;
+    return false;
+}
 
 fn lower(arena: std.mem.Allocator, s: []const u8) Error![]const u8 {
     const out = try arena.alloc(u8, s.len);
@@ -331,10 +360,19 @@ fn lower(arena: std.mem.Allocator, s: []const u8) Error![]const u8 {
     return out;
 }
 
-/// Headers forbidden on HTTP/2 (RFC 7540 §8.1.2.2).
-fn isConnectionSpecific(lname: []const u8) bool {
+/// Headers forbidden on HTTP/2 (RFC 9113 §8.2.2). Case-insensitive so callers
+/// do not have to allocate a lowercased copy before filtering.
+fn isConnectionSpecific(name: []const u8) bool {
     const banned = [_][]const u8{ "connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade" };
-    for (banned) |b| if (std.mem.eql(u8, lname, b)) return true;
+    for (banned) |b| if (std.ascii.eqlIgnoreCase(name, b)) return true;
+    return false;
+}
+
+/// Sensitive header fields emitted as Never Indexed (RFC 7541 §6.2.3) so
+/// intermediaries do not compress secrets into shared dynamic tables.
+fn isSensitiveHeader(name: []const u8) bool {
+    const sensitive = [_][]const u8{ "authorization", "proxy-authorization", "cookie", "set-cookie" };
+    for (sensitive) |s| if (std.ascii.eqlIgnoreCase(name, s)) return true;
     return false;
 }
 
@@ -753,4 +791,154 @@ test "encodeTableSizeUpdate emits valid RFC 7541 §6.3 dynamic table size update
     try testing.expectEqual(@as(usize, 0), dec.dyn.max_size);
     try testing.expectEqualStrings("200", findHeader(hs, ":status").?);
     try testing.expectEqualStrings("ok", findHeader(hs, "x-test").?);
+}
+
+test "Encoder filters te per RFC 9113 §8.2.2 and marks sensitive fields Never Indexed (#37, #41)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // encodeResponse drops ALL `te` headers (even `te: trailers`) and connection-specific headers.
+    {
+        var out: std.ArrayList(u8) = .empty;
+        const headers = [_]Header{
+            .{ .name = "TE", .value = "trailers" },
+            .{ .name = "te", .value = "gzip" },
+            .{ .name = "Connection", .value = "keep-alive" },
+            .{ .name = "Set-Cookie", .value = "sid=secret" },
+            .{ .name = "X-Mixed-Custom", .value = "ok" },
+        };
+        try Encoder.encodeResponse(arena, &out, 200, &headers);
+
+        // `:status 200` is 0x88 (1 byte); next field is `set-cookie` (static 55 > 15),
+        // emitted as Never Indexed (`0x10 | 0x0f = 0x1f`, followed by `55 - 15 = 40`).
+        try testing.expectEqual(@as(u8, 0x88), out.items[0]);
+        try testing.expectEqual(@as(u8, 0x1f), out.items[1]);
+        try testing.expectEqual(@as(u8, 40), out.items[2]);
+
+        var dec = Decoder.init(testing.allocator, 4096);
+        defer dec.deinit();
+        const hs = try dec.decode(arena, out.items);
+        try testing.expectEqual(@as(?[]const u8, null), findHeader(hs, "te"));
+        try testing.expectEqual(@as(?[]const u8, null), findHeader(hs, "connection"));
+        try testing.expectEqualStrings("sid=secret", findHeader(hs, "set-cookie").?);
+        try testing.expectEqualStrings("ok", findHeader(hs, "x-mixed-custom").?);
+    }
+
+    // encodeRequest retains `te: trailers` (any case on name, exact lowercase value) and drops others.
+    {
+        var out: std.ArrayList(u8) = .empty;
+        const headers = [_]Header{
+            .{ .name = "TE", .value = "gzip" },
+            .{ .name = "te", .value = "Trailers" },
+            .{ .name = "te", .value = "trailers, deflate" },
+            .{ .name = "TE", .value = "trailers" },
+            .{ .name = "Authorization", .value = "Bearer tok" },
+        };
+        try Encoder.encodeRequest(arena, &out, "POST", "https", "/rpc", "api.example.com", &headers);
+
+        var dec = Decoder.init(testing.allocator, 4096);
+        defer dec.deinit();
+        const hs = try dec.decode(arena, out.items);
+        var te_count: usize = 0;
+        for (hs) |h| {
+            if (std.mem.eql(u8, h.name, "te")) {
+                try testing.expectEqualStrings("trailers", h.value);
+                te_count += 1;
+            }
+        }
+        try testing.expectEqual(@as(usize, 1), te_count);
+        try testing.expectEqualStrings("Bearer tok", findHeader(hs, "authorization").?);
+    }
+}
+
+test "StaticTable.findName bucket lookup matches linear scan for all entries (#41)" {
+    for (hp.StaticTable.entries, 0..) |entry, i| {
+        // Compute expected first-match 1-based index linearly.
+        var expected: usize = i + 1;
+        for (hp.StaticTable.entries[0..i], 0..) |prev, j| {
+            if (std.mem.eql(u8, prev.name, entry.name)) {
+                expected = j + 1;
+                break;
+            }
+        }
+        try testing.expectEqual(@as(?usize, expected), hp.StaticTable.findName(entry.name));
+
+        // Verify case-insensitive match with uppercased name.
+        var upper: [64]u8 = undefined;
+        for (entry.name, 0..) |ch, k| upper[k] = std.ascii.toUpper(ch);
+        try testing.expectEqual(@as(?usize, expected), hp.StaticTable.findName(upper[0..entry.name.len]));
+    }
+    try testing.expectEqual(@as(?usize, null), hp.StaticTable.findName(""));
+    try testing.expectEqual(@as(?usize, null), hp.StaticTable.findName("x-not-in-static-table"));
+    try testing.expectEqual(@as(?usize, null), hp.StaticTable.findName("way-longer-than-any-static-table-header-name-ever"));
+}
+
+test "DynamicTable ring buffer handles wrap-around, growth, eviction, and resize (#41)" {
+    var dt = hp.DynamicTable.initWithSize(testing.allocator, 4096);
+    defer dt.deinit();
+
+    // Insert 40 entries (crosses initial 16 -> 32 -> 64 capacity doublings) and
+    // verify newest-first indexing order.
+    var kbuf: [16]u8 = undefined;
+    var vbuf: [16]u8 = undefined;
+    for (0..40) |i| {
+        const k = std.fmt.bufPrint(&kbuf, "k-{d}", .{i}) catch unreachable;
+        const v = std.fmt.bufPrint(&vbuf, "v-{d}", .{i}) catch unreachable;
+        try dt.add(k, v);
+    }
+    try testing.expectEqual(@as(usize, 40), dt.len());
+    try testing.expectEqualStrings("k-39", dt.get(0).?.name);
+    try testing.expectEqualStrings("v-39", dt.get(0).?.value);
+    try testing.expectEqualStrings("k-0", dt.get(39).?.name);
+    try testing.expectEqual(@as(?hp.StaticTable.Entry, null), dt.get(40));
+
+    // Shrink max_size to force FIFO eviction of oldest entries, then add more to wrap.
+    dt.setMaxSize(256);
+    try testing.expect(dt.current_size <= 256);
+    const keep_newest = dt.get(0).?.name;
+    try testing.expectEqualStrings("k-39", keep_newest);
+
+    for (40..90) |i| {
+        const k = std.fmt.bufPrint(&kbuf, "k-{d}", .{i}) catch unreachable;
+        const v = std.fmt.bufPrint(&vbuf, "v-{d}", .{i}) catch unreachable;
+        try dt.add(k, v);
+        try testing.expect(dt.current_size <= 256);
+        try testing.expectEqualStrings(k, dt.get(0).?.name);
+    }
+
+    // RFC 7541 §4.4: adding an entry larger than max_size empties the table.
+    const huge = @as([300]u8, @splat('z'));
+    try dt.add("x-big", &huge);
+    try testing.expectEqual(@as(usize, 0), dt.len());
+    try testing.expectEqual(@as(usize, 0), dt.current_size);
+}
+
+test "Encoder avoids temporary allocations when encoding into pre-sized buffer (#41)" {
+    // Pre-size `out` on a tight FixedBufferAllocator; encoding static + mixed-case
+    // custom headers with Huffman must succeed with zero extra heap allocations.
+    var backing: [512]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&backing);
+    const alloc = fba.allocator();
+
+    var out: std.ArrayList(u8) = .empty;
+    try out.ensureTotalCapacity(alloc, 256);
+    const before = fba.end_index;
+
+    const headers = [_]Header{
+        .{ .name = "Content-Type", .value = "application/json; charset=utf-8" },
+        .{ .name = "Cache-Control", .value = "public, max-age=3600" },
+        .{ .name = "X-Custom-Edge-Cache", .value = "HIT-aaaaaaaaaaaaaaaa" },
+    };
+    try Encoder.encodeResponse(alloc, &out, 200, &headers);
+    // Zero extra allocations beyond the pre-allocated `out` capacity.
+    try testing.expectEqual(before, fba.end_index);
+
+    var dec = Decoder.init(testing.allocator, 4096);
+    defer dec.deinit();
+    var dec_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer dec_arena.deinit();
+    const hs = try dec.decode(dec_arena.allocator(), out.items);
+    try testing.expectEqualStrings("application/json; charset=utf-8", findHeader(hs, "content-type").?);
+    try testing.expectEqualStrings("HIT-aaaaaaaaaaaaaaaa", findHeader(hs, "x-custom-edge-cache").?);
 }

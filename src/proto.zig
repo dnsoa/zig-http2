@@ -47,11 +47,24 @@ pub const set_enable_push: u16 = 0x2;
 pub const set_max_concurrent_streams: u16 = 0x3;
 pub const set_initial_window_size: u16 = 0x4;
 pub const set_max_frame_size: u16 = 0x5;
+pub const set_max_header_list_size: u16 = 0x6;
 
 // Common defaults / limits.
 pub const our_max_frame_size: u32 = 16384;
 pub const our_header_table_size: u32 = 4096;
 pub const default_window: i64 = 65535;
+
+/// Clamps a configured connection-level receive window to the RFC 9113 range
+/// `[65535, 2^31-1]` (a connection window starts at 65535 and can only grow).
+pub fn clampConnWindow(v: u32) i64 {
+    return @intCast(@min(@max(v, 65535), 0x7fff_ffff));
+}
+
+/// Clamps a configured `SETTINGS_INITIAL_WINDOW_SIZE` to the RFC 9113 §6.5.2
+/// range `[0, 2^31-1]` so misconfiguration never emits an illegal setting.
+pub fn clampInitialWindow(v: u32) u32 {
+    return @min(v, 0x7fff_ffff);
+}
 
 pub const ParsedHeader = struct { length: u32, ftype: FrameType, flags: u8, sid: u31 };
 
@@ -59,7 +72,7 @@ pub fn putHeader(buf: *[9]u8, length: usize, ftype: FrameType, flags: u8, sid: u
     buf[0] = @intCast((length >> 16) & 0xff);
     buf[1] = @intCast((length >> 8) & 0xff);
     buf[2] = @intCast(length & 0xff);
-    buf[3] = @intFromEnum(ftype);
+    buf[3] = @backingInt(ftype);
     buf[4] = flags;
     std.mem.writeInt(u32, buf[5..9], @as(u32, sid), .big);
 }
@@ -67,7 +80,7 @@ pub fn putHeader(buf: *[9]u8, length: usize, ftype: FrameType, flags: u8, sid: u
 pub fn parseHeader(b: *const [9]u8) ParsedHeader {
     return .{
         .length = (@as(u32, b[0]) << 16) | (@as(u32, b[1]) << 8) | b[2],
-        .ftype = @enumFromInt(b[3]),
+        .ftype = @fromBackingInt(@intCast(b[3])),
         .flags = b[4],
         .sid = @intCast(std.mem.readInt(u32, b[5..9], .big) & 0x7fff_ffff),
     };
@@ -116,12 +129,21 @@ pub fn validateInboundFrame(fh: ParsedHeader, payload: []const u8) ?ErrorCode {
     return null;
 }
 
-/// RFC 9113 §8.2.1: regular HTTP/2 field names MUST be non-empty, lowercase,
-/// and contain no 0x00-0x20, 0x41-0x5a, 0x7f-0xff, or ':' (0x3a).
+/// RFC 9110 §5.6.2 `tchar`: allowed characters in an HTTP token / field name.
+pub fn isTokenChar(ch: u8) bool {
+    return std.ascii.isAlphanumeric(ch) or switch (ch) {
+        '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~' => true,
+        else => false,
+    };
+}
+
+/// RFC 9113 §8.2.1 & RFC 9110 §5.1 / §5.6.2: regular HTTP/2 field names MUST
+/// be non-empty lowercase `tchar` sequences (rejects delimiters, CTLs,
+/// uppercase ASCII, and `:`).
 pub fn isValidFieldName(name: []const u8) bool {
     if (name.len == 0) return false;
     for (name) |ch| {
-        if (ch <= 0x20 or ch >= 0x7f or std.ascii.isUpper(ch) or ch == ':') return false;
+        if (std.ascii.isUpper(ch) or !isTokenChar(ch)) return false;
     }
     return true;
 }
@@ -152,11 +174,7 @@ pub fn isConnectionSpecificHeader(name: []const u8) bool {
 pub fn isValidToken(s: []const u8) bool {
     if (s.len == 0) return false;
     for (s) |ch| {
-        const ok = std.ascii.isAlphanumeric(ch) or switch (ch) {
-            '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~' => true,
-            else => false,
-        };
-        if (!ok) return false;
+        if (!isTokenChar(ch)) return false;
     }
     return true;
 }
@@ -183,10 +201,20 @@ pub fn parseContentLength(s: []const u8) ?u64 {
 test "proto field and token validators enforce RFC 9113 / RFC 9110 rules" {
     const testing = std.testing;
     try testing.expect(isValidFieldName("x-custom-1"));
+    try testing.expect(isValidFieldName("!#$%&'*+-.^_`|~09az"));
     try testing.expect(!isValidFieldName(""));
     try testing.expect(!isValidFieldName("X-Upper"));
     try testing.expect(!isValidFieldName(":pseudo"));
     try testing.expect(!isValidFieldName("bad name"));
+    // RFC 9110 §5.6.2: delimiters are not valid tchar in HTTP field names (#37).
+    const bad_delims = [_][]const u8{
+        "a,b", "a;b", "a=b", "a/b", "a\"b", "a(b",  "a)b",
+        "a{b", "a}b", "a[b", "a]b", "a@b",  "a\\b", "a<b",
+        "a>b", "a?b",
+    };
+    for (bad_delims) |name| {
+        try testing.expect(!isValidFieldName(name));
+    }
 
     try testing.expect(isValidFieldValue(""));
     try testing.expect(isValidFieldValue("a\tb c"));
@@ -205,4 +233,15 @@ test "proto field and token validators enforce RFC 9113 / RFC 9110 rules" {
     try testing.expectEqual(@as(?u64, 42), parseContentLength("42"));
     try testing.expectEqual(@as(?u64, null), parseContentLength("+42"));
     try testing.expectEqual(@as(?u64, null), parseContentLength("4_2"));
+
+    // Window clamping helpers (#38, #39).
+    try testing.expectEqual(@as(i64, 65535), clampConnWindow(0));
+    try testing.expectEqual(@as(i64, 65535), clampConnWindow(100));
+    try testing.expectEqual(@as(i64, 1 << 20), clampConnWindow(1 << 20));
+    try testing.expectEqual(@as(i64, 0x7fff_ffff), clampConnWindow(0xffff_ffff));
+
+    try testing.expectEqual(@as(u32, 0), clampInitialWindow(0));
+    try testing.expectEqual(@as(u32, 131072), clampInitialWindow(131072));
+    try testing.expectEqual(@as(u32, 0x7fff_ffff), clampInitialWindow(0x8000_0000));
+    try testing.expectEqual(@as(u32, 0x7fff_ffff), clampInitialWindow(0xffff_ffff));
 }

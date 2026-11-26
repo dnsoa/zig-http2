@@ -88,6 +88,39 @@ pub const StaticTable = struct {
         .{ .name = "www-authenticate", .value = "" }, // 61
     };
 
+    const max_name_len = blk: {
+        var m: usize = 0;
+        for (entries) |e| m = @max(m, e.name.len);
+        break :blk m;
+    };
+
+    const NameBucket = struct {
+        indices: [12]u8 = undefined,
+        len: u8 = 0,
+    };
+
+    /// Length-indexed lookup buckets for the 51 distinct static header names,
+    /// preserving first-match order (`findName` checks only entries of the same
+    /// length rather than scanning all 61 entries).
+    const name_buckets = blk: {
+        @setEvalBranchQuota(100_000);
+        var buckets: [max_name_len + 1]NameBucket = @splat(.{});
+        for (entries, 0..) |entry, i| {
+            var dup = false;
+            for (entries[0..i]) |prev| {
+                if (mem.eql(u8, prev.name, entry.name)) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (dup) continue;
+            const l = entry.name.len;
+            buckets[l].indices[buckets[l].len] = @intCast(i);
+            buckets[l].len += 1;
+        }
+        break :blk buckets;
+    };
+
     /// Looks up a header by index (1-based).
     pub fn get(index: usize) ?Entry {
         if (index == 0 or index > entries.len) return null;
@@ -96,9 +129,11 @@ pub const StaticTable = struct {
 
     /// Finds the index of a header name (returns first match).
     pub fn findName(name: []const u8) ?usize {
-        for (entries, 0..) |entry, i| {
-            if (std.ascii.eqlIgnoreCase(entry.name, name)) {
-                return i + 1;
+        if (name.len > max_name_len) return null;
+        const bucket = name_buckets[name.len];
+        for (bucket.indices[0..bucket.len]) |idx| {
+            if (std.ascii.eqlIgnoreCase(entries[idx].name, name)) {
+                return @as(usize, idx) + 1;
             }
         }
         return null;
@@ -126,10 +161,14 @@ pub const DynamicEntry = struct {
     }
 };
 
-/// HPACK dynamic table with FIFO eviction.
+/// HPACK dynamic table with FIFO eviction backed by an O(1) ring buffer.
 pub const DynamicTable = struct {
     allocator: Allocator,
-    entries: std.ArrayList(DynamicEntry) = .empty,
+    buf: []DynamicEntry = &.{},
+    /// Physical index of the newest entry (logical dynamic index 0).
+    head: usize = 0,
+    /// Number of live entries currently stored in `buf`.
+    count: usize = 0,
     current_size: usize = 0,
     max_size: usize = 4096, // Default per RFC 7541
 
@@ -144,20 +183,26 @@ pub const DynamicTable = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        for (self.entries.items) |entry| {
+        for (0..self.count) |i| {
+            const entry = self.buf[(self.head + i) % self.buf.len];
             self.allocator.free(entry.name);
             self.allocator.free(entry.value);
         }
-        self.entries.deinit(self.allocator);
+        if (self.buf.len > 0) self.allocator.free(self.buf);
+        self.buf = &.{};
+        self.head = 0;
+        self.count = 0;
+        self.current_size = 0;
     }
 
-    /// Adds a new entry to the beginning of the dynamic table. Evicts old
-    /// entries if necessary to fit within max_size.
+    /// Adds a new entry to the beginning of the dynamic table in O(1) amortized
+    /// time. Evicts oldest entries if necessary to fit within `max_size`.
     pub fn add(self: *Self, name: []const u8, value: []const u8) !void {
-        const entry_size = name.len + value.len + 32;
+        const entry_size = (name.len +| value.len) +| 32;
 
-        // Evict entries until we have room.
-        while (self.current_size + entry_size > self.max_size and self.entries.items.len > 0) {
+        // Evict entries until we have room (RFC 7541 §4.4: an entry larger than
+        // max_size still empties the table).
+        while (self.count > 0 and (entry_size > self.max_size or self.current_size > self.max_size - entry_size)) {
             self.evictOne();
         }
 
@@ -169,40 +214,56 @@ pub const DynamicTable = struct {
         const value_copy = try self.allocator.dupe(u8, value);
         errdefer self.allocator.free(value_copy);
 
-        // Insert at the beginning (index 0).
-        try self.entries.insert(self.allocator, 0, .{
+        if (self.count == self.buf.len) {
+            const new_cap: usize = if (self.buf.len == 0) 16 else self.buf.len * 2;
+            const new_buf = try self.allocator.alloc(DynamicEntry, new_cap);
+            for (0..self.count) |i| {
+                new_buf[i] = self.buf[(self.head + i) % self.buf.len];
+            }
+            if (self.buf.len > 0) self.allocator.free(self.buf);
+            self.buf = new_buf;
+            self.head = 0;
+        }
+
+        // Insert at logical index 0 (newest).
+        self.head = if (self.head == 0) self.buf.len - 1 else self.head - 1;
+        self.buf[self.head] = .{
             .name = name_copy,
             .value = value_copy,
-        });
+        };
+        self.count += 1;
         self.current_size += entry_size;
     }
 
-    /// Evicts the oldest entry (last in list).
+    /// Evicts the oldest entry (logical index `count - 1`) in O(1).
     fn evictOne(self: *Self) void {
-        if (self.entries.items.len == 0) return;
-        const entry = self.entries.pop().?;
+        if (self.count == 0) return;
+        const tail = (self.head + self.count - 1) % self.buf.len;
+        const entry = self.buf[tail];
+        self.count -= 1;
         self.current_size -= entry.name.len + entry.value.len + 32;
         self.allocator.free(entry.name);
         self.allocator.free(entry.value);
+        if (self.count == 0) self.head = 0;
     }
 
-    /// Gets an entry by index (0-based within the dynamic table).
+    /// Gets an entry by index (0-based within the dynamic table, newest first).
     pub fn get(self: *const Self, index: usize) ?StaticTable.Entry {
-        if (index >= self.entries.items.len) return null;
-        const entry = self.entries.items[index];
+        if (index >= self.count) return null;
+        const entry = self.buf[(self.head + index) % self.buf.len];
         return .{ .name = entry.name, .value = entry.value };
     }
 
     /// Updates the maximum size and evicts entries if needed.
     pub fn setMaxSize(self: *Self, new_max: usize) void {
         self.max_size = new_max;
-        while (self.current_size > self.max_size and self.entries.items.len > 0) {
+        while (self.current_size > self.max_size and self.count > 0) {
             self.evictOne();
         }
     }
 
     pub fn len(self: *const Self) usize {
-        return self.entries.items.len;
+        return self.count;
     }
 };
 
@@ -276,25 +337,43 @@ pub fn decodeInteger(data: []const u8, prefix_bits: u4) !struct { value: u64, le
     return error.UnexpectedEof;
 }
 
-/// Encodes a string (with optional Huffman encoding).
+/// Encodes a string (with optional Huffman encoding), writing directly into
+/// `out` without allocating a temporary Huffman buffer.
 pub fn encodeString(str: []const u8, use_huffman: bool, allocator: Allocator, out: *std.ArrayList(u8)) !void {
     if (use_huffman) {
-        const encoded = try HuffmanCodec.encode(str, allocator);
-        defer allocator.free(encoded);
-
-        // Length with H bit set.
-        var len_buf: [10]u8 = undefined;
-        const len_bytes = try encodeInteger(encoded.len, 7, &len_buf);
-        len_buf[0] |= 0x80; // Set Huffman flag.
-        try out.appendSlice(allocator, len_buf[0..len_bytes]);
-        try out.appendSlice(allocator, encoded);
+        try encodeStringHuffman(str, huffmanLen(str), allocator, out);
     } else {
-        // Length without H bit.
-        var len_buf: [10]u8 = undefined;
-        const len_bytes = try encodeInteger(str.len, 7, &len_buf);
-        try out.appendSlice(allocator, len_buf[0..len_bytes]);
-        try out.appendSlice(allocator, str);
+        try encodeStringRaw(str, allocator, out);
     }
+}
+
+/// Encodes a string using Huffman iff strictly shorter than raw (RFC 7541 §5.2),
+/// computing `huffmanLen` once and writing directly into `out`.
+pub fn encodeStringShortest(str: []const u8, allocator: Allocator, out: *std.ArrayList(u8)) !void {
+    const hlen = huffmanLen(str);
+    if (hlen < str.len) {
+        try encodeStringHuffman(str, hlen, allocator, out);
+    } else {
+        try encodeStringRaw(str, allocator, out);
+    }
+}
+
+fn encodeStringRaw(str: []const u8, allocator: Allocator, out: *std.ArrayList(u8)) !void {
+    var len_buf: [10]u8 = undefined;
+    const len_bytes = try encodeInteger(str.len, 7, &len_buf);
+    try out.ensureUnusedCapacity(allocator, len_bytes + str.len);
+    out.appendSliceAssumeCapacity(len_buf[0..len_bytes]);
+    out.appendSliceAssumeCapacity(str);
+}
+
+fn encodeStringHuffman(str: []const u8, hlen: usize, allocator: Allocator, out: *std.ArrayList(u8)) !void {
+    var len_buf: [10]u8 = undefined;
+    const len_bytes = try encodeInteger(hlen, 7, &len_buf);
+    len_buf[0] |= 0x80; // Set Huffman flag.
+    try out.ensureUnusedCapacity(allocator, len_bytes + hlen);
+    out.appendSliceAssumeCapacity(len_buf[0..len_bytes]);
+    const dst = out.addManyAsSliceAssumeCapacity(hlen);
+    HuffmanCodec.encodeInto(str, dst);
 }
 
 /// Decodes a string (handles Huffman encoding automatically).
@@ -383,13 +462,12 @@ pub const HuffmanCodec = struct {
         26, 27, 26, 26, 27, 27, 27, 27, 27, 28, 27, 27, 27, 27, 27, 26,
     };
 
-    /// Encodes data using Huffman coding.
-    pub fn encode(data: []const u8, allocator: Allocator) ![]u8 {
-        var result = std.ArrayList(u8).empty;
-        errdefer result.deinit(allocator);
-
+    /// Encodes `data` into `out`, which MUST have exact length `huffmanLen(data)`.
+    /// Writes directly with zero heap allocations.
+    pub fn encodeInto(data: []const u8, out: []u8) void {
         var bit_buffer: u64 = 0;
         var bit_count: u6 = 0;
+        var pos: usize = 0;
 
         for (data) |byte| {
             const code = codes[byte];
@@ -400,7 +478,8 @@ pub const HuffmanCodec = struct {
 
             while (bit_count >= 8) {
                 bit_count -= 8;
-                try result.append(allocator, @intCast((bit_buffer >> bit_count) & 0xFF));
+                out[pos] = @intCast((bit_buffer >> bit_count) & 0xFF);
+                pos += 1;
             }
         }
 
@@ -408,10 +487,17 @@ pub const HuffmanCodec = struct {
         if (bit_count > 0) {
             const pad_bits: u6 = 8 - bit_count;
             bit_buffer = (bit_buffer << pad_bits) | ((@as(u64, 1) << pad_bits) - 1);
-            try result.append(allocator, @intCast(bit_buffer & 0xFF));
+            out[pos] = @intCast(bit_buffer & 0xFF);
+            pos += 1;
         }
+        std.debug.assert(pos == out.len);
+    }
 
-        return result.toOwnedSlice(allocator);
+    /// Encodes data using Huffman coding.
+    pub fn encode(data: []const u8, allocator: Allocator) ![]u8 {
+        const out = try allocator.alloc(u8, huffmanLen(data));
+        encodeInto(data, out);
+        return out;
     }
 
     /// Decodes a symbol for a given top-8-bit window when the shortest matching

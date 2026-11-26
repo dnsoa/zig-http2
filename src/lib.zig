@@ -48,6 +48,7 @@ pub const Config = server_mod.Config;
 pub const serveConn = server_mod.serveConn;
 
 pub const Client = client_mod.Client;
+pub const ClientConfig = client_mod.Config;
 pub const Stream = client_mod.Stream;
 pub const RequestHead = client_mod.RequestHead;
 pub const Event = client_mod.Event;

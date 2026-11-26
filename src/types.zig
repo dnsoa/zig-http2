@@ -49,6 +49,10 @@ pub const Sink = struct {
         writeBody: *const fn (ctx: *anyopaque, res: *Response, bytes: []const u8) anyerror!void,
         /// Flush/terminate the response (final chunk, END_STREAM, etc.).
         finish: *const fn (ctx: *anyopaque, res: *Response) anyerror!void,
+        /// Optional coalesced fast path: emit the response head, complete body
+        /// (may be empty), and END_STREAM together in as few flushes as possible.
+        /// Falls back to `sendHead` + `writeBody` + `finish` when null.
+        sendComplete: ?*const fn (ctx: *anyopaque, res: *Response, body: []const u8) anyerror!void = null,
     };
 };
 
@@ -118,15 +122,35 @@ pub const Response = struct {
     }
 
     /// Convenience: send a complete response body with a known length.
+    /// Uses the sink's coalesced `sendComplete` fast path when available so
+    /// HEADERS + final DATA(END_STREAM) (or HEADERS(END_STREAM) when empty)
+    /// are flushed together.
     pub fn send(self: *Response, code: u16, content_type: []const u8, body: []const u8) !void {
         self.status(code);
         try self.header("content-type", content_type);
         self.setContentLength(body.len);
+        if (!self.head_sent and !self.finished and self.trailers.items.len == 0) {
+            if (self.sink.vtable.sendComplete) |send_complete| {
+                self.body_bytes += body.len;
+                try send_complete(self.sink.ctx, self, body);
+                self.head_sent = true;
+                self.finished = true;
+                return;
+            }
+        }
         try self.write(body);
     }
 
     pub fn finish(self: *Response) !void {
         if (self.finished) return;
+        if (!self.head_sent and self.trailers.items.len == 0) {
+            if (self.sink.vtable.sendComplete) |send_complete| {
+                try send_complete(self.sink.ctx, self, "");
+                self.head_sent = true;
+                self.finished = true;
+                return;
+            }
+        }
         try self.ensureHead();
         try self.sink.vtable.finish(self.sink.ctx, self);
         self.finished = true;
