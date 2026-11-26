@@ -1,4 +1,4 @@
-//! Shared HTTP/2 wire primitives (RFC 7540): the connection preface, frame
+//! Shared HTTP/2 wire primitives (RFC 9113): the connection preface, frame
 //! types/flags, error codes, SETTINGS identifiers, and 9-byte frame-header
 //! encode/decode. Both the server (`server.zig`) and the client (`client.zig`)
 //! build on these, so the framing stays defined once.

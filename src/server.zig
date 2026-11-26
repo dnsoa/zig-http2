@@ -1,4 +1,4 @@
-//! HTTP/2 server (RFC 7540) over an already-established transport, reached when
+//! HTTP/2 server (RFC 9113) over an already-established transport, reached when
 //! ALPN negotiates "h2" (or directly over any duplex stream). Transport-agnostic:
 //! the caller hands us `*std.Io.Reader`/`*std.Io.Writer` (TLS-wrapped for real
 //! connections, or a plain socketpair in tests). Cleartext h2c is not specially
@@ -146,7 +146,7 @@ pub const Server = struct {
 const TimedOp = union(enum) { work: anyerror!void, timer: void };
 
 fn timerThunk(io: Io, ms: u64) void {
-    Io.sleep(io, .{ .nanoseconds = @intCast(ms * std.time.ns_per_ms) }, .awake) catch {};
+    Io.sleep(io, .{ .nanoseconds = @as(i96, ms) * std.time.ns_per_ms }, .awake) catch {};
 }
 
 /// Runs blocking `f(args...)` (must return anyerror!void) raced against a `ms`
@@ -948,6 +948,8 @@ const Connection = struct {
 
     fn sendOurSettings(self: *Connection) !void {
         const cfg = self.srv.config;
+        const cwnd = clampConnWindow(cfg.connection_window_size);
+        self.conn_recv_window = cwnd;
         var p: [36]u8 = undefined; // 6 entries * 6 bytes
         putSetting(p[0..6], set_enable_push, 0);
         putSetting(p[6..12], set_max_concurrent_streams, cfg.max_concurrent_streams);
@@ -955,7 +957,27 @@ const Connection = struct {
         putSetting(p[18..24], set_max_frame_size, effectiveMaxFrameSize(cfg));
         putSetting(p[24..30], set_initial_window_size, clampInitialWindow(cfg.initial_window_size));
         putSetting(p[30..36], set_max_header_list_size, @intCast(self.decoder.max_list_size));
-        try self.cw.frame(.settings, 0, 0, &p);
+
+        // Coalesce initial SETTINGS + stream-0 WINDOW_UPDATE into a single lock + flush.
+        self.cw.lock();
+        defer self.cw.unlock();
+        if (self.cw.broken) return error.WriteFailed;
+        self.cw.frameLocked(.settings, 0, 0, &p) catch |err| {
+            self.cw.broken = true;
+            return err;
+        };
+        if (cwnd > 65535) {
+            var wu: [4]u8 = undefined;
+            std.mem.writeInt(u32, &wu, @intCast((cwnd - 65535) & 0x7fff_ffff), .big);
+            self.cw.frameLocked(.window_update, 0, 0, &wu) catch |err| {
+                self.cw.broken = true;
+                return err;
+            };
+        }
+        self.cw.w.flush() catch |err| {
+            self.cw.broken = true;
+            return err;
+        };
     }
 
     /// Wakes any worker blocked on a flow-control window (after WINDOW_UPDATE,
@@ -1232,7 +1254,7 @@ fn drainTimerThunk(conn: *Connection) bool {
         }
         const rem_ns = dl - now;
         conn.workers_mu.unlock(conn.io);
-        Io.sleep(conn.io, .{ .nanoseconds = @intCast(rem_ns) }, .awake) catch return false;
+        Io.sleep(conn.io, .{ .nanoseconds = rem_ns }, .awake) catch return false;
         conn.workers_mu.lockUncancelable(conn.io);
         if (conn.active_workers == 0) break;
         if (nextDrainDeadlineNsLocked(conn)) |cur_dl| {
@@ -1349,12 +1371,6 @@ pub fn serveConn(srv: *Server, r: *Io.Reader, w: *Io.Writer, client_ip: ?[]const
     defer conn.deinit();
 
     conn.sendOurSettings() catch return;
-    {
-        // Enlarge the connection-level receive window past the RFC 65535 floor.
-        const cwnd = clampConnWindow(srv.config.connection_window_size);
-        conn.conn_recv_window = cwnd;
-        if (cwnd > 65535) sendWindowUpdate(&conn, 0, cwnd - 65535);
-    }
     const graceful = readLoop(&conn, r);
     conn.drainWorkers(graceful);
 }
@@ -1553,6 +1569,7 @@ fn applyInitialWindow(conn: *Connection, new_iw: u32) bool {
         defer conn.send_mu.unlock(conn.io);
         var it = conn.streams.valueIterator();
         while (it.next()) |st| {
+            if (st.*.reset.load(.acquire)) continue;
             // Each window is <= 2^31-1 and |delta| < 2^31, so the sum cannot
             // overflow i64; a result over 2^31-1 is the illegal state itself.
             st.*.send_window += delta;
@@ -1614,12 +1631,14 @@ fn handleWindowUpdate(conn: *Connection, fh: ParsedHeader, payload: []const u8) 
                     conn.send_window += incr;
                 }
             } else if (conn.streams.get(fh.sid)) |st| {
-                if (st.send_window + incr > 0x7fff_ffff) {
-                    st.reset.store(true, .release);
-                    overflow_st = st;
-                    stream_overflow = true;
-                } else {
-                    st.send_window += incr;
+                if (!st.reset.load(.acquire)) {
+                    if (st.send_window + incr > 0x7fff_ffff) {
+                        st.reset.store(true, .release);
+                        overflow_st = st;
+                        stream_overflow = true;
+                    } else {
+                        st.send_window += incr;
+                    }
                 }
             }
             conn.send_cond.broadcast(conn.io);
@@ -1746,6 +1765,28 @@ fn handleData(conn: *Connection, fh: ParsedHeader, payload: []const u8) bool {
     };
     s.rx_mu.lockUncancelable(conn.io);
     const fc_len: i64 = @intCast(payload.len);
+    if (s.reset.load(.acquire)) {
+        // Stream was already reset (e.g. peer RST_STREAM or earlier stream error)
+        // while its worker is still unwinding: discard DATA without buffering,
+        // return connection-level flow-control credit immediately, and keep
+        // empty-DATA flood accounting active.
+        s.rx_mu.unlock(conn.io);
+        conn.streams_mu.unlock(conn.io);
+        if (fc_len > 0) {
+            const dc = creditConnEx(conn, fc_len, true);
+            if (dc > 0) sendWindowUpdate(conn, 0, dc);
+        }
+        if (data.len == 0 and !end_stream) {
+            const now_ns = Io.Timestamp.now(conn.io, .awake).nanoseconds;
+            if (conn.flood.recordEmptyData(now_ns, conn.srv.config)) {
+                sendGoaway(conn, .enhance_your_calm);
+                return false;
+            }
+        } else {
+            conn.flood.resetEmptyData();
+        }
+        return true;
+    }
     if (s.rx_eof) {
         // Already half-closed(remote) (END_STREAM seen): RFC 7540 §5.1 requires
         // RST_STREAM(STREAM_CLOSED) rather than buffering unread DATA. Return
@@ -2015,7 +2056,6 @@ fn handleHeaders(conn: *Connection, r: *Io.Reader, fh: ParsedHeader, first: []co
     if (count >= conn.srv.config.max_concurrent_streams) {
         return refuseStream(conn, fh.sid, block.items, .refused_stream);
     }
-    conn.last_stream_id = fh.sid;
 
     // Build the stream (owns its request arena). Decode happens on this (reader)
     // thread so the HPACK decoder stays single-threaded.
@@ -2035,6 +2075,7 @@ fn handleHeaders(conn: *Connection, r: *Io.Reader, fh: ParsedHeader, first: []co
         sendGoaway(conn, if (err == error.OutOfMemory) .internal_error else .compression_error);
         return error.ProtocolError;
     };
+    conn.last_stream_id = fh.sid;
     st.req = buildRequest(arena, decoded) catch |err| {
         st.arena_state.deinit();
         gpa.destroy(st);
@@ -2054,6 +2095,9 @@ fn handleHeaders(conn: *Connection, r: *Io.Reader, fh: ParsedHeader, first: []co
                 return;
             }
         }
+        st.rx_eof = true;
+    } else {
+        st.has_body = true;
     }
 
     conn.streams_mu.lockUncancelable(conn.io);
@@ -2069,10 +2113,7 @@ fn handleHeaders(conn: *Connection, r: *Io.Reader, fh: ParsedHeader, first: []co
 
     // Dispatch the worker as soon as headers decode. The request body (if any)
     // streams to the handler through `ctx.body_reader`; a bodyless request
-    // (END_STREAM on HEADERS) has no DATA coming, so preset rx EOF and the
-    // reader returns 0 immediately. Setting these here is race-free: the worker
-    // has not been spawned yet, so this thread owns `st`.
-    if (fh.flags & flag_end_stream != 0) st.rx_eof = true else st.has_body = true;
+    // (END_STREAM on HEADERS) has `rx_eof` preset so the reader returns 0.
     spawnWorker(conn, st);
 }
 
@@ -2141,6 +2182,12 @@ fn handleTrailingHeaders(conn: *Connection, fh: ParsedHeader, block: []const u8)
         return;
     };
     s.rx_mu.lockUncancelable(conn.io);
+    if (s.reset.load(.acquire)) {
+        // Already reset while worker is unwinding; HPACK was decoded above.
+        s.rx_mu.unlock(conn.io);
+        conn.streams_mu.unlock(conn.io);
+        return;
+    }
     // Already half-closed (END_STREAM seen) → HEADERS after end is STREAM_CLOSED;
     // otherwise bad trailers or content-length mismatch → protocol_error.
     const cl_bad = if (s.req.content_length) |cl| s.rx_body_bytes != cl else false;
@@ -6764,4 +6811,106 @@ test "server flushes sub-threshold connection recv credit when a stream complete
         }
     }
     try testing.expectEqual(@as(u32, 20480), conn_wu);
+}
+
+test "runTimed handles huge millisecond timeout without u64 multiplication overflow" {
+    const Noop = struct {
+        fn work() anyerror!void {}
+    };
+    // Exceeds maxInt(u64) / ns_per_ms (~1.84e13); previously panicked in timerThunk.
+    try runTimed(testing.io, std.math.maxInt(u64) / 2, Noop.work, .{});
+}
+
+test "server discards DATA, trailers, and WINDOW_UPDATE on an already-reset stream still unwinding" {
+    const NoopHandler = struct {
+        fn handle(_: *types.Context) anyerror!void {}
+    };
+    const fds = try newSocketPair();
+    defer _ = c.close(fds[0]);
+    defer _ = c.close(fds[1]);
+
+    var wbuf: [4096]u8 = undefined;
+    var rbuf: [4096]u8 = undefined;
+    var writer = peerStream(fds[0]).writer(testing.io, &wbuf);
+    var reader = peerStream(fds[1]).reader(testing.io, &rbuf);
+
+    var srv: Server = .{
+        .io = testing.io,
+        .gpa = testing.allocator,
+        .handler = NoopHandler.handle,
+        .config = .{ .max_empty_data_frames = 2 },
+    };
+    var conn: Connection = .{
+        .srv = &srv,
+        .gpa = testing.allocator,
+        .io = testing.io,
+        .cw = .{ .io = testing.io, .w = &writer.interface },
+        .decoder = hpack.Decoder.init(testing.allocator, our_header_table_size),
+        .highest_stream_id = 1,
+        .conn_recv_window = 1 << 20,
+    };
+    defer conn.deinit();
+
+    const st = try testing.allocator.create(H2Stream);
+    defer {
+        st.rx_buf.deinit(testing.allocator);
+        st.arena_state.deinit();
+        testing.allocator.destroy(st);
+    }
+    st.* = .{
+        .conn = &conn,
+        .id = 1,
+        .arena_state = std.heap.ArenaAllocator.init(testing.allocator),
+        .req = .{
+            .method = "POST",
+            .target = "/",
+            .minor_version = 0,
+            .headers = &.{},
+            .content_length = null,
+            .keep_alive = true,
+        },
+        .send_window = 0x7fff_ffff,
+        .recv_window = 65535,
+        .reset = .init(true),
+    };
+    try conn.streams.put(testing.allocator, 1, st);
+
+    // 1. DATA on the already-reset stream must NOT buffer into rx_buf or shrink
+    //    st.recv_window, and MUST immediately return connection window credit.
+    var body: [1024]u8 = @splat('x');
+    try testing.expect(handleData(&conn, .{ .length = body.len, .ftype = .data, .flags = 0, .sid = 1 }, &body));
+    try testing.expectEqual(@as(usize, 0), st.rx_buf.len);
+    try testing.expectEqual(@as(i64, 65535), st.recv_window);
+    try testing.expectEqual(@as(i64, 1 << 20), conn.conn_recv_window);
+    var wu = try readFrameAlloc(testing.allocator, &reader.interface);
+    defer wu.deinit(testing.allocator);
+    try testing.expectEqual(FrameType.window_update, wu.header.ftype);
+    try testing.expectEqual(@as(u31, 0), wu.header.sid);
+    try testing.expectEqual(@as(u32, 1024), std.mem.readInt(u32, wu.payload[0..4], .big) & 0x7fff_ffff);
+
+    // 2. Trailing HEADERS on the already-reset stream must advance HPACK without
+    //    setting rx_eof or emitting another RST_STREAM.
+    var trailer_block: std.ArrayList(u8) = .empty;
+    defer trailer_block.deinit(testing.allocator);
+    try hpack.Encoder.encodeTrailers(testing.allocator, &trailer_block, &.{.{ .name = "x-tr", .value = "1" }});
+    try handleTrailingHeaders(&conn, .{ .length = @intCast(trailer_block.items.len), .ftype = .headers, .flags = flag_end_headers | flag_end_stream, .sid = 1 }, trailer_block.items);
+    try testing.expect(!st.rx_eof);
+
+    // 3. WINDOW_UPDATE and SETTINGS_INITIAL_WINDOW_SIZE ignore the already-reset
+    //    stream (no false overflow on its max send_window).
+    var wu_payload: [4]u8 = undefined;
+    std.mem.writeInt(u32, &wu_payload, 100, .big);
+    try testing.expect(handleWindowUpdate(&conn, .{ .length = 4, .ftype = .window_update, .flags = 0, .sid = 1 }, &wu_payload));
+    try testing.expectEqual(@as(i64, 0x7fff_ffff), st.send_window);
+    try testing.expect(applyInitialWindow(&conn, 65536));
+    try testing.expectEqual(@as(i64, 0x7fff_ffff), st.send_window);
+
+    // 4. Empty DATA flood on an already-reset stream still trips ENHANCE_YOUR_CALM.
+    try testing.expect(handleData(&conn, .{ .length = 0, .ftype = .data, .flags = 0, .sid = 1 }, ""));
+    try testing.expect(handleData(&conn, .{ .length = 0, .ftype = .data, .flags = 0, .sid = 1 }, ""));
+    try testing.expect(!handleData(&conn, .{ .length = 0, .ftype = .data, .flags = 0, .sid = 1 }, ""));
+    var ga = try readFrameAlloc(testing.allocator, &reader.interface);
+    defer ga.deinit(testing.allocator);
+    try testing.expectEqual(FrameType.goaway, ga.header.ftype);
+    try testing.expectEqual(@backingInt(ErrorCode.enhance_your_calm), std.mem.readInt(u32, ga.payload[4..8], .big));
 }

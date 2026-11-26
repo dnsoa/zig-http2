@@ -12,11 +12,13 @@
 //!   try c.init(io, gpa, &reader, &writer);
 //!   defer c.deinit();
 //!   const s = try c.openStream(.{ .path = "/svc/Echo" }, false);
+//!   defer s.close();
 //!   try s.send("ping", true);
 //!   switch (try s.readEvent(arena)) { .headers => ..., .data => ..., ... }
 //!   ```
-//! `deinit` stops the reader; close the transport around it so the reader's
-//! blocking read returns. Keepalive (optional) detects half-open peers.
+//! `deinit` stops the reader (cancelling any in-flight read on concurrent
+//! `std.Io` backends; close the transport as well for non-concurrent fallback
+//! and prompt peer teardown). Keepalive (optional) detects half-open peers.
 
 const std = @import("std");
 const Io = std.Io;
@@ -563,13 +565,11 @@ pub const Client = struct {
     /// Releases the client: stops the reader thread, waits for in-flight
     /// readEvent/send to drain, then frees all streams.
     ///
-    /// ⚠️ The reader thread blocks in an I/O read on `r`; `dead`+broadcast wake
-    /// cond-waiters but NOT an I/O-blocked read. So the reader only exits when
-    /// that read returns — i.e. when the **transport is closed** (EOF/error) or
-    /// keepalive PINGs periodically wake it. **The caller must close the
-    /// transport around `deinit`** (e.g. close the socket for `connectTcp`, or
-    /// the custom Reader's underlying fd for `Channel.init`). Without this,
-    /// `reader_thread.join` blocks indefinitely on a persistent connection.
+    /// On concurrent `std.Io` backends, `deinit` wakes the reader watcher and
+    /// cancels the in-flight `readVec` so `reader_thread.join` returns promptly
+    /// even if the peer is silent. On non-concurrent backends (or custom
+    /// readers that do not observe cancellation), the caller must still close
+    /// the underlying transport so the blocking read returns.
     pub fn deinit(self: *Client) void {
         // Tell the reader to stop and wake it + any blocked senders/readers so
         // they observe `dead` and return promptly.
@@ -1182,12 +1182,20 @@ pub const Client = struct {
                         s.recv_window += @as(i64, fc_cost); // nothing delivered: no stream credit owed
                         rst = .flow_control_error;
                     } else {
-                        s.rx_body_bytes += bytes.len;
-                        if (s.resp_content_length) |cl| {
-                            if (s.rx_body_bytes > cl or (end_stream and s.rx_body_bytes != cl)) {
-                                s.recv_window += @as(i64, fc_cost);
-                                rst = .protocol_error;
+                        if (std.math.add(u64, s.rx_body_bytes, bytes.len)) |new_total| {
+                            if (s.resp_content_length) |cl| {
+                                if (new_total > cl or (end_stream and new_total != cl)) {
+                                    s.recv_window += @as(i64, fc_cost);
+                                    rst = .protocol_error;
+                                } else {
+                                    s.rx_body_bytes = new_total;
+                                }
+                            } else {
+                                s.rx_body_bytes = new_total;
                             }
+                        } else |_| {
+                            s.recv_window += @as(i64, fc_cost);
+                            rst = .protocol_error;
                         }
                     }
                 }
@@ -1526,6 +1534,7 @@ pub const Client = struct {
             if (delta != 0) {
                 var it = self.streams.valueIterator();
                 while (it.next()) |s| {
+                    if (s.*.aborted.load(.acquire)) continue;
                     // Each window is <= 2^31-1 and |delta| < 2^31, so the sum
                     // cannot overflow i64; a result over 2^31-1 is the illegal
                     // state itself.
@@ -1608,6 +1617,9 @@ pub const Client = struct {
                 const ka_to = self.keepalive_timeout_ms.load(.acquire);
                 if (ka_time == 0) {
                     prev_ka_time = 0;
+                    // Drop any stale outstanding-PING state from before disable
+                    // so re-enabling keepalive later starts a fresh idle window.
+                    self.ping_outstanding.store(false, .release);
                     while (!self.dead.load(.acquire) and self.ka_gen == seen_gen) {
                         self.wake_cond.wait(self.io, &self.wake_mu) catch return .canceled;
                     }
@@ -5286,4 +5298,60 @@ test "waitReadChunk prioritizes real transport read errors over concurrent dead 
         defer client.dec.deinit();
         try testing.expectError(error.EndOfStream, client.waitReadChunk(&dst, false, now));
     }
+}
+
+test "setKeepalive(0, 0) clears stale ping_outstanding before later re-enable" {
+    var fds: [2]c_int = undefined;
+    if (std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds) != 0) return error.SocketPairFailed;
+    defer _ = std.c.close(fds[0]);
+    defer _ = std.c.close(fds[1]);
+
+    const c_stream: net.Stream = .{ .socket = .{
+        .handle = fds[0],
+        .address = net.IpAddress.parse("127.0.0.1", 0) catch unreachable,
+    } };
+    const s_stream: net.Stream = .{ .socket = .{
+        .handle = fds[1],
+        .address = net.IpAddress.parse("127.0.0.1", 0) catch unreachable,
+    } };
+    var crbuf: [4096]u8 = undefined;
+    var cwbuf: [4096]u8 = undefined;
+    var srbuf: [4096]u8 = undefined;
+    var swbuf: [4096]u8 = undefined;
+    var cr = c_stream.reader(testing.io, &crbuf);
+    var cw = c_stream.writer(testing.io, &cwbuf);
+    var sr = s_stream.reader(testing.io, &srbuf);
+    var sw = s_stream.writer(testing.io, &swbuf);
+
+    var client: Client = undefined;
+    try client.initWithConfig(testing.io, testing.allocator, &cr.interface, &cw.interface, .{
+        .keepalive_time_ms = 40,
+        .keepalive_timeout_ms = 2_000,
+    });
+    defer client.deinit();
+
+    // Complete server handshake (preface + SETTINGS) and wait for keepalive PING
+    // without replying, so `ping_outstanding` becomes true.
+    try ctHandshake(&sr.interface, &sw.interface);
+    while (true) {
+        var f = try ctRead(testing.allocator, &sr.interface);
+        const is_ping = f.hdr.ftype == .ping and (f.hdr.flags & p2.flag_ack == 0);
+        f.deinit(testing.allocator);
+        if (is_ping) break;
+    }
+    try testing.expect(client.ping_outstanding.load(.acquire));
+
+    // Disable keepalive; watcher must clear ping_outstanding.
+    client.setKeepalive(0, 0);
+    var waited: usize = 0;
+    while (client.ping_outstanding.load(.acquire) and waited < 200) : (waited += 1) {
+        Io.sleep(testing.io, .{ .nanoseconds = 2 * std.time.ns_per_ms }, .awake) catch {};
+    }
+    try testing.expect(!client.ping_outstanding.load(.acquire));
+
+    // Re-enable with a long idle cadence (5s) and tiny timeout (20ms): if
+    // ping_outstanding had stayed true, the connection would die in ~20ms.
+    client.setKeepalive(5_000, 20);
+    Io.sleep(testing.io, .{ .nanoseconds = 80 * std.time.ns_per_ms }, .awake) catch {};
+    try testing.expect(!client.dead.load(.acquire));
 }

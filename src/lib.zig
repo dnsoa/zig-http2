@@ -1,5 +1,5 @@
-//! zig-http2 — a dependency-free HTTP/2 (RFC 7540) server and client for Zig
-//! 0.16's `std.Io` model. Transport-agnostic: callers supply any
+//! zig-http2 — a dependency-free HTTP/2 (RFC 9113) server and client for Zig
+//! 0.17's `std.Io` model. Transport-agnostic: callers supply any
 //! `*std.Io.Reader`/`*std.Io.Writer` pair (e.g. a TLS-wrapped socket).
 //!
 //! Quick start:
@@ -18,6 +18,7 @@
 //!   try c.init(io, gpa, &reader, &writer);
 //!   defer c.deinit();
 //!   const s = try c.openStream(.{ .path = "/svc/Echo" }, false);
+//!   defer s.close();
 //!   try s.send("ping", true);
 //!   // s.readEvent(arena) yields .headers / .data / .rst / .goaway
 //!   ```

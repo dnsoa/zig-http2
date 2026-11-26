@@ -72,6 +72,7 @@ pub fn main(init: std.process.Init) !void {
     defer client.deinit();
 
     const stream = try client.openStream(.{ .path = "/echo", .method = "POST" }, false);
+    defer stream.close();
     try stream.send("hello over h2", true);
 
     var arena_state = std.heap.ArenaAllocator.init(gpa);

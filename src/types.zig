@@ -110,6 +110,7 @@ pub const Response = struct {
 
     /// Writes a body chunk, streaming it to the client immediately.
     pub fn write(self: *Response, bytes: []const u8) !void {
+        if (self.finished) return error.ResponseFinished;
         try self.ensureHead();
         if (bytes.len == 0) return;
         self.body_bytes += bytes.len;
@@ -126,10 +127,11 @@ pub const Response = struct {
     /// HEADERS + final DATA(END_STREAM) (or HEADERS(END_STREAM) when empty)
     /// are flushed together.
     pub fn send(self: *Response, code: u16, content_type: []const u8, body: []const u8) !void {
+        if (self.finished) return error.ResponseFinished;
         self.status(code);
         try self.header("content-type", content_type);
         self.setContentLength(body.len);
-        if (!self.head_sent and !self.finished and self.trailers.items.len == 0) {
+        if (!self.head_sent and self.trailers.items.len == 0) {
             if (self.sink.vtable.sendComplete) |send_complete| {
                 self.body_bytes += body.len;
                 try send_complete(self.sink.ctx, self, body);
@@ -243,4 +245,43 @@ test "Context.setDeadlineIn handles u64 values above maxInt(i64) without panicki
     ctx.setDeadlineIn(big_ns);
     try std.testing.expect(cap.seen != null);
     try std.testing.expect(cap.seen.?.nanoseconds >= @as(i96, big_ns));
+}
+
+test "Response.write and Response.send reject writes after finish()" {
+    const DummySink = struct {
+        heads: usize = 0,
+        writes: usize = 0,
+        finishes: usize = 0,
+        fn sendHead(ctx: *anyopaque, _: *Response) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.heads += 1;
+        }
+        fn writeBody(ctx: *anyopaque, _: *Response, _: []const u8) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.writes += 1;
+        }
+        fn finish(ctx: *anyopaque, _: *Response) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.finishes += 1;
+        }
+    };
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var ds: DummySink = .{};
+    const vtable: Sink.Vtable = .{
+        .sendHead = DummySink.sendHead,
+        .writeBody = DummySink.writeBody,
+        .finish = DummySink.finish,
+    };
+    var res: Response = .{
+        .arena = arena_state.allocator(),
+        .sink = .{ .ctx = &ds, .vtable = &vtable },
+    };
+    try res.write("hello");
+    try res.finish();
+    try std.testing.expectError(error.ResponseFinished, res.write("late"));
+    try std.testing.expectError(error.ResponseFinished, res.send(200, "text/plain", "late"));
+    try std.testing.expectEqual(@as(usize, 1), ds.heads);
+    try std.testing.expectEqual(@as(usize, 1), ds.writes);
+    try std.testing.expectEqual(@as(usize, 1), ds.finishes);
 }

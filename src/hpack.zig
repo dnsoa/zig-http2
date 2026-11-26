@@ -146,7 +146,7 @@ pub const Decoder = struct {
     /// decoded-list total and rejects the block once it exceeds `max_list_size`
     /// — the guard against HPACK decompression bombs.
     fn account(self: *const Decoder, list_size: *usize, name: []const u8, value: []const u8) Error!void {
-        list_size.* += name.len + value.len + 32;
+        list_size.* = list_size.* +| name.len +| value.len +| 32;
         if (self.max_list_size != 0 and list_size.* > self.max_list_size) return Error.HeaderListTooLarge;
     }
 
