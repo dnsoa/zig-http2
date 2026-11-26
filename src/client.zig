@@ -206,9 +206,9 @@ pub const Stream = struct {
             const last = off + n == data.len;
             c.writeDataForStream(self, data[off .. off + n], end_stream and last) catch |err| {
                 if (err == error.StreamReset or err == error.StreamClosed) {
-                    // Frame was not written on the wire; return send credit.
+                    // Frame was not written on the wire; return both stream and connection send credit.
                     c.send_mu.lockUncancelable(c.io);
-                    if (err == error.StreamClosed) self.send_window += @as(i64, @intCast(n));
+                    self.send_window += @as(i64, @intCast(n));
                     c.conn_send_window += @as(i64, @intCast(n));
                     c.send_cond.broadcast(c.io);
                     c.send_mu.unlock(c.io);
@@ -459,14 +459,14 @@ pub const Client = struct {
 
     keepalive_time_ms: std.atomic.Value(u64) = .init(0),
     keepalive_timeout_ms: std.atomic.Value(u64) = .init(0),
-    ping_outstanding: bool = false,
+    ping_outstanding: std.atomic.Value(bool) = .init(false),
 
     dead: std.atomic.Value(bool) = .init(false),
     reader_thread: ?std.Thread = null,
     /// Reusable inbound frame payload scratch buffer (reader-thread-only, #41).
     rx_scratch: std.ArrayList(u8) = .empty,
-    /// Event-driven wakeup for the reader thread on `deinit()`/`kill()`/
-    /// `setKeepalive()` without 50 ms timer polling (#40).
+    /// Event-driven wakeup for the keepalive/teardown watcher on `deinit()`,
+    /// `kill()`, and `setKeepalive()` without 50 ms polling or live-read cancellation (#40).
     wake_mu: Io.Mutex = .init,
     wake_cond: Io.Condition = .init,
     ka_gen: u64 = 0,
@@ -479,9 +479,8 @@ pub const Client = struct {
     //   bits 31..0  : error code (u32)
     goaway_state: std.atomic.Value(u64) = .init(0),
 
-    const ReaderWake = enum { dead, reconfigured, timeout, canceled };
+    const ReaderWake = enum { dead, canceled };
     const ReadChunkOp = union(enum) { work: anyerror!usize, wake: ReaderWake };
-    const ChunkResult = union(enum) { bytes: usize, reconfigured, timeout };
 
     /// Sends the connection preface + initial SETTINGS (+ connection window
     /// enlargement) with default `Config` and starts the reader thread.
@@ -891,8 +890,10 @@ pub const Client = struct {
             self.releaseSlot(kv.value); // backstop: free the slot if not already
             kv.value.freeQueued(self.gpa);
             self.gpa.destroy(kv.value);
-            if (!self.dead.load(.acquire) and owed > 0) {
-                const conn_amt = self.creditConn(owed);
+            if (!self.dead.load(.acquire)) {
+                // Flush both unconsumed DATA and any remaining sub-threshold
+                // conn_recv_pending so closing a stream never strands peer credit.
+                const conn_amt = self.creditConn(owed, true);
                 self.writeWindowUpdates(conn_amt, 0, 0);
             }
         } else {
@@ -1149,7 +1150,7 @@ pub const Client = struct {
                 // frames, but still return the connection-level window credit
                 // deducted on arrival (RFC 7540 §6.9).
                 if (fc_cost > 0) {
-                    const conn_amt = self.creditConn(fc_cost);
+                    const conn_amt = self.creditConn(fc_cost, true);
                     self.writeWindowUpdates(conn_amt, 0, 0);
                 }
                 return;
@@ -1234,7 +1235,7 @@ pub const Client = struct {
                 // credit we grant (RFC 7540 §6.9 — conn flow control spans
                 // reset/closed streams).
                 if (fc_cost > 0) {
-                    const conn_amt = self.creditConn(fc_cost);
+                    const conn_amt = self.creditConn(fc_cost, true);
                     self.writeWindowUpdates(conn_amt, 0, 0);
                 }
                 return;
@@ -1276,22 +1277,24 @@ pub const Client = struct {
             // closed streams), or a hostile peer could leak it to zero. The
             // ledger grows with the credit granted, same as replenish.
             if (fc_cost > 0) {
-                const conn_amt = self.creditConn(fc_cost);
+                const conn_amt = self.creditConn(fc_cost, true);
                 self.writeWindowUpdates(conn_amt, 0, 0);
             }
         }
     }
 
     /// Records `amt` consumed/reclaimed connection-level bytes and returns the
-    /// stream-0 WINDOW_UPDATE increment once pending reaches half the configured
-    /// connection window (0 if below threshold).
-    fn creditConn(self: *Client, amt: u32) u32 {
-        if (amt == 0) return 0;
+    /// stream-0 WINDOW_UPDATE increment to emit. When `flush_all` is false
+    /// (stream still receiving), batches until half of `connection_window_size`;
+    /// when `flush_all` is true (stream ended or removed), flushes all pending
+    /// connection credit so sub-threshold credit is never stranded on idle.
+    fn creditConn(self: *Client, amt: u32, flush_all: bool) u32 {
         self.fc_mu.lockUncancelable(self.io);
         defer self.fc_mu.unlock(self.io);
         self.conn_recv_pending += @as(i64, amt);
+        if (self.conn_recv_pending <= 0) return 0;
         const threshold = @max(@as(i64, 1), p2.clampConnWindow(self.cfg.connection_window_size) >> 1);
-        if (self.conn_recv_pending >= threshold) {
+        if (flush_all or self.conn_recv_pending >= threshold) {
             const room: i64 = 0x7fff_ffff - self.conn_recv_window;
             const grant = @min(self.conn_recv_pending, @max(@as(i64, 0), room));
             if (grant > 0) {
@@ -1332,16 +1335,19 @@ pub const Client = struct {
     }
 
     /// Credits both the connection and the stream receive windows for `amt`
-    /// bytes of consumed DATA, batching until each window's half-window
-    /// threshold is reached and coalescing any emitted frames into one flush (#39).
+    /// bytes of consumed DATA. While the stream is still open, batches both
+    /// windows at their half-window thresholds and coalesces any emitted frames
+    /// into one flush; once the stream has ended (remote_closed/reset/gone),
+    /// skips stream WINDOW_UPDATE and flushes all pending connection credit (#39).
     fn replenish(self: *Client, sid: u31, amt: u32) void {
         if (amt == 0) return;
-        const conn_amt = self.creditConn(amt);
         var stream_amt: u32 = 0;
+        var stream_ended = true;
         self.streams_mu.lockUncancelable(self.io);
         if (self.streams.get(sid)) |s| {
             s.recv_mu.lockUncancelable(self.io);
             if (!s.remote_closed and s.reset == null and !s.cancelled and !s.goaway_refused) {
+                stream_ended = false;
                 s.recv_pending += @as(i64, amt);
                 const iw: i64 = @intCast(p2.clampInitialWindow(self.cfg.initial_window_size));
                 const threshold = @max(@as(i64, 1), iw >> 1);
@@ -1358,6 +1364,7 @@ pub const Client = struct {
             s.recv_mu.unlock(self.io);
         }
         self.streams_mu.unlock(self.io);
+        const conn_amt = self.creditConn(amt, stream_ended);
         self.writeWindowUpdates(conn_amt, sid, stream_amt);
     }
 
@@ -1579,34 +1586,91 @@ pub const Client = struct {
         }
     }
 
-    fn currentKaGen(self: *Client) u64 {
-        self.wake_mu.lockUncancelable(self.io);
-        defer self.wake_mu.unlock(self.io);
-        return self.ka_gen;
-    }
+    /// Background keepalive & teardown watcher raced alongside an in-flight
+    /// `readVec` in `waitReadChunk`. Handles `setKeepalive()` reconfigurations
+    /// and sends keepalive PING frames internally **without** returning and
+    /// **without** cancelling the live `readVec` (protecting TLS record framing,
+    /// #40). Only returns `.dead` once the connection is dead (`deinit`, `kill`,
+    /// or keepalive timeout expiry), or `.canceled` when `readVec` completes.
+    fn keepaliveAndStopWaiter(self: *Client, mid_frame: bool, initial_start_ns: i96) ReaderWake {
+        var wait_start_ns = initial_start_ns;
+        var prev_ka_time: u64 = self.keepalive_time_ms.load(.acquire);
+        while (true) {
+            var should_send_ping = false;
+            var should_kill = false;
+            {
+                self.wake_mu.lockUncancelable(self.io);
+                defer self.wake_mu.unlock(self.io);
+                if (self.dead.load(.acquire)) return .dead;
 
-    fn waitWakeOrTimeout(self: *Client, timeout_ns: ?i96, seen_gen: u64) ReaderWake {
-        self.wake_mu.lockUncancelable(self.io);
-        defer self.wake_mu.unlock(self.io);
-        while (!self.dead.load(.acquire) and self.ka_gen == seen_gen) {
-            if (timeout_ns) |ns| {
-                if (ns <= 0) return .timeout;
-                self.wake_cond.waitTimeout(self.io, &self.wake_mu, .{
-                    .duration = .{ .raw = .{ .nanoseconds = ns }, .clock = .awake },
-                }) catch |err| switch (err) {
-                    error.Timeout => return .timeout,
-                    error.Canceled => return .canceled,
+                const seen_gen = self.ka_gen;
+                const ka_time = self.keepalive_time_ms.load(.acquire);
+                const ka_to = self.keepalive_timeout_ms.load(.acquire);
+                if (ka_time == 0) {
+                    prev_ka_time = 0;
+                    while (!self.dead.load(.acquire) and self.ka_gen == seen_gen) {
+                        self.wake_cond.wait(self.io, &self.wake_mu) catch return .canceled;
+                    }
+                    if (self.dead.load(.acquire)) return .dead;
+                    continue;
+                }
+
+                if (prev_ka_time == 0) {
+                    // Keepalive was just enabled: anchor the window from now so a
+                    // connection that sat idle with keepalive disabled is not killed.
+                    wait_start_ns = Io.Timestamp.now(self.io, .awake).nanoseconds;
+                }
+                prev_ka_time = ka_time;
+
+                const stall_ms = if (ka_to != 0) ka_to else ka_time;
+                const waiting_reply = mid_frame or self.ping_outstanding.load(.acquire);
+                const target_ms: u64 = if (waiting_reply) stall_ms else ka_time;
+                const limit_ns: i96 = @as(i96, target_ms) * std.time.ns_per_ms;
+                const now_ns = Io.Timestamp.now(self.io, .awake).nanoseconds;
+                const elapsed_ns = now_ns - wait_start_ns;
+
+                if (elapsed_ns < limit_ns) {
+                    const rem_ns = limit_ns - elapsed_ns;
+                    self.wake_cond.waitTimeout(self.io, &self.wake_mu, .{
+                        .duration = .{ .raw = .{ .nanoseconds = rem_ns }, .clock = .awake },
+                    }) catch |err| switch (err) {
+                        error.Timeout => continue, // re-check deadline / handle spurious wakeups
+                        error.Canceled => return .canceled,
+                    };
+                    if (self.dead.load(.acquire)) return .dead;
+                    // Reconfigured via setKeepalive: adjust timer in place without cancelling readVec.
+                    if (self.ka_gen != seen_gen and !mid_frame and !self.ping_outstanding.load(.acquire)) {
+                        wait_start_ns = Io.Timestamp.now(self.io, .awake).nanoseconds;
+                    }
+                    continue;
+                }
+
+                if (waiting_reply) {
+                    should_kill = true;
+                } else {
+                    should_send_ping = true;
+                }
+            }
+
+            if (should_kill) {
+                self.kill();
+                return .dead;
+            }
+            if (should_send_ping) {
+                if (self.dead.load(.acquire)) return .dead;
+                const ping = @as([8]u8, @splat(0));
+                self.writeFrame(.ping, 0, 0, &ping) catch {
+                    self.kill();
+                    return .dead;
                 };
-            } else {
-                self.wake_cond.wait(self.io, &self.wake_mu) catch return .canceled;
+                self.ping_outstanding.store(true, .release);
+                wait_start_ns = Io.Timestamp.now(self.io, .awake).nanoseconds;
             }
         }
-        return if (self.dead.load(.acquire)) .dead else .reconfigured;
     }
 
-    /// Reads `dst` incrementally with event-driven teardown/reconfiguration
-    /// wakeups (no 50 ms polling loop, #40) and full keepalive stall bounding
-    /// when keepalive is enabled.
+    /// Reads `dst` incrementally while keepalive stall timeouts and teardown
+    /// are handled by `keepaliveAndStopWaiter` without cancelling live reads (#40).
     fn readBytesBounded(self: *Client, dst: []u8) !void {
         var got: usize = 0;
         var last_progress_ns: i96 = Io.Timestamp.now(self.io, .awake).nanoseconds;
@@ -1617,55 +1681,24 @@ pub const Client = struct {
                 @memcpy(dst[got..][0..take], avail[0..take]);
                 self.r.toss(take);
                 got += take;
-                self.ping_outstanding = false;
+                self.ping_outstanding.store(false, .release);
                 last_progress_ns = Io.Timestamp.now(self.io, .awake).nanoseconds;
                 continue;
             }
             if (self.dead.load(.acquire)) return error.ConnectionClosed;
-            const seen_gen = self.currentKaGen();
-            const ka_time = self.keepalive_time_ms.load(.acquire);
-            const ka_to = self.keepalive_timeout_ms.load(.acquire);
-            const stall_ms = if (ka_to != 0) ka_to else ka_time;
-            var timeout_ns: ?i96 = null;
-            if (ka_time != 0) {
-                const limit_ns: i96 = @as(i96, stall_ms) * std.time.ns_per_ms;
-                const elapsed_ns = Io.Timestamp.now(self.io, .awake).nanoseconds - last_progress_ns;
-                if (elapsed_ns >= limit_ns) {
-                    self.kill();
-                    return error.ConnectionClosed;
-                }
-                timeout_ns = limit_ns - elapsed_ns;
-            }
-            switch (try self.waitReadChunk(dst[got..], timeout_ns, seen_gen)) {
-                .bytes => |n| {
-                    if (n == 0) return error.EndOfStream;
-                    got += n;
-                    self.ping_outstanding = false;
-                    last_progress_ns = Io.Timestamp.now(self.io, .awake).nanoseconds;
-                },
-                .reconfigured => {
-                    if (self.dead.load(.acquire)) return error.ConnectionClosed;
-                    continue;
-                },
-                .timeout => {
-                    if (self.dead.load(.acquire)) return error.ConnectionClosed;
-                    if (ka_time == 0) continue;
-                    const limit_ns: i96 = @as(i96, stall_ms) * std.time.ns_per_ms;
-                    if (Io.Timestamp.now(self.io, .awake).nanoseconds - last_progress_ns >= limit_ns) {
-                        self.kill();
-                        return error.ConnectionClosed;
-                    }
-                },
-            }
+            const n = try self.waitReadChunk(dst[got..], true, last_progress_ns);
+            if (n == 0) return error.EndOfStream;
+            got += n;
+            self.ping_outstanding.store(false, .release);
+            last_progress_ns = Io.Timestamp.now(self.io, .awake).nanoseconds;
         }
-        self.ping_outstanding = false;
+        self.ping_outstanding.store(false, .release);
     }
 
-    /// Reads the next 9-byte frame header without 50 ms polling (#40): when
-    /// keepalive is disabled, blocks indefinitely until data arrives or
-    /// `deinit()`/`setKeepalive()` signals `wake_cond`; when keepalive is
-    /// enabled, sleeps the full keepalive/stall interval while still waking
-    /// instantaneously on `deinit()`.
+    /// Reads the next 9-byte frame header without 50 ms polling or live-read
+    /// cancellation (#40): `keepaliveAndStopWaiter` emits keepalive PINGs and
+    /// tracks reconfiguration in place while `readVec` stays uninterrupted;
+    /// `readVec` is only cancelled when the connection is already dead.
     fn readFrameHeader(self: *Client, hb: *[9]u8) !void {
         var got: usize = 0;
         var wait_start_ns: i96 = Io.Timestamp.now(self.io, .awake).nanoseconds;
@@ -1676,65 +1709,18 @@ pub const Client = struct {
                 @memcpy(hb[got..][0..take], avail[0..take]);
                 self.r.toss(take);
                 got += take;
-                self.ping_outstanding = false;
+                self.ping_outstanding.store(false, .release);
                 wait_start_ns = Io.Timestamp.now(self.io, .awake).nanoseconds;
                 continue;
             }
             if (self.dead.load(.acquire)) return error.ConnectionClosed;
-            const seen_gen = self.currentKaGen();
-            const ka_time = self.keepalive_time_ms.load(.acquire);
-            const ka_to = self.keepalive_timeout_ms.load(.acquire);
-            const stall_ms = if (ka_to != 0) ka_to else ka_time;
-            var timeout_ns: ?i96 = null;
-            if (ka_time != 0) {
-                const target_ms: u64 = if (got > 0 or self.ping_outstanding) stall_ms else ka_time;
-                const limit_ns: i96 = @as(i96, target_ms) * std.time.ns_per_ms;
-                const elapsed_ns = Io.Timestamp.now(self.io, .awake).nanoseconds - wait_start_ns;
-                if (elapsed_ns >= limit_ns) {
-                    if (got > 0 or self.ping_outstanding) {
-                        self.kill();
-                        return error.ConnectionClosed;
-                    }
-                    const ping = @as([8]u8, @splat(0));
-                    self.writeFrame(.ping, 0, 0, &ping) catch return error.ConnectionClosed;
-                    self.ping_outstanding = true;
-                    wait_start_ns = Io.Timestamp.now(self.io, .awake).nanoseconds;
-                    continue;
-                }
-                timeout_ns = limit_ns - elapsed_ns;
-            }
-            switch (try self.waitReadChunk(hb[got..], timeout_ns, seen_gen)) {
-                .bytes => |n| {
-                    if (n == 0) return error.EndOfStream;
-                    got += n;
-                    self.ping_outstanding = false;
-                    wait_start_ns = Io.Timestamp.now(self.io, .awake).nanoseconds;
-                },
-                .reconfigured => {
-                    if (self.dead.load(.acquire)) return error.ConnectionClosed;
-                    if (got == 0 and !self.ping_outstanding) {
-                        wait_start_ns = Io.Timestamp.now(self.io, .awake).nanoseconds;
-                    }
-                    continue;
-                },
-                .timeout => {
-                    if (self.dead.load(.acquire)) return error.ConnectionClosed;
-                    if (ka_time == 0) continue;
-                    const target_ms: u64 = if (got > 0 or self.ping_outstanding) stall_ms else ka_time;
-                    const limit_ns: i96 = @as(i96, target_ms) * std.time.ns_per_ms;
-                    if (Io.Timestamp.now(self.io, .awake).nanoseconds - wait_start_ns < limit_ns) continue;
-                    if (got > 0 or self.ping_outstanding) {
-                        self.kill();
-                        return error.ConnectionClosed;
-                    }
-                    const ping = @as([8]u8, @splat(0));
-                    self.writeFrame(.ping, 0, 0, &ping) catch return error.ConnectionClosed;
-                    self.ping_outstanding = true;
-                    wait_start_ns = Io.Timestamp.now(self.io, .awake).nanoseconds;
-                },
-            }
+            const n = try self.waitReadChunk(hb[got..], got > 0, wait_start_ns);
+            if (n == 0) return error.EndOfStream;
+            got += n;
+            self.ping_outstanding.store(false, .release);
+            wait_start_ns = Io.Timestamp.now(self.io, .awake).nanoseconds;
         }
-        self.ping_outstanding = false;
+        self.ping_outstanding.store(false, .release);
     }
 
     fn readChunkThunk(self: *Client, dst: []u8) anyerror!usize {
@@ -1742,20 +1728,20 @@ pub const Client = struct {
         return self.r.readVec(&bufs);
     }
 
-    fn waitReadChunk(self: *Client, dst: []u8, timeout_ns: ?i96, seen_gen: u64) !ChunkResult {
+    fn waitReadChunk(self: *Client, dst: []u8, mid_frame: bool, wait_start_ns: i96) !usize {
         var buf: [2]ReadChunkOp = undefined;
         var sel = Io.Select(ReadChunkOp).init(self.io, &buf);
-        // Spawn the wake/timeout waiter first so if concurrency is unavailable
-        // (or only one slot is available and `.work` fails to spawn), `.work`
-        // is never cancelled mid-flight and no read result/error is discarded.
-        sel.concurrent(.wake, waitWakeOrTimeout, .{ self, timeout_ns, seen_gen }) catch {
+        // Spawn the watcher first so if concurrency is unavailable (or only one
+        // slot is available and `.work` fails to spawn), `.work` is never
+        // cancelled mid-flight and no read result/error is discarded.
+        sel.concurrent(.wake, keepaliveAndStopWaiter, .{ self, mid_frame, wait_start_ns }) catch {
             var bufs = [_][]u8{dst};
-            return .{ .bytes = try self.r.readVec(&bufs) };
+            return self.r.readVec(&bufs);
         };
         sel.concurrent(.work, readChunkThunk, .{ self, dst }) catch {
             while (sel.cancel()) |_| {}
             var bufs = [_][]u8{dst};
-            return .{ .bytes = try self.r.readVec(&bufs) };
+            return self.r.readVec(&bufs);
         };
         const first = try sel.await();
         var got_n: ?usize = switch (first) {
@@ -1780,13 +1766,14 @@ pub const Client = struct {
                 wake_res = w;
             },
         };
-        if (got_n) |n| return .{ .bytes = n };
-        if (wake_res) |w| switch (w) {
-            .dead => return error.ConnectionClosed,
-            .reconfigured => return .reconfigured,
-            .timeout => return .timeout,
-            .canceled => {},
-        };
+        // Priority: bytes actually read > real transport read error > dead signal.
+        // `Io.Reader.readVec` wraps cancellation as `error.ReadFailed`, so treat
+        // `work_err` as a real transport error only when `.work` won `await()` or
+        // explicitly returned `EndOfStream` (which cancellation never produces).
+        if (got_n) |n| return n;
+        if (first == .work) return work_err orelse error.Canceled;
+        if (work_err) |e| if (e == error.EndOfStream) return error.EndOfStream;
+        if (wake_res == .dead) return error.ConnectionClosed;
         return work_err orelse error.Canceled;
     }
 };
@@ -5114,12 +5101,189 @@ test "idle client without keepalive does not poll every 50ms and wakes promptly 
     // Remain idle for 250 ms: old 50 ms polling loop caused ~5 extra readVec calls;
     // event-driven wakeup must cause 0 additional calls!
     Io.sleep(io, .{ .nanoseconds = 250 * std.time.ns_per_ms }, .awake) catch {};
-    const calls_after = counting.calls.load(.acquire);
-    try testing.expectEqual(calls_before, calls_after);
+    const calls_after_idle = counting.calls.load(.acquire);
+    try testing.expectEqual(calls_before, calls_after_idle);
+
+    // Enabling/reconfiguring keepalive and sending a keepalive PING must ALSO
+    // never cancel or re-invoke the live `readVec` (PR #43 review #2).
+    client.setKeepalive(60, 500);
+    Io.sleep(io, .{ .nanoseconds = 20 * std.time.ns_per_ms }, .awake) catch {};
+    client.setKeepalive(50, 500);
+    var ping_frame = try ctRead(testing.allocator, &asr.interface);
+    defer ping_frame.deinit(testing.allocator);
+    try testing.expectEqual(p2.FrameType.ping, ping_frame.hdr.ftype);
+    try testing.expectEqual(@as(u8, 0), ping_frame.hdr.flags & p2.flag_ack);
+    try testing.expectEqual(calls_before, counting.calls.load(.acquire));
+
+    // Reply with PING(ACK); the uninterrupted readVec receives it cleanly.
+    try ctWrite(&asw.interface, .ping, p2.flag_ack, 0, ping_frame.payload);
+    Io.sleep(io, .{ .nanoseconds = 30 * std.time.ns_per_ms }, .awake) catch {};
+    try testing.expect(!client.dead.load(.acquire));
 
     // deinit must still wake and join promptly without closing the socket beforehand.
     const start = Io.Timestamp.now(io, .awake).nanoseconds;
     client.deinit();
     const elapsed_ms = @divFloor(Io.Timestamp.now(io, .awake).nanoseconds - start, std.time.ns_per_ms);
     try testing.expect(elapsed_ms < 500);
+}
+
+test "client flushes sub-threshold connection credit on stream end and removeStream" {
+    const io = testing.io;
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var srv = try addr.listen(io, .{ .mode = .stream, .reuse_address = true });
+    defer srv.deinit(io);
+    const port = srv.socket.address.ip4.port;
+    const caddr = try net.IpAddress.parse("127.0.0.1", port);
+    const cstream = try caddr.connect(io, .{ .mode = .stream });
+    defer cstream.close(io);
+    var accepted = try srv.accept(io);
+    defer accepted.close(io);
+
+    var crbuf: [8192]u8 = undefined;
+    var cwbuf: [8192]u8 = undefined;
+    var csr = cstream.reader(io, &crbuf);
+    var csw = cstream.writer(io, &cwbuf);
+    var client: Client = undefined;
+    // Default 1 MiB connection window -> half-window threshold is 512 KiB.
+    try client.init(io, testing.allocator, &csr.interface, &csw.interface);
+    defer client.deinit();
+
+    var arbuf: [8192]u8 = undefined;
+    var awbuf: [65536]u8 = undefined;
+    var asr = accepted.reader(io, &arbuf);
+    var asw = accepted.writer(io, &awbuf);
+    try ctHandshake(&asr.interface, &asw.interface);
+    while (true) {
+        var f = try ctRead(testing.allocator, &asr.interface);
+        const is_ack = f.hdr.ftype == .settings and (f.hdr.flags & p2.flag_ack != 0);
+        f.deinit(testing.allocator);
+        if (is_ack) break;
+    }
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Stream 1: receive 24 KiB (< 512 KiB threshold) with END_STREAM on the 2nd frame.
+    const s1 = try client.openStream(.{ .path = "/sub-threshold" }, true);
+    var req1 = try ctRead(testing.allocator, &asr.interface);
+    req1.deinit(testing.allocator);
+    const ok200 = [_]u8{0x88};
+    try ctWrite(&asw.interface, .headers, p2.flag_end_headers, s1.id, &ok200);
+    var chunk: [12000]u8 = @splat('c');
+    try ctWrite(&asw.interface, .data, 0, s1.id, &chunk);
+    try ctWrite(&asw.interface, .data, p2.flag_end_stream, s1.id, &chunk);
+
+    _ = try s1.readEvent(arena); // headers
+    _ = try s1.readEvent(arena); // chunk 1 (stream still open -> batched)
+    _ = try s1.readEvent(arena); // chunk 2 (remote_closed -> flushes all 24000 B conn credit!)
+    s1.close();
+
+    const ping: [8]u8 = @splat(0x55);
+    try ctWrite(&asw.interface, .ping, 0, 0, &ping);
+    var conn_wu: u32 = 0;
+    var stream_wu: u32 = 0;
+    while (true) {
+        var f = try ctRead(testing.allocator, &asr.interface);
+        defer f.deinit(testing.allocator);
+        if (f.hdr.ftype == .window_update) {
+            const incr = std.mem.readInt(u32, f.payload[0..4], .big) & 0x7fff_ffff;
+            if (f.hdr.sid == 0) conn_wu += incr else stream_wu += incr;
+        }
+        if (f.hdr.ftype == .ping and (f.hdr.flags & p2.flag_ack != 0)) break;
+    }
+    try testing.expectEqual(@as(u32, 24000), conn_wu);
+    try testing.expectEqual(@as(u32, 0), stream_wu);
+
+    // Stream 3: peer sends 12000 B (not END_STREAM), caller consumes nothing and closes.
+    // `removeStream` must flush the 12000 B immediately instead of stranding it.
+    const s3 = try client.openStream(.{ .path = "/unconsumed" }, true);
+    var req3 = try ctRead(testing.allocator, &asr.interface);
+    req3.deinit(testing.allocator);
+    try ctWrite(&asw.interface, .headers, p2.flag_end_headers, s3.id, &ok200);
+    try ctWrite(&asw.interface, .data, 0, s3.id, &chunk);
+    // Fence via PING so readerLoop definitely queued the 12000 B before s3.close().
+    try ctWrite(&asw.interface, .ping, 0, 0, &ping);
+    while (true) {
+        var f = try ctRead(testing.allocator, &asr.interface);
+        const is_pong = f.hdr.ftype == .ping and (f.hdr.flags & p2.flag_ack != 0);
+        f.deinit(testing.allocator);
+        if (is_pong) break;
+    }
+    s3.close();
+
+    try ctWrite(&asw.interface, .ping, 0, 0, &ping);
+    var conn_wu2: u32 = 0;
+    while (true) {
+        var f = try ctRead(testing.allocator, &asr.interface);
+        defer f.deinit(testing.allocator);
+        if (f.hdr.ftype == .window_update and f.hdr.sid == 0) {
+            conn_wu2 += std.mem.readInt(u32, f.payload[0..4], .big) & 0x7fff_ffff;
+        }
+        if (f.hdr.ftype == .ping and (f.hdr.flags & p2.flag_ack != 0)) break;
+    }
+    try testing.expectEqual(@as(u32, 12000), conn_wu2);
+}
+
+test "waitReadChunk prioritizes real transport read errors over concurrent dead wakeup" {
+    const ErrReader = struct {
+        err: Io.Reader.Error,
+        reader: Io.Reader,
+        fn stream(r: *Io.Reader, _: *Io.Writer, _: Io.Limit) Io.Reader.StreamError!usize {
+            const self: *@This() = @fieldParentPtr("reader", r);
+            return self.err;
+        }
+        fn readVec(r: *Io.Reader, _: [][]u8) Io.Reader.Error!usize {
+            const self: *@This() = @fieldParentPtr("reader", r);
+            return self.err;
+        }
+    };
+    var dummy_w: Io.Writer = .{ .buffer = &.{}, .vtable = undefined };
+    var dst: [9]u8 = undefined;
+    const now = Io.Timestamp.now(testing.io, .awake).nanoseconds;
+
+    // Case 1: `.work` fails with ReadFailed while connection is live -> ReadFailed.
+    {
+        var fr: ErrReader = .{
+            .err = error.ReadFailed,
+            .reader = .{
+                .buffer = &.{},
+                .seek = 0,
+                .end = 0,
+                .vtable = &.{ .stream = ErrReader.stream, .readVec = ErrReader.readVec },
+            },
+        };
+        var client: Client = .{
+            .io = testing.io,
+            .gpa = testing.allocator,
+            .r = &fr.reader,
+            .w = &dummy_w,
+            .dec = hpack.Decoder.init(testing.allocator, p2.our_header_table_size),
+        };
+        defer client.dec.deinit();
+        try testing.expectError(error.ReadFailed, client.waitReadChunk(&dst, false, now));
+    }
+
+    // Case 2: `.work` returns EndOfStream even while `dead == true` -> EndOfStream wins.
+    {
+        var fr: ErrReader = .{
+            .err = error.EndOfStream,
+            .reader = .{
+                .buffer = &.{},
+                .seek = 0,
+                .end = 0,
+                .vtable = &.{ .stream = ErrReader.stream, .readVec = ErrReader.readVec },
+            },
+        };
+        var client: Client = .{
+            .io = testing.io,
+            .gpa = testing.allocator,
+            .r = &fr.reader,
+            .w = &dummy_w,
+            .dec = hpack.Decoder.init(testing.allocator, p2.our_header_table_size),
+            .dead = .init(true),
+        };
+        defer client.dec.deinit();
+        try testing.expectError(error.EndOfStream, client.waitReadChunk(&dst, false, now));
+    }
 }

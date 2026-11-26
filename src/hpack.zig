@@ -255,9 +255,15 @@ pub const Encoder = struct {
         if (authority.len > 0) try emitPseudo(arena, out, ":authority", authority);
         for (headers) |h| {
             // RFC 9113 §8.2.2: drop connection-specific headers; in requests
-            // `te` is permitted only with the exact value "trailers".
+            // `te` is permitted only with token `trailers` (HTTP/1.1 input may
+            // use mixed case or OWS — fold & normalize to lowercase "trailers").
             if (isConnectionSpecific(h.name)) continue;
-            if (std.ascii.eqlIgnoreCase(h.name, "te") and !std.mem.eql(u8, h.value, "trailers")) continue;
+            if (std.ascii.eqlIgnoreCase(h.name, "te")) {
+                const trimmed = std.mem.trim(u8, h.value, " \t");
+                if (!std.ascii.eqlIgnoreCase(trimmed, "trailers")) continue;
+                try emitField(arena, out, "te", "trailers");
+                continue;
+            }
             try emitField(arena, out, h.name, h.value);
         }
     }
@@ -825,12 +831,14 @@ test "Encoder filters te per RFC 9113 §8.2.2 and marks sensitive fields Never I
         try testing.expectEqualStrings("ok", findHeader(hs, "x-mixed-custom").?);
     }
 
-    // encodeRequest retains `te: trailers` (any case on name, exact lowercase value) and drops others.
+    // encodeRequest retains `te: trailers` (folding case & OWS and normalizing to
+    // lowercase "trailers") and drops multi-value or other transfer codings.
     {
         var out: std.ArrayList(u8) = .empty;
         const headers = [_]Header{
             .{ .name = "TE", .value = "gzip" },
             .{ .name = "te", .value = "Trailers" },
+            .{ .name = "TE", .value = " \ttrailers " },
             .{ .name = "te", .value = "trailers, deflate" },
             .{ .name = "TE", .value = "trailers" },
             .{ .name = "Authorization", .value = "Bearer tok" },
@@ -847,7 +855,7 @@ test "Encoder filters te per RFC 9113 §8.2.2 and marks sensitive fields Never I
                 te_count += 1;
             }
         }
-        try testing.expectEqual(@as(usize, 1), te_count);
+        try testing.expectEqual(@as(usize, 3), te_count);
         try testing.expectEqualStrings("Bearer tok", findHeader(hs, "authorization").?);
     }
 }
