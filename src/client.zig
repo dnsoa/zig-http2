@@ -595,6 +595,7 @@ pub const Client = struct {
     ctrl_buf: std.ArrayList(u8) = .empty,
     ctrl_drain: std.ArrayList(u8) = .empty,
     ctrl_hpack_zero: bool = false,
+    ctrl_broken: bool = false,
 
     // Send-side flow control (connection + per-stream windows live here).
     send_mu: Io.Mutex = .init,
@@ -639,7 +640,7 @@ pub const Client = struct {
     reader_thread: ?std.Thread = null,
     reader_group: Io.Group = .init,
     reader_done: Io.Event = .unset,
-    reader_group_started: bool = false,
+    reader_group_started: std.atomic.Value(bool) = .init(false),
     /// Reusable inbound frame payload scratch buffer (reader-thread-only, #41).
     rx_scratch: std.ArrayList(u8) = .empty,
     /// Event-driven wakeup for the keepalive/teardown watcher on `deinit()`,
@@ -718,12 +719,15 @@ pub const Client = struct {
         if (cfg.spawn_reader_thread) {
             self.reader_thread = std.Thread.spawn(.{}, readerLoop, .{self}) catch return error.SystemResources;
         } else {
+            // Publish `reader_group_started` BEFORE `concurrent()` spawns
+            // `readerLoop` so an instant EOF exit cannot miss setting `reader_done`.
+            self.reader_group_started.store(true, .release);
             self.reader_group.concurrent(self.io, readerLoop, .{self}) catch |err| switch (err) {
                 error.ConcurrencyUnavailable => {
+                    self.reader_group_started.store(false, .release);
                     self.reader_thread = std.Thread.spawn(.{}, readerLoop, .{self}) catch return error.SystemResources;
                 },
             };
-            if (self.reader_thread == null) self.reader_group_started = true;
         }
     }
 
@@ -788,7 +792,7 @@ pub const Client = struct {
         self.streams_mu.unlock(self.io);
         if (self.reader_thread) |t| {
             t.join();
-        } else if (self.reader_group_started) {
+        } else if (self.reader_group_started.load(.acquire)) {
             self.reader_done.waitUncancelable(self.io);
             self.reader_group.await(self.io) catch {};
         }
@@ -865,9 +869,22 @@ pub const Client = struct {
     fn markWriteBrokenLocked(self: *Client) void {
         self.write_broken = true;
         self.ctrl_mu.lockUncancelable(self.io);
+        self.ctrl_broken = true;
         self.ctrl_buf.clearRetainingCapacity();
         self.ctrl_hpack_zero = false;
         self.ctrl_mu.unlock(self.io);
+    }
+
+    fn failCtrlAllocAndUnlock(self: *Client, kill_on_err: bool) void {
+        self.ctrl_broken = true;
+        self.ctrl_buf.clearRetainingCapacity();
+        self.ctrl_hpack_zero = false;
+        self.ctrl_mu.unlock(self.io);
+        if (self.write_mu.tryLock()) {
+            self.write_broken = true;
+            self.write_mu.unlock(self.io);
+        }
+        if (kill_on_err) self.kill();
     }
 
     fn writeFrameLocked(self: *Client, ftype: p2.FrameType, flags: u8, sid: u31, payload: []const u8) !void {
@@ -921,6 +938,10 @@ pub const Client = struct {
     fn drainCtrlToBufferLocked(self: *Client) !void {
         while (true) {
             self.ctrl_mu.lockUncancelable(self.io);
+            if (self.ctrl_broken) {
+                self.ctrl_mu.unlock(self.io);
+                return error.WriteFailed;
+            }
             if (self.ctrl_buf.items.len == 0) {
                 self.ctrl_mu.unlock(self.io);
                 return;
@@ -953,6 +974,13 @@ pub const Client = struct {
         }
         while (true) {
             self.ctrl_mu.lockUncancelable(self.io);
+            if (self.ctrl_broken) {
+                self.ctrl_mu.unlock(self.io);
+                self.markWriteBrokenLocked();
+                self.write_mu.unlock(self.io);
+                if (kill_on_err) self.kill();
+                return error.WriteFailed;
+            }
             if (self.ctrl_buf.items.len == 0) {
                 self.write_mu.unlock(self.io);
                 self.ctrl_mu.unlock(self.io);
@@ -999,14 +1027,14 @@ pub const Client = struct {
             return self.finishWriteAndUnlock(err_opt, kill_on_err);
         }
         self.ctrl_mu.lockUncancelable(self.io);
-        if (self.write_broken) {
+        if (self.ctrl_broken) {
             self.ctrl_mu.unlock(self.io);
             return error.WriteFailed;
         }
         var hb: [9]u8 = undefined;
         p2.putHeader(&hb, payload.len, ftype, flags, sid);
         self.ctrl_buf.ensureUnusedCapacity(self.gpa, 9 + payload.len) catch |err| {
-            self.ctrl_mu.unlock(self.io);
+            self.failCtrlAllocAndUnlock(kill_on_err);
             return err;
         };
         self.ctrl_buf.appendSliceAssumeCapacity(&hb);
@@ -1028,7 +1056,7 @@ pub const Client = struct {
     }
 
     fn writeFrame(self: *Client, ftype: p2.FrameType, flags: u8, sid: u31, payload: []const u8) !void {
-        const kill_on_err = self.reader_thread != null or self.reader_group_started;
+        const kill_on_err = self.reader_thread != null or self.reader_group_started.load(.acquire);
         return self.writeControlFrame(ftype, flags, sid, payload, false, kill_on_err);
     }
 
@@ -1339,7 +1367,7 @@ pub const Client = struct {
     }
 
     fn readerLoop(self: *Client) void {
-        defer if (self.reader_group_started) self.reader_done.set(self.io);
+        defer if (self.reader_group_started.load(.acquire)) self.reader_done.set(self.io);
         var peer_settings_seen = false;
         while (!self.dead.load(.acquire)) {
             var hb: [9]u8 = undefined;
@@ -1769,7 +1797,7 @@ pub const Client = struct {
 
     fn writeWindowUpdates(self: *Client, conn_amt: u32, sid: u31, stream_amt: u32) void {
         if (conn_amt == 0 and stream_amt == 0) return;
-        const kill_on_err = self.reader_thread != null or self.reader_group_started;
+        const kill_on_err = self.reader_thread != null or self.reader_group_started.load(.acquire);
         if (self.write_mu.tryLock()) {
             if (self.write_broken) {
                 self.write_mu.unlock(self.io);
@@ -1783,29 +1811,33 @@ pub const Client = struct {
             return;
         }
         self.ctrl_mu.lockUncancelable(self.io);
-        if (self.write_broken) {
+        if (self.ctrl_broken) {
             self.ctrl_mu.unlock(self.io);
             return;
         }
         const count: usize = @as(usize, if (conn_amt > 0) 13 else 0) + @as(usize, if (stream_amt > 0) 13 else 0);
-        if (self.ctrl_buf.ensureUnusedCapacity(self.gpa, count)) |_| {
-            if (conn_amt > 0) {
-                var hb: [9]u8 = undefined;
-                var wu: [4]u8 = undefined;
-                p2.putHeader(&hb, 4, .window_update, 0, 0);
-                std.mem.writeInt(u32, &wu, conn_amt, .big);
-                self.ctrl_buf.appendSliceAssumeCapacity(&hb);
-                self.ctrl_buf.appendSliceAssumeCapacity(&wu);
-            }
-            if (stream_amt > 0) {
-                var hb: [9]u8 = undefined;
-                var wu: [4]u8 = undefined;
-                p2.putHeader(&hb, 4, .window_update, 0, sid);
-                std.mem.writeInt(u32, &wu, stream_amt, .big);
-                self.ctrl_buf.appendSliceAssumeCapacity(&hb);
-                self.ctrl_buf.appendSliceAssumeCapacity(&wu);
-            }
-        } else |_| {}
+        self.ctrl_buf.ensureUnusedCapacity(self.gpa, count) catch {
+            // Local receive-window ledgers were already incremented; tear down
+            // rather than silently dropping the peer's WINDOW_UPDATE credit.
+            self.failCtrlAllocAndUnlock(kill_on_err);
+            return;
+        };
+        if (conn_amt > 0) {
+            var hb: [9]u8 = undefined;
+            var wu: [4]u8 = undefined;
+            p2.putHeader(&hb, 4, .window_update, 0, 0);
+            std.mem.writeInt(u32, &wu, conn_amt, .big);
+            self.ctrl_buf.appendSliceAssumeCapacity(&hb);
+            self.ctrl_buf.appendSliceAssumeCapacity(&wu);
+        }
+        if (stream_amt > 0) {
+            var hb: [9]u8 = undefined;
+            var wu: [4]u8 = undefined;
+            p2.putHeader(&hb, 4, .window_update, 0, sid);
+            std.mem.writeInt(u32, &wu, stream_amt, .big);
+            self.ctrl_buf.appendSliceAssumeCapacity(&hb);
+            self.ctrl_buf.appendSliceAssumeCapacity(&wu);
+        }
         self.ctrl_mu.unlock(self.io);
         if (self.write_mu.tryLock()) {
             if (self.write_broken) {
@@ -6795,4 +6827,77 @@ test "Client enforces write_timeout_ms on stalled writes and supports non-blocki
         const elapsed_ms = @divFloor(Io.Timestamp.now(testing.io, .awake).nanoseconds - t0, std.time.ns_per_ms);
         try testing.expect(elapsed_ms < 1_000);
     }
+}
+
+test "Client.deinit never hangs when Io.Group readerLoop exits immediately on instant EOF (#49)" {
+    const NoopSink = struct {
+        writer: Io.Writer,
+        fn drain(w: *Io.Writer, data: []const []const u8, _: usize) Io.Writer.Error!usize {
+            w.end = 0;
+            return data[0].len;
+        }
+    };
+
+    for (0..40) |i| {
+        var er: Io.Reader = .fixed(&.{});
+        var wbuf: [256]u8 = undefined;
+        var ns: NoopSink = .{ .writer = .{ .buffer = &wbuf, .vtable = &.{ .drain = NoopSink.drain } } };
+        var client: Client = undefined;
+        try client.init(testing.io, testing.allocator, &er, &ns.writer);
+        if (i % 2 == 0) {
+            Io.sleep(testing.io, .{ .nanoseconds = 200 * std.time.ns_per_us }, .awake) catch {};
+        }
+        client.deinit();
+    }
+}
+
+test "Client.writeWindowUpdates tears down connection on ctrl_buf OOM instead of dropping credit (#49)" {
+    const NoopSink = struct {
+        writer: Io.Writer,
+        fn drain(_: *Io.Writer, data: []const []const u8, _: usize) Io.Writer.Error!usize {
+            return data[0].len;
+        }
+    };
+    var ns: NoopSink = .{ .writer = .{ .buffer = &.{}, .vtable = &.{ .drain = NoopSink.drain } } };
+    var dummy_r: Io.Reader = .{ .buffer = &.{}, .seek = 0, .end = 0, .vtable = undefined };
+    var client: Client = .{
+        .io = testing.io,
+        .gpa = testing.failing_allocator,
+        .r = &dummy_r,
+        .w = &ns.writer,
+        .dec = hpack.Decoder.init(testing.allocator, p2.our_header_table_size),
+    };
+    client.reader_group_started.store(true, .release);
+    client.reader_done.set(testing.io);
+    defer client.deinit();
+
+    const Holder = struct {
+        c: *Client,
+        locked: std.atomic.Value(bool) = .init(false),
+        release: std.atomic.Value(bool) = .init(false),
+        err: ?anyerror = null,
+        fn run(self: *@This()) void {
+            self.c.write_mu.lockUncancelable(testing.io);
+            self.locked.store(true, .release);
+            while (!self.release.load(.acquire)) {
+                Io.sleep(testing.io, .{ .nanoseconds = 1 * std.time.ns_per_ms }, .awake) catch {};
+            }
+            self.c.finishWriteAndUnlock(null, true) catch |e| {
+                self.err = e;
+            };
+        }
+    };
+    var h: Holder = .{ .c = &client };
+    const th = try std.Thread.spawn(.{}, Holder.run, .{&h});
+    while (!h.locked.load(.acquire)) {
+        Io.sleep(testing.io, .{ .nanoseconds = 1 * std.time.ns_per_ms }, .awake) catch {};
+    }
+
+    client.writeWindowUpdates(4096, 1, 4096);
+    try testing.expect(client.dead.load(.acquire));
+
+    h.release.store(true, .release);
+    th.join();
+    try testing.expectEqual(@as(?anyerror, error.WriteFailed), h.err);
+    try testing.expect(client.write_broken);
 }

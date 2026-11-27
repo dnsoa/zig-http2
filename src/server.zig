@@ -188,6 +188,7 @@ const ConnWriter = struct {
     ctrl_buf: std.ArrayList(u8) = .empty,
     ctrl_drain: std.ArrayList(u8) = .empty,
     ctrl_hpack_zero: bool = false,
+    ctrl_broken: bool = false,
 
     fn deinit(self: *ConnWriter) void {
         if (self.gpa) |gpa| {
@@ -206,10 +207,27 @@ const ConnWriter = struct {
     fn markBrokenLocked(self: *ConnWriter) void {
         self.broken = true;
         self.ctrl_mu.lockUncancelable(self.io);
+        self.ctrl_broken = true;
         self.ctrl_buf.clearRetainingCapacity();
         self.ctrl_hpack_zero = false;
         self.ctrl_mu.unlock(self.io);
         if (self.conn) |conn_ptr| conn_ptr.noteWriteFailure();
+    }
+
+    /// Marks the control queue broken on an OOM while `ctrl_mu` is held
+    /// (without `mu`), wakes blocked stream workers/readers, and syncs
+    /// `self.broken = true` if `mu` is already free (otherwise the active `mu`
+    /// holder observes `ctrl_broken` in `drainCtrlToBufferLocked` / `finishAndUnlock`).
+    fn failCtrlAllocAndUnlock(self: *ConnWriter) void {
+        self.ctrl_broken = true;
+        self.ctrl_buf.clearRetainingCapacity();
+        self.ctrl_hpack_zero = false;
+        self.ctrl_mu.unlock(self.io);
+        if (self.conn) |conn_ptr| conn_ptr.noteWriteFailure();
+        if (self.mu.tryLock()) {
+            self.broken = true;
+            self.unlock();
+        }
     }
 
     /// Writes one frame; assumes `mu` is held. Uses `writeVecAll` to submit the
@@ -285,6 +303,10 @@ const ConnWriter = struct {
     fn drainCtrlToBufferLocked(self: *ConnWriter) !void {
         while (true) {
             self.ctrl_mu.lockUncancelable(self.io);
+            if (self.ctrl_broken) {
+                self.ctrl_mu.unlock(self.io);
+                return error.WriteFailed;
+            }
             if (self.ctrl_buf.items.len == 0) {
                 self.ctrl_mu.unlock(self.io);
                 return;
@@ -317,6 +339,12 @@ const ConnWriter = struct {
         }
         while (true) {
             self.ctrl_mu.lockUncancelable(self.io);
+            if (self.ctrl_broken) {
+                self.ctrl_mu.unlock(self.io);
+                self.markBrokenLocked();
+                self.unlock();
+                return error.WriteFailed;
+            }
             if (self.ctrl_buf.items.len == 0) {
                 self.unlock();
                 self.ctrl_mu.unlock(self.io);
@@ -365,14 +393,14 @@ const ConnWriter = struct {
         }
         if (self.gpa) |gpa| {
             self.ctrl_mu.lockUncancelable(self.io);
-            if (self.broken) {
+            if (self.ctrl_broken) {
                 self.ctrl_mu.unlock(self.io);
                 return error.WriteFailed;
             }
             var hdr: [9]u8 = undefined;
             putHeader(&hdr, payload.len, ftype, flags, sid);
             self.ctrl_buf.ensureUnusedCapacity(gpa, 9 + payload.len) catch |err| {
-                self.ctrl_mu.unlock(self.io);
+                self.failCtrlAllocAndUnlock();
                 return err;
             };
             self.ctrl_buf.appendSliceAssumeCapacity(&hdr);
@@ -448,29 +476,33 @@ const ConnWriter = struct {
         }
         if (self.gpa) |gpa| {
             self.ctrl_mu.lockUncancelable(self.io);
-            if (self.broken) {
+            if (self.ctrl_broken) {
                 self.ctrl_mu.unlock(self.io);
                 return;
             }
             const count: usize = @as(usize, if (stream_incr > 0) 13 else 0) + @as(usize, if (conn_incr > 0) 13 else 0);
-            if (self.ctrl_buf.ensureUnusedCapacity(gpa, count)) |_| {
-                if (stream_incr > 0) {
-                    var hdr: [9]u8 = undefined;
-                    var wu: [4]u8 = undefined;
-                    putHeader(&hdr, 4, .window_update, 0, sid);
-                    std.mem.writeInt(u32, &wu, @intCast(stream_incr & 0x7fff_ffff), .big);
-                    self.ctrl_buf.appendSliceAssumeCapacity(&hdr);
-                    self.ctrl_buf.appendSliceAssumeCapacity(&wu);
-                }
-                if (conn_incr > 0) {
-                    var hdr: [9]u8 = undefined;
-                    var wu: [4]u8 = undefined;
-                    putHeader(&hdr, 4, .window_update, 0, 0);
-                    std.mem.writeInt(u32, &wu, @intCast(conn_incr & 0x7fff_ffff), .big);
-                    self.ctrl_buf.appendSliceAssumeCapacity(&hdr);
-                    self.ctrl_buf.appendSliceAssumeCapacity(&wu);
-                }
-            } else |_| {}
+            self.ctrl_buf.ensureUnusedCapacity(gpa, count) catch {
+                // Local flow-control ledgers were already credited; tear down
+                // rather than silently stranding the peer's send window.
+                self.failCtrlAllocAndUnlock();
+                return;
+            };
+            if (stream_incr > 0) {
+                var hdr: [9]u8 = undefined;
+                var wu: [4]u8 = undefined;
+                putHeader(&hdr, 4, .window_update, 0, sid);
+                std.mem.writeInt(u32, &wu, @intCast(stream_incr & 0x7fff_ffff), .big);
+                self.ctrl_buf.appendSliceAssumeCapacity(&hdr);
+                self.ctrl_buf.appendSliceAssumeCapacity(&wu);
+            }
+            if (conn_incr > 0) {
+                var hdr: [9]u8 = undefined;
+                var wu: [4]u8 = undefined;
+                putHeader(&hdr, 4, .window_update, 0, 0);
+                std.mem.writeInt(u32, &wu, @intCast(conn_incr & 0x7fff_ffff), .big);
+                self.ctrl_buf.appendSliceAssumeCapacity(&hdr);
+                self.ctrl_buf.appendSliceAssumeCapacity(&wu);
+            }
             self.ctrl_mu.unlock(self.io);
             if (self.mu.tryLock()) {
                 if (self.broken) {
@@ -1316,10 +1348,20 @@ const IdleHeaderResult = enum { frame, stopped };
 /// zero periodic wakeups until `idle_timeout_ms`, `requestStop()`, or handoff.
 const stop_poll_ns: i96 = 200 * std.time.ns_per_ms;
 
+fn broadcastIfStopped(srv: *Server) bool {
+    if (srv.stop.load(.acquire) or srv.stop_event.isSet()) {
+        srv.requestStop();
+        return true;
+    }
+    return false;
+}
+
 fn forwardStopLeaderIfVacant(srv: *Server) void {
-    if (srv.stop_poller.load(.acquire) == 0 and !srv.stop.load(.acquire) and !srv.stop_event.isSet()) {
+    if (broadcastIfStopped(srv)) return;
+    if (srv.stop_poller.load(.acquire) == 0) {
         _ = srv.stop_wake.fetchAdd(1, .release);
         srv.io.futexWake(u32, &srv.stop_wake.raw, 1);
+        _ = broadcastIfStopped(srv);
     }
 }
 
@@ -1334,7 +1376,7 @@ fn idleWaitThunk(conn: *Connection, idle_timeout_ms: u64) IdleWait {
     } else .none;
 
     while (true) {
-        if (srv.stop.load(.acquire) or srv.stop_event.isSet()) return .stopped;
+        if (broadcastIfStopped(srv)) return .stopped;
         if (conn.closing.load(.acquire)) return .aborted;
         if (deadline_ns) |dl| {
             if (Io.Timestamp.now(srv.io, .awake).nanoseconds >= dl) {
@@ -1353,10 +1395,7 @@ fn idleWaitThunk(conn: *Connection, idle_timeout_ms: u64) IdleWait {
                 forwardStopLeaderIfVacant(srv);
             }
             while (true) {
-                if (srv.stop.load(.acquire) or srv.stop_event.isSet()) {
-                    srv.requestStop();
-                    return .stopped;
-                }
+                if (broadcastIfStopped(srv)) return .stopped;
                 if (conn.closing.load(.acquire)) return .aborted;
                 var wait_ns: i96 = stop_poll_ns;
                 if (deadline_ns) |dl| {
@@ -1376,7 +1415,7 @@ fn idleWaitThunk(conn: *Connection, idle_timeout_ms: u64) IdleWait {
         }
 
         // Follower path (`N - 1` idle connections): zero 200ms polling!
-        if (srv.stop.load(.acquire) or srv.stop_event.isSet()) return .stopped;
+        if (broadcastIfStopped(srv)) return .stopped;
         if (conn.closing.load(.acquire)) return .aborted;
         srv.io.futexWaitTimeout(u32, &srv.stop_wake.raw, wake_seq, timeout) catch |err| switch (err) {
             error.Canceled => {
@@ -1394,7 +1433,7 @@ fn idleWaitThunk(conn: *Connection, idle_timeout_ms: u64) IdleWait {
 /// Preserves partial header bytes via `readVec` so an in-flight header is never
 /// silently truncated across a stop wakeup.
 fn readIdleHeader(conn: *Connection, r: *Io.Reader, hb: *[9]u8) !IdleHeaderResult {
-    if (conn.srv.stop.load(.acquire)) return .stopped;
+    if (broadcastIfStopped(conn.srv)) return .stopped;
     if (conn.closing.load(.acquire)) return error.WriteFailed;
     const buffered = r.buffered();
     if (buffered.len >= hb.len) {
@@ -7515,4 +7554,105 @@ test "server FloodGuard rejects 1-byte WINDOW_UPDATE silly-window floods while a
     var ga = try readFrameOfType(testing.allocator, &reader.interface, .goaway);
     defer ga.deinit(testing.allocator);
     try testing.expectEqual(@backingInt(ErrorCode.enhance_your_calm), std.mem.readInt(u32, ga.payload[4..8], .big));
+}
+
+test "idle follower broadcasts bare srv.stop.store(true) when woken by single-waiter handoff (#49)" {
+    // Pre-claim `stop_poller = 1` so all 3 connections enter the follower path
+    // with `idle_timeout_ms = 0` (unbounded), then flip bare `stop = true`,
+    // release `stop_poller = 0`, and wake ONLY ONE follower (`futexWake(..., 1)`).
+    // That single woken follower must broadcast and wake the other 2 followers!
+    const conn_count = 3;
+    var fds_arr: [conn_count][2]c_int = undefined;
+    var threads: [conn_count]std.Thread = undefined;
+    var srv: Server = .{
+        .io = testing.io,
+        .gpa = testing.allocator,
+        .handler = h2TestHandler,
+        .config = .{ .idle_timeout_ms = 0 },
+    };
+    srv.stop_poller.store(1, .release);
+    for (0..conn_count) |i| {
+        fds_arr[i] = try newSocketPair();
+        threads[i] = try std.Thread.spawn(.{}, serveRawH2OnFd, .{ &srv, fds_arr[i][0] });
+    }
+    defer {
+        for (0..conn_count) |i| _ = c.close(fds_arr[i][1]);
+    }
+
+    var rbufs: [conn_count][4096]u8 = undefined;
+    var wbufs: [conn_count][4096]u8 = undefined;
+    for (0..conn_count) |i| {
+        var r = peerStream(fds_arr[i][1]).reader(testing.io, &rbufs[i]);
+        var w = peerStream(fds_arr[i][1]).writer(testing.io, &wbufs[i]);
+        try rawHandshake(&r.interface, &w.interface);
+    }
+    Io.sleep(testing.io, .{ .nanoseconds = 40 * std.time.ns_per_ms }, .awake) catch {};
+
+    const start = Io.Timestamp.now(testing.io, .awake).nanoseconds;
+    srv.stop.store(true, .release);
+    srv.stop_poller.store(0, .release);
+    // Simulate a leader exiting via cancellation right after bare `stop` was set:
+    // wake only 1 follower via `forwardStopLeaderIfVacant` / single-waiter handoff.
+    _ = srv.stop_wake.fetchAdd(1, .release);
+    testing.io.futexWake(u32, &srv.stop_wake.raw, 1);
+
+    for (0..conn_count) |i| {
+        var r = peerStream(fds_arr[i][1]).reader(testing.io, &rbufs[i]);
+        var ga = try readFrameOfType(testing.allocator, &r.interface, .goaway);
+        defer ga.deinit(testing.allocator);
+        try testing.expectEqual(@backingInt(ErrorCode.no_error), std.mem.readInt(u32, ga.payload[4..8], .big));
+        threads[i].join();
+    }
+    const elapsed_ms = @divFloor(Io.Timestamp.now(testing.io, .awake).nanoseconds - start, std.time.ns_per_ms);
+    try testing.expect(elapsed_ms < 1_000);
+}
+
+test "ConnWriter.writeWindowUpdates marks connection broken on ctrl_buf OOM instead of dropping credit (#49)" {
+    const NoopSink = struct {
+        writer: Io.Writer,
+        fn drain(_: *Io.Writer, data: []const []const u8, _: usize) Io.Writer.Error!usize {
+            return data[0].len;
+        }
+    };
+    var ns: NoopSink = .{ .writer = .{ .buffer = &.{}, .vtable = &.{ .drain = NoopSink.drain } } };
+    var srv: Server = .{ .io = testing.io, .gpa = testing.allocator, .handler = h2TestHandler };
+    var conn: Connection = .{
+        .srv = &srv,
+        .gpa = testing.allocator,
+        .io = testing.io,
+        .cw = .{ .io = testing.io, .w = &ns.writer, .gpa = testing.failing_allocator },
+        .decoder = hpack.Decoder.init(testing.allocator, our_header_table_size),
+    };
+    conn.cw.conn = &conn;
+    defer conn.deinit();
+
+    const Holder = struct {
+        cw: *ConnWriter,
+        locked: std.atomic.Value(bool) = .init(false),
+        release: std.atomic.Value(bool) = .init(false),
+        err: ?anyerror = null,
+        fn run(self: *@This()) void {
+            self.cw.lock();
+            self.locked.store(true, .release);
+            while (!self.release.load(.acquire)) {
+                Io.sleep(testing.io, .{ .nanoseconds = 1 * std.time.ns_per_ms }, .awake) catch {};
+            }
+            self.cw.finishAndUnlock(null) catch |e| {
+                self.err = e;
+            };
+        }
+    };
+    var h: Holder = .{ .cw = &conn.cw };
+    const th = try std.Thread.spawn(.{}, Holder.run, .{&h});
+    while (!h.locked.load(.acquire)) {
+        Io.sleep(testing.io, .{ .nanoseconds = 1 * std.time.ns_per_ms }, .awake) catch {};
+    }
+
+    conn.cw.writeWindowUpdates(1, 4096, 4096);
+    try testing.expect(conn.closing.load(.acquire));
+
+    h.release.store(true, .release);
+    th.join();
+    try testing.expectEqual(@as(?anyerror, error.WriteFailed), h.err);
+    try testing.expect(conn.cw.broken);
 }
