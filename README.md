@@ -5,8 +5,8 @@ A dependency-free, transport-agnostic HTTP/2 (RFC 9113) and HPACK (RFC 7541) ser
 ## Features
 
 - **Transport-agnostic**: Runs over any `*std.Io.Reader` / `*std.Io.Writer` pair (TLS-wrapped sockets, TCP, Unix sockets, in-memory pipes).
-- **Server & Client**: Full multiplexed HTTP/2 framing, stream & connection flow control, bounded 64 KiB multi-frame write batching + vectored writes, trailers, zero-allocation streaming request/response bodies (`ctx.body_reader`, `stream.readBody` / `stream.bodyReader()`), and bidirectional streaming (gRPC & CDN origin-ready).
-- **HPACK (RFC 7541)**: Separate decoder/encoder direction split with dynamic table ring buffer, Huffman shorter-of-two encoding, Never-Indexed marking for sensitive headers (`authorization`, `cookie`, `set-cookie`, `proxy-authorization`), and decompression-bomb limits (`SETTINGS_MAX_HEADER_LIST_SIZE`).
+- **Server & Client**: Full multiplexed HTTP/2 framing, stream & connection flow control with `O(1)` per-stream wakeup conditions, bounded 64 KiB multi-frame write batching + vectored writes, lock-free client op tracking, trailers, zero-allocation streaming request/response bodies (`ctx.body_reader`, `stream.readBody` / `stream.bodyReader()`), and bidirectional streaming (gRPC & CDN origin-ready).
+- **HPACK (RFC 7541)**: Separate decoder/encoder direction split with connection-stateful outbound dynamic-table compression (`max_encoder_table_size = 4096` cap, CDN-aware selective indexing), zero-allocation contiguous circular dynamic byte pool, zero-copy `.rodata` static-table borrowing, Huffman shorter-of-two encoding, Never-Indexed marking for sensitive headers (`authorization`, `cookie`, `set-cookie`, `proxy-authorization`), and decompression-bomb limits (`SETTINGS_MAX_HEADER_LIST_SIZE`).
 - **Hardened & RFC 9113 compliant**:
   - Strict header/pseudo-header/content-length validation and `cookie` joining.
   - Protections against Rapid Reset (CVE-2023-44487), CONTINUATION floods (CVE-2024-27316), control-frame / empty-DATA floods (CVE-2019-9512 / 9515 / 9518), and 1-byte `WINDOW_UPDATE` silly-window amplification.

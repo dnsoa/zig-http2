@@ -24,7 +24,7 @@ const Allocator = mem.Allocator;
 pub const StaticTable = struct {
     pub const Entry = struct { name: []const u8, value: []const u8 };
 
-    pub const entries = [_]Entry{
+    const raw_entries = [_]Entry{
         .{ .name = ":authority", .value = "" }, // 1
         .{ .name = ":method", .value = "GET" }, // 2
         .{ .name = ":method", .value = "POST" }, // 3
@@ -88,6 +88,56 @@ pub const StaticTable = struct {
         .{ .name = "www-authenticate", .value = "" }, // 61
     };
 
+    const blob_len = blk: {
+        @setEvalBranchQuota(100_000);
+        var total: usize = 1; // byte 0 reserved as empty-slice anchor `< static_blob.len`
+        for (raw_entries) |e| total += e.name.len + e.value.len;
+        break :blk total;
+    };
+
+    /// Single contiguous `.rodata` backing array for all 61 RFC 7541 static
+    /// header names and values so `isStaticSlice` is an O(1) range check.
+    pub const static_blob: [blob_len]u8 = blk: {
+        @setEvalBranchQuota(200_000);
+        var b: [blob_len]u8 = @splat(0);
+        var pos: usize = 1;
+        for (raw_entries) |e| {
+            @memcpy(b[pos .. pos + e.name.len], e.name);
+            pos += e.name.len;
+            if (e.value.len > 0) {
+                @memcpy(b[pos .. pos + e.value.len], e.value);
+                pos += e.value.len;
+            }
+        }
+        break :blk b;
+    };
+
+    pub const entries: [raw_entries.len]Entry = blk: {
+        @setEvalBranchQuota(200_000);
+        var t: [raw_entries.len]Entry = undefined;
+        var pos: usize = 1;
+        for (raw_entries, 0..) |e, i| {
+            const n_start = pos;
+            pos += e.name.len;
+            const v_start = if (e.value.len == 0) 0 else pos;
+            pos += e.value.len;
+            t[i] = .{
+                .name = static_blob[n_start .. n_start + e.name.len],
+                .value = static_blob[v_start .. v_start + e.value.len],
+            };
+        }
+        break :blk t;
+    };
+
+    /// Returns true when `s` points into `StaticTable.static_blob` (immortal
+    /// `.rodata` memory that must never be passed to `Allocator.free`).
+    pub inline fn isStaticSlice(s: []const u8) bool {
+        const start = @intFromPtr(&static_blob[0]);
+        const end = start + static_blob.len;
+        const p = @intFromPtr(s.ptr);
+        return p >= start and p < end;
+    }
+
     const max_name_len = blk: {
         var m: usize = 0;
         for (entries) |e| m = @max(m, e.name.len);
@@ -139,10 +189,24 @@ pub const StaticTable = struct {
         return null;
     }
 
-    /// Finds the index of a header name+value pair.
+    /// Finds the 1-based index of a header name+value pair, filtering by exact
+    /// lengths before comparing bytes (only 14 of 61 static entries carry a
+    /// non-empty value).
     pub fn findNameValue(name: []const u8, value: []const u8) ?usize {
+        if (name.len > max_name_len) return null;
+        if (value.len == 0) {
+            // Every empty-valued static entry is the first occurrence of its name
+            // EXCEPT `:method`, `:path`, `:scheme`, `:status`, `accept-encoding`
+            // (none of which have an empty-valued duplicate).
+            if (findName(name)) |idx1| {
+                if (entries[idx1 - 1].value.len == 0) return idx1;
+            }
+            return null;
+        }
         for (entries, 0..) |entry, i| {
-            if (std.ascii.eqlIgnoreCase(entry.name, name) and mem.eql(u8, entry.value, value)) {
+            if (entry.value.len == value.len and entry.name.len == name.len and
+                mem.eql(u8, entry.value, value) and std.ascii.eqlIgnoreCase(entry.name, name))
+            {
                 return i + 1;
             }
         }
@@ -150,7 +214,16 @@ pub const StaticTable = struct {
     }
 };
 
-/// Dynamic table entry.
+fn hashExact(s: []const u8) u32 {
+    var h: u32 = 2166136261;
+    for (s) |b| {
+        h ^= b;
+        h *%= 16777619;
+    }
+    return h;
+}
+
+/// Dynamic table entry descriptor (kept for public compatibility).
 pub const DynamicEntry = struct {
     name: []u8,
     value: []u8,
@@ -161,14 +234,41 @@ pub const DynamicEntry = struct {
     }
 };
 
-/// HPACK dynamic table with FIFO eviction backed by an O(1) ring buffer.
+/// HPACK dynamic table with O(1) FIFO eviction backed by a contiguous circular
+/// byte pool (`storage.len >= 2 * max_size`).
+///
+/// Mathematical Contiguity Guarantee:
+/// Live entries satisfy `sum(name.len + value.len) + 32 * count <= max_size`.
+/// When appending `str_len` bytes after evicting to fit `max_size`, total live
+/// string bytes plus `str_len` is strictly `< max_size`. Wrapping `write_pos`
+/// to `0` whenever `write_pos + str_len > storage.len` (>= `2 * max_size`)
+/// guarantees `oldest.offset > max_size > str_len`, so `[0 .. str_len]` never
+/// overlaps any live entry, every `name`/`value` slice stays contiguous, and
+/// steady-state insertion + eviction perform **zero heap allocations/frees**.
 pub const DynamicTable = struct {
-    allocator: Allocator,
-    buf: []DynamicEntry = &.{},
+    pub const Slot = struct {
+        offset: u32,
+        name_len: u32,
+        value_len: u32,
+        name_hash: u32,
+    };
+
+    pub const Match = struct {
+        /// 0-based dynamic index of an exact `(name, value)` match, if any.
+        full: ?usize = null,
+        /// 0-based dynamic index of a `name`-only match, if any.
+        name_only: ?usize = null,
+    };
+
+    allocator: ?Allocator = null,
+    slots: []Slot = &.{},
+    storage: []u8 = &.{},
     /// Physical index of the newest entry (logical dynamic index 0).
     head: usize = 0,
-    /// Number of live entries currently stored in `buf`.
+    /// Number of live entries currently stored in `slots`.
     count: usize = 0,
+    /// Next byte write position in `storage`.
+    write_pos: usize = 0,
     current_size: usize = 0,
     max_size: usize = 4096, // Default per RFC 7541
 
@@ -182,23 +282,39 @@ pub const DynamicTable = struct {
         return .{ .allocator = allocator, .max_size = max_size };
     }
 
-    pub fn deinit(self: *Self) void {
-        for (0..self.count) |i| {
-            const entry = self.buf[(self.head + i) % self.buf.len];
-            self.allocator.free(entry.name);
-            self.allocator.free(entry.value);
-        }
-        if (self.buf.len > 0) self.allocator.free(self.buf);
-        self.buf = &.{};
+    pub fn deinitWithAllocator(self: *Self, gpa: Allocator) void {
+        if (self.storage.len > 0) gpa.free(self.storage);
+        if (self.slots.len > 0) gpa.free(self.slots);
+        self.slots = &.{};
+        self.storage = &.{};
         self.head = 0;
         self.count = 0;
+        self.write_pos = 0;
         self.current_size = 0;
     }
 
-    /// Adds a new entry to the beginning of the dynamic table in O(1) amortized
-    /// time. Evicts oldest entries if necessary to fit within `max_size`.
-    pub fn add(self: *Self, name: []const u8, value: []const u8) !void {
-        const entry_size = (name.len +| value.len) +| 32;
+    pub fn deinit(self: *Self) void {
+        if (self.allocator) |gpa| self.deinitWithAllocator(gpa);
+    }
+
+    fn clearAll(self: *Self) void {
+        self.head = 0;
+        self.count = 0;
+        self.write_pos = 0;
+        self.current_size = 0;
+    }
+
+    /// Adds a new entry to the beginning of the dynamic table using `gpa` only
+    /// on initial/growth backing-pool allocation (zero allocations in steady state).
+    pub fn addWithAllocator(self: *Self, gpa: Allocator, name: []const u8, value: []const u8) !void {
+        const str_len = std.math.add(usize, name.len, value.len) catch {
+            self.clearAll();
+            return;
+        };
+        const entry_size = std.math.add(usize, str_len, 32) catch {
+            self.clearAll();
+            return;
+        };
 
         // Evict entries until we have room (RFC 7541 §4.4: an entry larger than
         // max_size still empties the table).
@@ -209,49 +325,116 @@ pub const DynamicTable = struct {
         // If a single entry is larger than max_size, don't add it.
         if (entry_size > self.max_size) return;
 
-        const name_copy = try self.allocator.dupe(u8, name);
-        errdefer self.allocator.free(name_copy);
-        const value_copy = try self.allocator.dupe(u8, value);
-        errdefer self.allocator.free(value_copy);
-
-        if (self.count == self.buf.len) {
-            const new_cap: usize = if (self.buf.len == 0) 16 else self.buf.len * 2;
-            const new_buf = try self.allocator.alloc(DynamicEntry, new_cap);
-            for (0..self.count) |i| {
-                new_buf[i] = self.buf[(self.head + i) % self.buf.len];
+        // Ensure byte pool has at least `2 * max_size` bytes so wrap-to-0 never
+        // collides with the oldest surviving entry.
+        const min_storage = std.math.mul(usize, @max(self.max_size, 64), 2) catch return error.OutOfMemory;
+        if (self.storage.len < min_storage) {
+            const new_storage = try gpa.alloc(u8, min_storage);
+            // Compact live entries oldest-first so physical order matches `write_pos`.
+            var pos: usize = 0;
+            var rev: usize = self.count;
+            while (rev > 0) {
+                rev -= 1;
+                const phys = (self.head + rev) % self.slots.len;
+                const sl = &self.slots[phys];
+                const sl_bytes: usize = @as(usize, sl.name_len) + @as(usize, sl.value_len);
+                @memcpy(new_storage[pos .. pos + sl_bytes], self.storage[sl.offset .. sl.offset + sl_bytes]);
+                sl.offset = @intCast(pos);
+                pos += sl_bytes;
             }
-            if (self.buf.len > 0) self.allocator.free(self.buf);
-            self.buf = new_buf;
+            if (self.storage.len > 0) gpa.free(self.storage);
+            self.storage = new_storage;
+            self.write_pos = pos;
+        }
+
+        // Ensure slot ring capacity (at most `max_size / 32` entries can fit).
+        if (self.count == self.slots.len) {
+            const min_slots = @max(@as(usize, 16), (self.max_size / 32) + 1);
+            const new_cap: usize = @max(min_slots, if (self.slots.len == 0) 16 else self.slots.len * 2);
+            const new_slots = try gpa.alloc(Slot, new_cap);
+            for (0..self.count) |i| {
+                new_slots[i] = self.slots[(self.head + i) % self.slots.len];
+            }
+            if (self.slots.len > 0) gpa.free(self.slots);
+            self.slots = new_slots;
             self.head = 0;
         }
 
-        // Insert at logical index 0 (newest).
-        self.head = if (self.head == 0) self.buf.len - 1 else self.head - 1;
-        self.buf[self.head] = .{
-            .name = name_copy,
-            .value = value_copy,
+        if (self.count == 0 or self.write_pos + str_len > self.storage.len) {
+            self.write_pos = 0;
+        }
+        if (self.count > 0) {
+            const oldest = self.slots[(self.head + self.count - 1) % self.slots.len];
+            const oldest_start: usize = oldest.offset;
+            const oldest_end: usize = oldest_start + oldest.name_len + oldest.value_len;
+            std.debug.assert(self.write_pos + str_len <= oldest_start or self.write_pos >= oldest_end);
+        }
+
+        const off = self.write_pos;
+        if (name.len > 0) @memcpy(self.storage[off .. off + name.len], name);
+        if (value.len > 0) @memcpy(self.storage[off + name.len .. off + str_len], value);
+        self.write_pos = off + str_len;
+
+        self.head = if (self.head == 0) self.slots.len - 1 else self.head - 1;
+        self.slots[self.head] = .{
+            .offset = @intCast(off),
+            .name_len = @intCast(name.len),
+            .value_len = @intCast(value.len),
+            .name_hash = hashExact(name),
         };
         self.count += 1;
         self.current_size += entry_size;
     }
 
-    /// Evicts the oldest entry (logical index `count - 1`) in O(1).
+    pub fn add(self: *Self, name: []const u8, value: []const u8) !void {
+        return self.addWithAllocator(self.allocator.?, name, value);
+    }
+
+    /// Evicts the oldest entry (logical index `count - 1`) in O(1) with zero frees.
     fn evictOne(self: *Self) void {
         if (self.count == 0) return;
-        const tail = (self.head + self.count - 1) % self.buf.len;
-        const entry = self.buf[tail];
+        const tail = (self.head + self.count - 1) % self.slots.len;
+        const sl = self.slots[tail];
         self.count -= 1;
-        self.current_size -= entry.name.len + entry.value.len + 32;
-        self.allocator.free(entry.name);
-        self.allocator.free(entry.value);
-        if (self.count == 0) self.head = 0;
+        self.current_size -= @as(usize, sl.name_len) + @as(usize, sl.value_len) + 32;
+        if (self.count == 0) {
+            self.head = 0;
+            self.write_pos = 0;
+        }
     }
 
     /// Gets an entry by index (0-based within the dynamic table, newest first).
     pub fn get(self: *const Self, index: usize) ?StaticTable.Entry {
         if (index >= self.count) return null;
-        const entry = self.buf[(self.head + index) % self.buf.len];
-        return .{ .name = entry.name, .value = entry.value };
+        const sl = self.slots[(self.head + index) % self.slots.len];
+        const n_off: usize = sl.offset;
+        const v_off: usize = n_off + sl.name_len;
+        return .{
+            .name = self.storage[n_off .. n_off + sl.name_len],
+            .value = self.storage[v_off .. v_off + sl.value_len],
+        };
+    }
+
+    /// Searches the dynamic table (newest-first) for an exact `(name, value)`
+    /// or `name`-only match using `name_len` + 32-bit FNV-1a pre-filtering.
+    pub fn find(self: *const Self, name: []const u8, value: []const u8) Match {
+        if (self.count == 0) return .{};
+        const h = hashExact(name);
+        var name_only: ?usize = null;
+        for (0..self.count) |i| {
+            const sl = self.slots[(self.head + i) % self.slots.len];
+            if (sl.name_len != name.len or sl.name_hash != h) continue;
+            const n_off: usize = sl.offset;
+            if (!mem.eql(u8, self.storage[n_off .. n_off + sl.name_len], name)) continue;
+            if (name_only == null) name_only = i;
+            if (sl.value_len == value.len) {
+                const v_off: usize = n_off + sl.name_len;
+                if (mem.eql(u8, self.storage[v_off .. v_off + sl.value_len], value)) {
+                    return .{ .full = i, .name_only = name_only };
+                }
+            }
+        }
+        return .{ .full = null, .name_only = name_only };
     }
 
     /// Updates the maximum size and evicts entries if needed.
@@ -532,6 +715,7 @@ pub const HuffmanCodec = struct {
     pub fn decode(data: []const u8, allocator: Allocator) ![]u8 {
         var result = std.ArrayList(u8).empty;
         errdefer result.deinit(allocator);
+        if (data.len > 0) try result.ensureTotalCapacity(allocator, data.len);
 
         var bit_buffer: u64 = 0;
         var bit_count: u6 = 0;
@@ -590,6 +774,107 @@ pub const HuffmanCodec = struct {
         }
 
         return result.toOwnedSlice(allocator);
+    }
+
+    /// Validates Huffman-encoded `data` (including EOS padding) and returns its
+    /// exact decoded byte length with **zero heap allocations**.
+    pub fn decodeLengthOnly(data: []const u8) !usize {
+        var decoded_len: usize = 0;
+        var bit_buffer: u64 = 0;
+        var bit_count: u6 = 0;
+
+        for (data) |byte| {
+            bit_buffer = (bit_buffer << 8) | byte;
+            bit_count += 8;
+
+            while (bit_count >= 5) {
+                if (bit_count >= 8) {
+                    const peek: u8 = @intCast((bit_buffer >> (bit_count - 8)) & 0xFF);
+                    const e = fast_decode_table[peek];
+                    if (e.len != 0) {
+                        decoded_len += 1;
+                        bit_count -= e.len;
+                        continue;
+                    }
+                }
+                var matched = false;
+                var L: u5 = if (bit_count >= 8) 9 else 5;
+                while (L <= 30 and L <= bit_count) : (L += 1) {
+                    const shift: u6 = @intCast(bit_count - L);
+                    const mask: u64 = (@as(u64, 1) << L) - 1;
+                    const cand: u64 = (bit_buffer >> shift) & mask;
+                    for (codes, 0..) |code, sym| {
+                        if (lengths[sym] == L and @as(u64, code) == cand) {
+                            decoded_len += 1;
+                            bit_count -= L;
+                            matched = true;
+                            break;
+                        }
+                    }
+                    if (matched) break;
+                }
+                if (!matched) {
+                    if (bit_count >= 30) return error.InvalidHuffmanCode;
+                    break;
+                }
+            }
+        }
+
+        if (bit_count > 7) return error.InvalidHuffmanPadding;
+        if (bit_count > 0) {
+            const mask = (@as(u64, 1) << bit_count) - 1;
+            if ((bit_buffer & mask) != mask) return error.InvalidHuffmanPadding;
+        }
+        return decoded_len;
+    }
+
+    /// Decodes Huffman `data` into caller stack `scratch` when it fits, falling
+    /// back to `allocator` only for strings longer than `scratch.len`.
+    pub fn decodeIntoScratch(data: []const u8, scratch: []u8, allocator: Allocator) !struct { slice: []const u8, owned: ?[]u8 } {
+        const needed = try decodeLengthOnly(data);
+        if (needed > scratch.len) {
+            const heap_slice = try decode(data, allocator);
+            return .{ .slice = heap_slice, .owned = heap_slice };
+        }
+        var pos: usize = 0;
+        var bit_buffer: u64 = 0;
+        var bit_count: u6 = 0;
+        for (data) |byte| {
+            bit_buffer = (bit_buffer << 8) | byte;
+            bit_count += 8;
+            while (bit_count >= 5) {
+                if (bit_count >= 8) {
+                    const peek: u8 = @intCast((bit_buffer >> (bit_count - 8)) & 0xFF);
+                    const e = fast_decode_table[peek];
+                    if (e.len != 0) {
+                        scratch[pos] = e.sym;
+                        pos += 1;
+                        bit_count -= e.len;
+                        continue;
+                    }
+                }
+                var matched = false;
+                var L: u5 = if (bit_count >= 8) 9 else 5;
+                while (L <= 30 and L <= bit_count) : (L += 1) {
+                    const shift: u6 = @intCast(bit_count - L);
+                    const mask: u64 = (@as(u64, 1) << L) - 1;
+                    const cand: u64 = (bit_buffer >> shift) & mask;
+                    for (codes, 0..) |code, sym| {
+                        if (lengths[sym] == L and @as(u64, code) == cand) {
+                            scratch[pos] = @intCast(sym);
+                            pos += 1;
+                            bit_count -= L;
+                            matched = true;
+                            break;
+                        }
+                    }
+                    if (matched) break;
+                }
+                if (!matched) break;
+            }
+        }
+        std.debug.assert(pos == needed);
+        return .{ .slice = scratch[0..needed], .owned = null };
     }
 };
 
