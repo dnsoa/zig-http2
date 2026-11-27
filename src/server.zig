@@ -7893,6 +7893,102 @@ test "server per-stream send_cond wakes target stream and RST unblocks conn-wind
             got1 += f.payload.len;
         }
     }
+
+    // Sub-case 2 (#50 review P3): exhaust `conn.send_window == 0` while per-stream
+    // `send_window > 0` so senders park on `conn.send_cond` (`waiting_conn_window == true`);
+    // verify stream-level WINDOW_UPDATE keeps them asleep, RST_STREAM wakes the reset
+    // stream immediately, and connection-level WINDOW_UPDATE(0) wakes the survivor.
+    {
+        const NoopSink = struct {
+            writer: Io.Writer,
+            fn drain(_: *Io.Writer, data: []const []const u8, _: usize) Io.Writer.Error!usize {
+                return data[0].len;
+            }
+        };
+        var ns: NoopSink = .{ .writer = .{ .buffer = &.{}, .vtable = &.{ .drain = NoopSink.drain } } };
+        var w_srv: Server = .{ .io = testing.io, .gpa = testing.allocator, .handler = h2TestHandler };
+        var conn: Connection = .{
+            .srv = &w_srv,
+            .gpa = testing.allocator,
+            .io = testing.io,
+            .cw = .{ .io = testing.io, .w = &ns.writer, .gpa = testing.allocator },
+            .decoder = hpack.Decoder.init(testing.allocator, our_header_table_size),
+            .send_window = 0, // connection send window exhausted
+            .highest_stream_id = 7,
+        };
+        conn.cw.conn = &conn;
+        defer conn.deinit();
+
+        var st5: H2Stream = .{
+            .conn = &conn,
+            .id = 5,
+            .arena_state = std.heap.ArenaAllocator.init(testing.allocator),
+            .req = undefined,
+            .send_window = 16_384,
+        };
+        defer st5.arena_state.deinit();
+        var st7: H2Stream = .{
+            .conn = &conn,
+            .id = 7,
+            .arena_state = std.heap.ArenaAllocator.init(testing.allocator),
+            .req = undefined,
+            .send_window = 16_384,
+        };
+        defer st7.arena_state.deinit();
+
+        try conn.streams.put(testing.allocator, 5, &st5);
+        try conn.streams.put(testing.allocator, 7, &st7);
+        defer {
+            _ = conn.streams.remove(5);
+            _ = conn.streams.remove(7);
+        }
+
+        const Sender = struct {
+            st: *H2Stream,
+            err: ?anyerror = null,
+            done: std.atomic.Value(bool) = .init(false),
+            fn run(self: *@This()) void {
+                self.st.sendBodyImpl("conn-window-gated", true) catch |e| {
+                    self.err = e;
+                };
+                self.done.store(true, .release);
+            }
+        };
+        var w5: Sender = .{ .st = &st5 };
+        var w7: Sender = .{ .st = &st7 };
+        const th5 = try std.Thread.spawn(.{}, Sender.run, .{&w5});
+        const th7 = try std.Thread.spawn(.{}, Sender.run, .{&w7});
+
+        // Wait until both threads are parked on `conn.send_cond` (`waiting_conn_window == true`).
+        while (true) {
+            conn.send_mu.lockUncancelable(testing.io);
+            const both_parked = st5.waiting_conn_window and st7.waiting_conn_window;
+            conn.send_mu.unlock(testing.io);
+            if (both_parked) break;
+            Io.sleep(testing.io, .{ .nanoseconds = 1 * std.time.ns_per_ms }, .awake) catch {};
+        }
+
+        // Stream-level WINDOW_UPDATE on sid=5 (or sid=7) must NOT unblock either
+        // sender while `conn.send_window` remains 0.
+        var wu4k: [4]u8 = undefined;
+        std.mem.writeInt(u32, &wu4k, 4096, .big);
+        try testing.expect(handleWindowUpdate(&conn, .{ .length = 4, .ftype = .window_update, .flags = 0, .sid = 5 }, &wu4k));
+        Io.sleep(testing.io, .{ .nanoseconds = 15 * std.time.ns_per_ms }, .awake) catch {};
+        try testing.expect(!w5.done.load(.acquire));
+        try testing.expect(!w7.done.load(.acquire));
+
+        // RST_STREAM(5) must wake `st5` out of `conn.send_cond` (`error.StreamReset`)
+        // while `st7` stays parked waiting for connection-level credit.
+        try testing.expect(resetStream(&conn, 5));
+        th5.join();
+        try testing.expectEqual(@as(?anyerror, error.StreamReset), w5.err);
+        try testing.expect(!w7.done.load(.acquire));
+
+        // Connection-level WINDOW_UPDATE(0) wakes `st7` to finish sending.
+        try testing.expect(handleWindowUpdate(&conn, .{ .length = 4, .ftype = .window_update, .flags = 0, .sid = 0 }, &wu4k));
+        th7.join();
+        try testing.expectEqual(@as(?anyerror, null), w7.err);
+    }
 }
 
 test "server refuseStream decodeDiscard preserves HPACK dynamic table for later streams" {
