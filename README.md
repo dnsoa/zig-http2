@@ -74,14 +74,12 @@ try client.initWithConfig(io, gpa, &reader, &writer, .{
 });
 defer client.deinit();
 
-const stream = try client.openStream(.{
+const stream = try client.openStreamWithBody(.{
     .method = "POST",
     .path = "/echo",
     .authority = "example.com",
-}, false);
+}, "hello over h2", true);
 defer stream.close();
-
-try stream.send("hello over h2", true);
 
 while (true) {
     const ev = stream.readEvent(arena) catch |err| switch (err) {

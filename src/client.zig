@@ -67,6 +67,11 @@ const max_header_block: usize = 256 * 1024;
 /// size cap never fires — `readContinuations` would loop forever. A legitimate
 /// block needs a handful (256KiB / 16KiB ⇒ ~16), so this is generous.
 const max_continuation_frames: usize = 256;
+/// Max DATA payload bytes coalesced into one `write_mu` acquisition + `w.flush()`
+/// batch (4 default 16 KiB frames). Keeps typical unary/POST payloads in 1 flush
+/// while bounding `write_mu` hold time so control frames and concurrent streams
+/// stay responsive during large uploads (#44).
+const max_write_batch: usize = 64 * 1024;
 
 /// Tunables for a client connection. `Client.init` uses these defaults; pass
 /// custom values via `Client.initWithConfig`.
@@ -199,7 +204,8 @@ pub const Stream = struct {
                     c.send_cond.waitUncancelable(c.io, &c.send_mu);
                     continue;
                 }
-                const want: i64 = @min(@as(i64, @intCast(data.len - off)), @min(avail, @as(i64, @intCast(c.peer_max_frame.load(.acquire)))));
+                const batch_cap: usize = @max(max_write_batch, c.peer_max_frame.load(.acquire));
+                const want: i64 = @min(@as(i64, @intCast(data.len - off)), @min(avail, @as(i64, @intCast(batch_cap))));
                 self.send_window -= want;
                 c.conn_send_window -= want;
                 break :blk @as(usize, @intCast(want));
@@ -709,24 +715,48 @@ pub const Client = struct {
         };
     }
 
+    /// Writes `data` as one or more DATA frames (each <= `max_frame`) without
+    /// flushing. Caller holds `write_mu`. When `data.len == 0` and `end_stream`
+    /// is true, emits a single 0-byte DATA(END_STREAM) frame.
+    fn writeDataFramesLocked(self: *Client, sid: u31, data: []const u8, end_stream: bool, max_frame: usize) !void {
+        std.debug.assert(max_frame > 0);
+        if (data.len == 0) {
+            if (end_stream) try self.writeFrameLocked(.data, p2.flag_end_stream, sid, "");
+            return;
+        }
+        var off: usize = 0;
+        while (off < data.len) {
+            const chunk_len = @min(data.len - off, max_frame);
+            const is_last = off + chunk_len == data.len;
+            const flags: u8 = if (end_stream and is_last) p2.flag_end_stream else 0;
+            try self.writeFrameLocked(.data, flags, sid, data[off .. off + chunk_len]);
+            off += chunk_len;
+        }
+    }
+
     fn writeDataForStream(self: *Client, st: *Stream, data: []const u8, end_stream: bool) !void {
-        self.write_mu.lockUncancelable(self.io);
-        defer self.write_mu.unlock(self.io);
-        if (self.dead.load(.acquire) or self.write_broken) return error.ConnectionClosed;
-        if (st.aborted.load(.acquire)) return error.StreamReset;
-        if (st.local_closed.load(.acquire)) return error.StreamClosed;
-        const flags: u8 = if (end_stream) p2.flag_end_stream else 0;
-        self.writeFrameLocked(.data, flags, st.id, data) catch |err| {
-            self.write_broken = true;
-            self.dead.store(true, .release);
-            return err;
+        const write_err: ?anyerror = blk: {
+            self.write_mu.lockUncancelable(self.io);
+            defer self.write_mu.unlock(self.io);
+            if (self.dead.load(.acquire) or self.write_broken) return error.ConnectionClosed;
+            if (st.aborted.load(.acquire)) return error.StreamReset;
+            if (st.local_closed.load(.acquire)) return error.StreamClosed;
+            const max: usize = self.peer_max_frame.load(.acquire);
+            self.writeDataFramesLocked(st.id, data, end_stream, max) catch |err| {
+                self.write_broken = true;
+                break :blk err;
+            };
+            self.w.flush() catch |err| {
+                self.write_broken = true;
+                break :blk err;
+            };
+            if (end_stream) st.local_closed.store(true, .release);
+            return;
         };
-        self.w.flush() catch |err| {
-            self.write_broken = true;
-            self.dead.store(true, .release);
+        if (write_err) |err| {
+            self.kill();
             return err;
-        };
-        if (end_stream) st.local_closed.store(true, .release);
+        }
     }
 
     /// Returns true if `sid` is in the idle state (never initiated: even push
@@ -751,11 +781,27 @@ pub const Client = struct {
 
     /// Opens a new stream, sending the request HEADERS. Returns a handle for
     /// send/readEvent/cancel. `end_stream` half-closes immediately (bodyless).
-    /// The stream id is allocated and HEADERS emitted under `write_mu` so that
-    /// concurrent openers issue ids in strictly increasing wire order (RFC 7540
-    /// §5.1.1); the stream is registered before HEADERS is sent so the reader
-    /// can deliver the response.
+    /// For requests with an initial body payload (e.g. gRPC unary RPCs or
+    /// known-body POSTs), prefer `openStreamWithBody` to coalesce HEADERS +
+    /// initial DATA (+ END_STREAM) into a single flush.
     pub fn openStream(self: *Client, head: RequestHead, end_stream: bool) !*Stream {
+        return self.openStreamWithBody(head, "", end_stream);
+    }
+
+    /// Opens a new stream and coalesces request HEADERS + initial DATA (+
+    /// END_STREAM when the full body fits in the current flow-control window
+    /// and batch cap) into a single `write_mu` lock and single `w.flush()` (#44).
+    ///
+    /// The stream id is allocated and HEADERS emitted under `write_mu` so that
+    /// concurrent openers issue ids in strictly increasing wire order (RFC 9113
+    /// §5.1.1); the stream is registered before HEADERS is sent so the reader
+    /// can deliver the response. When `body.len == 0`, behaves identically to
+    /// `openStream(head, end_stream)`. When `body` exceeds the immediately
+    /// available flow-control window (or batch cap), flushes HEADERS + the
+    /// initial chunk (or HEADERS alone if window == 0) and sends the remainder
+    /// via `Stream.send`; if sending the remainder fails, the stream is closed
+    /// and reclaimed before returning the error.
+    pub fn openStreamWithBody(self: *Client, head: RequestHead, body: []const u8, end_stream: bool) !*Stream {
         self.beginOp();
         defer self.endOp();
         if (self.dead.load(.acquire)) return error.ConnectionClosed;
@@ -807,9 +853,12 @@ pub const Client = struct {
             .id = sid,
             .send_window = 0,
             .recv_window = p2.clampInitialWindow(self.cfg.initial_window_size),
-            .local_closed = .init(end_stream),
+            .local_closed = .init(false),
             .is_head_request = std.mem.eql(u8, head.method, "HEAD"),
         };
+        const max: usize = self.peer_max_frame.load(.acquire);
+        const batch_cap: usize = @max(max_write_batch, max);
+        var first_chunk: usize = 0;
         self.streams_mu.lockUncancelable(self.io);
         // Re-check dead/GOAWAY under streams_mu: handle(.goaway) and kill()
         // publish their flags before locking streams_mu to sweep open streams,
@@ -829,10 +878,6 @@ pub const Client = struct {
             self.gpa.destroy(st);
             return error.GoingAway;
         }
-        // Seed the send window under streams_mu, which applyInitialWindow also
-        // holds while it rewrites peer_initial_window and shifts every
-        // registered stream.
-        st.send_window = self.peer_initial_window.load(.acquire);
         self.streams.put(self.gpa, sid, st) catch {
             self.streams_mu.unlock(self.io);
             self.write_mu.unlock(self.io);
@@ -841,31 +886,64 @@ pub const Client = struct {
             return error.OutOfMemory;
         };
         self.next_id = next_sid;
+        {
+            // Lock order: write_mu -> streams_mu -> send_mu (matches
+            // applyInitialWindow / handleWindowUpdate's streams_mu -> send_mu).
+            // Seeding st.send_window and reserving the initial DATA chunk
+            // atomically prevents applyInitialWindow from racing either step.
+            self.send_mu.lockUncancelable(self.io);
+            defer self.send_mu.unlock(self.io);
+            st.send_window = self.peer_initial_window.load(.acquire);
+            if (body.len > 0) {
+                const avail = @min(st.send_window, self.conn_send_window);
+                if (avail > 0) {
+                    const want: i64 = @min(@as(i64, @intCast(body.len)), @min(avail, @as(i64, @intCast(batch_cap))));
+                    st.send_window -= want;
+                    self.conn_send_window -= want;
+                    first_chunk = @intCast(want);
+                }
+            }
+        }
+        const all_sent = first_chunk == body.len;
+        if (end_stream and all_sent) st.local_closed.store(true, .release);
         self.streams_mu.unlock(self.io);
 
-        const max: usize = self.peer_max_frame.load(.acquire);
         var pbuf: [10]u8 = undefined;
         const prefix: []const u8 = if (self.pending_hpack_zero) blk: {
             self.pending_hpack_zero = false;
             break :blk hpack.Encoder.encodeTableSizeUpdate(0, &pbuf);
         } else &[_]u8{};
+        const hdr_end_stream = end_stream and body.len == 0;
         const write_ok = blk: {
-            self.writeHeaderBlockLocked(sid, end_stream, max, prefix, block.items) catch break :blk false;
+            self.writeHeaderBlockLocked(sid, hdr_end_stream, max, prefix, block.items) catch break :blk false;
+            if (first_chunk > 0) {
+                self.writeDataFramesLocked(sid, body[0..first_chunk], end_stream and all_sent, max) catch break :blk false;
+            }
             self.w.flush() catch break :blk false;
             break :blk true;
         };
         if (!write_ok) {
             self.write_broken = true;
             self.write_mu.unlock(self.io);
-            // A failed write may leave a partial HEADERS/CONTINUATION sequence
-            // on the wire (RFC 9113 §6.10), so tear down the connection.
+            // A failed write may leave a partial HEADERS/CONTINUATION or DATA
+            // frame on the wire (RFC 9113 §6.10), so tear down the connection.
             self.kill();
             self.removeStream(sid); // releases the slot
             return error.ConnectionClosed;
         }
         self.write_mu.unlock(self.io);
-        // A bodyless request half-closes our side immediately.
-        if (end_stream) self.noteEnd(st, true, false);
+
+        if (all_sent) {
+            if (end_stream) self.noteEnd(st, true, false);
+            return st;
+        }
+        // Remaining body bytes exceed the initial window or batch cap: stream
+        // them via `Stream.send` (which also handles END_STREAM + noteEnd).
+        // On failure, close & reclaim `st` since the caller never receives it.
+        st.send(body[first_chunk..], end_stream) catch |err| {
+            st.close();
+            return err;
+        };
         return st;
     }
 
@@ -5354,4 +5432,448 @@ test "setKeepalive(0, 0) clears stale ping_outstanding before later re-enable" {
     client.setKeepalive(5_000, 20);
     Io.sleep(testing.io, .{ .nanoseconds = 80 * std.time.ns_per_ms }, .awake) catch {};
     try testing.expect(!client.dead.load(.acquire));
+}
+
+test "openStreamWithBody coalesces HEADERS + DATA (+ END_STREAM) into a single flush (#44)" {
+    const CountingWriter = struct {
+        flushes: usize = 0,
+        bytes: std.ArrayList(u8) = .empty,
+        writer: Io.Writer,
+
+        fn drain(w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
+            const self: *@This() = @fieldParentPtr("writer", w);
+            var total: usize = 0;
+            if (w.end > 0) {
+                self.bytes.appendSlice(testing.allocator, w.buffer[0..w.end]) catch return error.WriteFailed;
+                w.end = 0;
+            }
+            if (data.len > 0) {
+                for (data[0 .. data.len - 1]) |s| {
+                    self.bytes.appendSlice(testing.allocator, s) catch return error.WriteFailed;
+                    total += s.len;
+                }
+                const last = data[data.len - 1];
+                for (0..splat) |_| {
+                    self.bytes.appendSlice(testing.allocator, last) catch return error.WriteFailed;
+                    total += last.len;
+                }
+            }
+            self.flushes += 1;
+            return total;
+        }
+    };
+
+    const parseWireFrames = struct {
+        fn check(
+            wire: []const u8,
+            expect_sid: u31,
+            expect_hdr_es: bool,
+            expect_body: []const u8,
+            expect_data_es: bool,
+            expect_data_frames: usize,
+        ) !void {
+            var pos: usize = 0;
+            var hdr_seen = false;
+            var data_frames: usize = 0;
+            var reassembled: std.ArrayList(u8) = .empty;
+            defer reassembled.deinit(testing.allocator);
+
+            while (pos < wire.len) {
+                try testing.expect(pos + 9 <= wire.len);
+                const fh = p2.parseHeader(wire[pos..][0..9]);
+                pos += 9;
+                try testing.expect(pos + fh.length <= wire.len);
+                const payload = wire[pos .. pos + fh.length];
+                pos += fh.length;
+                try testing.expectEqual(expect_sid, fh.sid);
+                if (!hdr_seen) {
+                    try testing.expectEqual(p2.FrameType.headers, fh.ftype);
+                    try testing.expect((fh.flags & p2.flag_end_headers) != 0);
+                    try testing.expectEqual(expect_hdr_es, (fh.flags & p2.flag_end_stream) != 0);
+                    hdr_seen = true;
+                } else {
+                    try testing.expectEqual(p2.FrameType.data, fh.ftype);
+                    try testing.expect(payload.len <= 16384);
+                    data_frames += 1;
+                    const is_last = pos == wire.len;
+                    const has_es = (fh.flags & p2.flag_end_stream) != 0;
+                    if (is_last) {
+                        try testing.expectEqual(expect_data_es, has_es);
+                    } else {
+                        try testing.expect(!has_es);
+                    }
+                    try reassembled.appendSlice(testing.allocator, payload);
+                }
+            }
+            try testing.expect(hdr_seen);
+            try testing.expectEqual(expect_data_frames, data_frames);
+            try testing.expectEqualSlices(u8, expect_body, reassembled.items);
+        }
+    }.check;
+
+    const wbuf = try testing.allocator.alloc(u8, 128 * 1024);
+    defer testing.allocator.free(wbuf);
+    var dummy_r: Io.Reader = .{ .buffer = &.{}, .seek = 0, .end = 0, .vtable = undefined };
+
+    // Case 1: empty body + end_stream -> 1 flush, HEADERS(END_STREAM) only.
+    {
+        var cw: CountingWriter = .{ .writer = .{ .buffer = wbuf, .vtable = &.{ .drain = CountingWriter.drain } } };
+        defer cw.bytes.deinit(testing.allocator);
+        var client: Client = .{
+            .io = testing.io,
+            .gpa = testing.allocator,
+            .r = &dummy_r,
+            .w = &cw.writer,
+            .dec = hpack.Decoder.init(testing.allocator, p2.our_header_table_size),
+        };
+        defer client.deinit();
+
+        const st = try client.openStreamWithBody(.{ .method = "GET", .path = "/empty" }, "", true);
+        try testing.expectEqual(@as(usize, 1), cw.flushes);
+        try testing.expect(st.local_closed.load(.acquire));
+        try parseWireFrames(cw.bytes.items, 1, true, "", false, 0);
+    }
+
+    // Case 2: small unary body + end_stream -> 1 flush, HEADERS + DATA(END_STREAM).
+    {
+        var cw: CountingWriter = .{ .writer = .{ .buffer = wbuf, .vtable = &.{ .drain = CountingWriter.drain } } };
+        defer cw.bytes.deinit(testing.allocator);
+        var client: Client = .{
+            .io = testing.io,
+            .gpa = testing.allocator,
+            .r = &dummy_r,
+            .w = &cw.writer,
+            .dec = hpack.Decoder.init(testing.allocator, p2.our_header_table_size),
+        };
+        defer client.deinit();
+
+        const payload = "hello grpc";
+        const st = try client.openStreamWithBody(.{ .method = "POST", .path = "/svc/Echo" }, payload, true);
+        try testing.expectEqual(@as(usize, 1), cw.flushes);
+        try testing.expect(st.local_closed.load(.acquire));
+        try testing.expectEqual(p2.default_window - @as(i64, payload.len), st.send_window);
+        try testing.expectEqual(p2.default_window - @as(i64, payload.len), client.conn_send_window);
+        try parseWireFrames(cw.bytes.items, 1, false, payload, true, 1);
+    }
+
+    // Case 3: multi-frame body (36000 B <= 64 KiB batch cap & 65535 window) -> 1 flush, 1 HEADERS + 3 DATA.
+    {
+        var cw: CountingWriter = .{ .writer = .{ .buffer = wbuf, .vtable = &.{ .drain = CountingWriter.drain } } };
+        defer cw.bytes.deinit(testing.allocator);
+        var client: Client = .{
+            .io = testing.io,
+            .gpa = testing.allocator,
+            .r = &dummy_r,
+            .w = &cw.writer,
+            .dec = hpack.Decoder.init(testing.allocator, p2.our_header_table_size),
+        };
+        defer client.deinit();
+
+        const body = try testing.allocator.alloc(u8, 36_000);
+        defer testing.allocator.free(body);
+        for (body, 0..) |*b, idx| b.* = @truncate(idx);
+
+        const st = try client.openStreamWithBody(.{ .method = "POST", .path = "/multi" }, body, true);
+        try testing.expectEqual(@as(usize, 1), cw.flushes);
+        try testing.expect(st.local_closed.load(.acquire));
+        try testing.expectEqual(p2.default_window - @as(i64, @intCast(body.len)), st.send_window);
+        try parseWireFrames(cw.bytes.items, 1, false, body, true, 3);
+    }
+
+    // Case 4: initial payload with end_stream=false -> 1 flush, stream stays open for later send().
+    {
+        var cw: CountingWriter = .{ .writer = .{ .buffer = wbuf, .vtable = &.{ .drain = CountingWriter.drain } } };
+        defer cw.bytes.deinit(testing.allocator);
+        var client: Client = .{
+            .io = testing.io,
+            .gpa = testing.allocator,
+            .r = &dummy_r,
+            .w = &cw.writer,
+            .dec = hpack.Decoder.init(testing.allocator, p2.our_header_table_size),
+        };
+        defer client.deinit();
+
+        const st = try client.openStreamWithBody(.{ .method = "POST", .path = "/bidi" }, "head", false);
+        try testing.expectEqual(@as(usize, 1), cw.flushes);
+        try testing.expect(!st.local_closed.load(.acquire));
+        try parseWireFrames(cw.bytes.items, 1, false, "head", false, 1);
+
+        try st.send("-tail", true);
+        try testing.expectEqual(@as(usize, 2), cw.flushes);
+        try testing.expect(st.local_closed.load(.acquire));
+        try parseWireFrames(cw.bytes.items, 1, false, "head-tail", true, 2);
+    }
+}
+
+test "Stream.send batches multi-frame DATA into bounded single-flush writes (#44)" {
+    const CountingWriter = struct {
+        flushes: usize = 0,
+        bytes: std.ArrayList(u8) = .empty,
+        writer: Io.Writer,
+
+        fn drain(w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
+            const self: *@This() = @fieldParentPtr("writer", w);
+            var total: usize = 0;
+            if (w.end > 0) {
+                self.bytes.appendSlice(testing.allocator, w.buffer[0..w.end]) catch return error.WriteFailed;
+                w.end = 0;
+            }
+            if (data.len > 0) {
+                for (data[0 .. data.len - 1]) |s| {
+                    self.bytes.appendSlice(testing.allocator, s) catch return error.WriteFailed;
+                    total += s.len;
+                }
+                const last = data[data.len - 1];
+                for (0..splat) |_| {
+                    self.bytes.appendSlice(testing.allocator, last) catch return error.WriteFailed;
+                    total += last.len;
+                }
+            }
+            self.flushes += 1;
+            return total;
+        }
+    };
+
+    const wbuf = try testing.allocator.alloc(u8, 128 * 1024);
+    defer testing.allocator.free(wbuf);
+    var dummy_r: Io.Reader = .{ .buffer = &.{}, .seek = 0, .end = 0, .vtable = undefined };
+    var cw: CountingWriter = .{ .writer = .{ .buffer = wbuf, .vtable = &.{ .drain = CountingWriter.drain } } };
+    defer cw.bytes.deinit(testing.allocator);
+
+    var client: Client = .{
+        .io = testing.io,
+        .gpa = testing.allocator,
+        .r = &dummy_r,
+        .w = &cw.writer,
+        .dec = hpack.Decoder.init(testing.allocator, p2.our_header_table_size),
+        .conn_send_window = 256 * 1024,
+        .peer_initial_window = .init(256 * 1024),
+    };
+    defer client.deinit();
+
+    const st = try client.openStream(.{ .method = "POST", .path = "/upload" }, false);
+    cw.flushes = 0;
+    cw.bytes.clearRetainingCapacity();
+
+    // 40000 B fits inside one 64 KiB batch -> 1 flush, 3 DATA frames (16384 + 16384 + 7232).
+    const chunk1 = try testing.allocator.alloc(u8, 40_000);
+    defer testing.allocator.free(chunk1);
+    for (chunk1, 0..) |*b, idx| b.* = @truncate(idx);
+    try st.send(chunk1, false);
+    try testing.expectEqual(@as(usize, 1), cw.flushes);
+
+    var pos: usize = 0;
+    var frames: usize = 0;
+    var got: std.ArrayList(u8) = .empty;
+    defer got.deinit(testing.allocator);
+    while (pos < cw.bytes.items.len) {
+        const fh = p2.parseHeader(cw.bytes.items[pos..][0..9]);
+        pos += 9;
+        try testing.expectEqual(p2.FrameType.data, fh.ftype);
+        try testing.expect(fh.length <= 16384);
+        try testing.expect((fh.flags & p2.flag_end_stream) == 0);
+        try got.appendSlice(testing.allocator, cw.bytes.items[pos .. pos + fh.length]);
+        pos += fh.length;
+        frames += 1;
+    }
+    try testing.expectEqual(@as(usize, 3), frames);
+    try testing.expectEqualSlices(u8, chunk1, got.items);
+
+    // 140000 B splits across 3 bounded 64 KiB batches (65536 + 65536 + 8928) -> 3 flushes, 9 frames.
+    cw.flushes = 0;
+    cw.bytes.clearRetainingCapacity();
+    got.clearRetainingCapacity();
+    const chunk2 = try testing.allocator.alloc(u8, 140_000);
+    defer testing.allocator.free(chunk2);
+    for (chunk2, 0..) |*b, idx| b.* = @truncate(idx *% 3);
+    try st.send(chunk2, true);
+    try testing.expectEqual(@as(usize, 3), cw.flushes);
+    try testing.expect(st.local_closed.load(.acquire));
+
+    pos = 0;
+    frames = 0;
+    while (pos < cw.bytes.items.len) {
+        const fh = p2.parseHeader(cw.bytes.items[pos..][0..9]);
+        pos += 9;
+        try testing.expectEqual(p2.FrameType.data, fh.ftype);
+        try testing.expect(fh.length <= 16384);
+        const is_last = pos + fh.length == cw.bytes.items.len;
+        try testing.expectEqual(is_last, (fh.flags & p2.flag_end_stream) != 0);
+        try got.appendSlice(testing.allocator, cw.bytes.items[pos .. pos + fh.length]);
+        pos += fh.length;
+        frames += 1;
+    }
+    try testing.expectEqual(@as(usize, 9), frames);
+    try testing.expectEqualSlices(u8, chunk2, got.items);
+}
+
+test "openStreamWithBody handles zero/partial initial window and cleans up on remainder reset (#44)" {
+    var fds: [2]c_int = undefined;
+    if (std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds) != 0) return error.SocketPairFailed;
+    defer _ = std.c.close(fds[0]);
+    defer _ = std.c.close(fds[1]);
+
+    const c_stream: net.Stream = .{ .socket = .{
+        .handle = fds[0],
+        .address = net.IpAddress.parse("127.0.0.1", 0) catch unreachable,
+    } };
+    const s_stream: net.Stream = .{ .socket = .{
+        .handle = fds[1],
+        .address = net.IpAddress.parse("127.0.0.1", 0) catch unreachable,
+    } };
+    var crbuf: [8192]u8 = undefined;
+    var cwbuf: [8192]u8 = undefined;
+    var srbuf: [8192]u8 = undefined;
+    var swbuf: [8192]u8 = undefined;
+    var cr = c_stream.reader(testing.io, &crbuf);
+    var cw = c_stream.writer(testing.io, &cwbuf);
+    var sr = s_stream.reader(testing.io, &srbuf);
+    var sw = s_stream.writer(testing.io, &swbuf);
+
+    var client: Client = undefined;
+    try client.init(testing.io, testing.allocator, &cr.interface, &cw.interface);
+    defer client.deinit();
+
+    try ctHandshake(&sr.interface, &sw.interface);
+    while (true) {
+        var f = try ctRead(testing.allocator, &sr.interface);
+        const is_ack = f.hdr.ftype == .settings and (f.hdr.flags & p2.flag_ack != 0);
+        f.deinit(testing.allocator);
+        if (is_ack) break;
+    }
+
+    const setPeerInitWin = struct {
+        fn send(r: *Io.Reader, w: *Io.Writer, iw: u32) !void {
+            var sp: [6]u8 = undefined;
+            p2.putSetting(&sp, p2.set_initial_window_size, iw);
+            try ctWrite(w, .settings, 0, 0, &sp);
+            while (true) {
+                var f = try ctRead(testing.allocator, r);
+                const is_ack = f.hdr.ftype == .settings and (f.hdr.flags & p2.flag_ack != 0);
+                f.deinit(testing.allocator);
+                if (is_ack) break;
+            }
+        }
+    }.send;
+
+    const Opener = struct {
+        client: *Client,
+        path: []const u8,
+        body: []const u8,
+        stream: ?*Stream = null,
+        err: ?anyerror = null,
+        fn run(self: *@This()) void {
+            if (self.client.openStreamWithBody(.{ .method = "POST", .path = self.path }, self.body, true)) |s| {
+                self.stream = s;
+            } else |e| {
+                self.err = e;
+            }
+        }
+    };
+
+    // Part A: initial window == 0 -> HEADERS flushes, DATA waits for WINDOW_UPDATE.
+    try setPeerInitWin(&sr.interface, &sw.interface, 0);
+    {
+        var op: Opener = .{ .client = &client, .path = "/zero-win", .body = "deferred-payload" };
+        const th = try std.Thread.spawn(.{}, Opener.run, .{&op});
+
+        var h = try ctRead(testing.allocator, &sr.interface);
+        defer h.deinit(testing.allocator);
+        try testing.expectEqual(p2.FrameType.headers, h.hdr.ftype);
+        try testing.expect((h.hdr.flags & p2.flag_end_stream) == 0);
+        const sid = h.hdr.sid;
+
+        var wu: [4]u8 = undefined;
+        std.mem.writeInt(u32, &wu, 1024, .big);
+        try ctWrite(&sw.interface, .window_update, 0, sid, &wu);
+
+        var d = try ctRead(testing.allocator, &sr.interface);
+        defer d.deinit(testing.allocator);
+        try testing.expectEqual(p2.FrameType.data, d.hdr.ftype);
+        try testing.expectEqual(sid, d.hdr.sid);
+        try testing.expect((d.hdr.flags & p2.flag_end_stream) != 0);
+        try testing.expectEqualStrings("deferred-payload", d.payload);
+
+        th.join();
+        try testing.expect(op.err == null);
+        const s = op.stream.?;
+        try testing.expect(s.local_closed.load(.acquire));
+        const ok200 = [_]u8{0x88};
+        try ctWrite(&sw.interface, .headers, p2.flag_end_headers | p2.flag_end_stream, sid, &ok200);
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        _ = try s.readEvent(arena.allocator());
+        s.close();
+    }
+
+    // Part B: partial initial window (8 B) -> HEADERS + 8 B coalesced, tail sent after WINDOW_UPDATE.
+    try setPeerInitWin(&sr.interface, &sw.interface, 8);
+    {
+        var op: Opener = .{ .client = &client, .path = "/partial-win", .body = "01234567abcdefgh" };
+        const th = try std.Thread.spawn(.{}, Opener.run, .{&op});
+
+        var h = try ctRead(testing.allocator, &sr.interface);
+        defer h.deinit(testing.allocator);
+        try testing.expectEqual(p2.FrameType.headers, h.hdr.ftype);
+        try testing.expect((h.hdr.flags & p2.flag_end_stream) == 0);
+        const sid = h.hdr.sid;
+
+        var d1 = try ctRead(testing.allocator, &sr.interface);
+        defer d1.deinit(testing.allocator);
+        try testing.expectEqual(p2.FrameType.data, d1.hdr.ftype);
+        try testing.expect((d1.hdr.flags & p2.flag_end_stream) == 0);
+        try testing.expectEqualStrings("01234567", d1.payload);
+
+        var wu: [4]u8 = undefined;
+        std.mem.writeInt(u32, &wu, 1024, .big);
+        try ctWrite(&sw.interface, .window_update, 0, sid, &wu);
+
+        var d2 = try ctRead(testing.allocator, &sr.interface);
+        defer d2.deinit(testing.allocator);
+        try testing.expectEqual(p2.FrameType.data, d2.hdr.ftype);
+        try testing.expect((d2.hdr.flags & p2.flag_end_stream) != 0);
+        try testing.expectEqualStrings("abcdefgh", d2.payload);
+
+        th.join();
+        try testing.expect(op.err == null);
+        const s = op.stream.?;
+        const ok200 = [_]u8{0x88};
+        try ctWrite(&sw.interface, .headers, p2.flag_end_headers | p2.flag_end_stream, sid, &ok200);
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        _ = try s.readEvent(arena.allocator());
+        s.close();
+    }
+
+    // Part C: remainder send interrupted by RST_STREAM -> returns StreamReset & reclaims stream + slot.
+    try setPeerInitWin(&sr.interface, &sw.interface, 4);
+    {
+        var op: Opener = .{ .client = &client, .path = "/rst-tail", .body = "0123blocked-tail" };
+        const th = try std.Thread.spawn(.{}, Opener.run, .{&op});
+
+        var h = try ctRead(testing.allocator, &sr.interface);
+        defer h.deinit(testing.allocator);
+        const sid = h.hdr.sid;
+        var d1 = try ctRead(testing.allocator, &sr.interface);
+        defer d1.deinit(testing.allocator);
+        try testing.expectEqualStrings("0123", d1.payload);
+
+        var rst: [4]u8 = undefined;
+        std.mem.writeInt(u32, &rst, @backingInt(p2.ErrorCode.cancel), .big);
+        try ctWrite(&sw.interface, .rst_stream, 0, sid, &rst);
+
+        th.join();
+        try testing.expectEqual(@as(?anyerror, error.StreamReset), op.err);
+        try testing.expect(op.stream == null);
+
+        client.streams_mu.lockUncancelable(testing.io);
+        const remaining_streams = client.streams.count();
+        client.streams_mu.unlock(testing.io);
+        try testing.expectEqual(@as(usize, 0), remaining_streams);
+
+        client.admit_mu.lockUncancelable(testing.io);
+        const active = client.active_streams;
+        client.admit_mu.unlock(testing.io);
+        try testing.expectEqual(@as(u32, 0), active);
+    }
 }

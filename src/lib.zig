@@ -139,3 +139,115 @@ test "client close() after early server response does not trip rapid-reset limit
     try testing.expect(client.goAway() == null);
     try testing.expect(!client.dead.load(.acquire));
 }
+
+test "Client.openStreamWithBody echoes unary and multi-frame bodies with Server (#44)" {
+    const std = @import("std");
+    const testing = std.testing;
+    const Helper = struct {
+        fn serve(srv: *Server, fd: std.posix.fd_t) void {
+            defer _ = std.c.close(fd);
+            const s: std.Io.net.Stream = .{ .socket = .{
+                .handle = fd,
+                .address = std.Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable,
+            } };
+            var rbuf: [8192]u8 = undefined;
+            var wbuf: [8192]u8 = undefined;
+            var sr = s.reader(srv.io, &rbuf);
+            var sw = s.writer(srv.io, &wbuf);
+            serveConn(srv, &sr.interface, &sw.interface, null, "https");
+        }
+        fn echo(ctx: *Context) anyerror!void {
+            var buf: std.ArrayList(u8) = .empty;
+            if (ctx.body_reader) |br| {
+                var tmp: [4096]u8 = undefined;
+                while (true) {
+                    const n = try br.read(&tmp);
+                    if (n == 0) break;
+                    try buf.appendSlice(ctx.arena, tmp[0..n]);
+                }
+            }
+            try ctx.res.send(200, "application/octet-stream", buf.items);
+        }
+    };
+
+    var fds: [2]c_int = undefined;
+    if (std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds) != 0) return error.SocketPairFailed;
+    errdefer _ = std.c.close(fds[1]);
+
+    var srv: Server = .{
+        .io = testing.io,
+        .gpa = testing.allocator,
+        .handler = Helper.echo,
+        .config = .{ .idle_timeout_ms = 10_000 },
+    };
+    const th = try std.Thread.spawn(.{}, Helper.serve, .{ &srv, fds[0] });
+    defer th.join();
+    defer _ = std.c.close(fds[1]);
+
+    const peer: std.Io.net.Stream = .{ .socket = .{
+        .handle = fds[1],
+        .address = std.Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable,
+    } };
+    var rbuf: [8192]u8 = undefined;
+    var wbuf: [8192]u8 = undefined;
+    var sr = peer.reader(testing.io, &rbuf);
+    var sw = peer.writer(testing.io, &wbuf);
+
+    var client: Client = undefined;
+    try client.init(testing.io, testing.allocator, &sr.interface, &sw.interface);
+    defer client.deinit();
+
+    // 1. Unary small body.
+    {
+        const s = try client.openStreamWithBody(.{ .method = "POST", .path = "/unary" }, "hello coalesced", true);
+        defer s.close();
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        var got: std.ArrayList(u8) = .empty;
+        defer got.deinit(testing.allocator);
+        while (true) {
+            const ev = s.readEvent(arena_state.allocator()) catch |err| switch (err) {
+                error.EndOfStream => break,
+                else => return err,
+            };
+            switch (ev) {
+                .data => |d| {
+                    try got.appendSlice(testing.allocator, d.payload);
+                    if (d.end_stream) break;
+                },
+                .headers => |h| if (h.end_stream) break,
+                .rst, .goaway => return error.UnexpectedStreamEnd,
+            }
+        }
+        try testing.expectEqualStrings("hello coalesced", got.items);
+    }
+
+    // 2. Multi-frame body (40000 B > 16384 B frame limit).
+    {
+        const big = try testing.allocator.alloc(u8, 40_000);
+        defer testing.allocator.free(big);
+        for (big, 0..) |*b, i| b.* = @truncate(i *% 7 +% 3);
+
+        const s = try client.openStreamWithBody(.{ .method = "POST", .path = "/big" }, big, true);
+        defer s.close();
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        var got: std.ArrayList(u8) = .empty;
+        defer got.deinit(testing.allocator);
+        while (true) {
+            const ev = s.readEvent(arena_state.allocator()) catch |err| switch (err) {
+                error.EndOfStream => break,
+                else => return err,
+            };
+            switch (ev) {
+                .data => |d| {
+                    try got.appendSlice(testing.allocator, d.payload);
+                    if (d.end_stream) break;
+                },
+                .headers => |h| if (h.end_stream) break,
+                .rst, .goaway => return error.UnexpectedStreamEnd,
+            }
+        }
+        try testing.expectEqualSlices(u8, big, got.items);
+    }
+}
