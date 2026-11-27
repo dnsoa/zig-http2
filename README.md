@@ -22,7 +22,7 @@ A dependency-free, transport-agnostic HTTP/2 (RFC 9113) and HPACK (RFC 7541) ser
 Fetch the package with `zig fetch`:
 
 ```sh
-zig fetch --save https://github.com/dnsoa/zig-http2/archive/refs/tags/v0.2.0.tar.gz
+zig fetch --save https://github.com/dnsoa/zig-http2/archive/refs/tags/v0.2.1.tar.gz
 ```
 
 Then wire the `zig_http2` module in your `build.zig`:

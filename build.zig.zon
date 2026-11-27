@@ -1,6 +1,6 @@
 .{
     .name = .zig_http2,
-    .version = "0.2.0",
+    .version = "0.2.1",
     .fingerprint = 0x6e6cd81487bf589,
     .minimum_zig_version = "0.17.0",
     .dependencies = .{},
