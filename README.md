@@ -94,7 +94,7 @@ while (true) {
 }
 ```
 
-> **Note**: Always call `stream.close()` when finished with a `*h2.Stream` so completed streams are reclaimed on long-lived connections.
+> **Note**: Always call `stream.close()` when finished with a `*h2.Stream` so completed streams are reclaimed on long-lived connections. Do not call any `Stream` method (including `stream.close()`) once `client.deinit()` has started — if separate threads hold `*h2.Stream` handles with `defer stream.close()`, cancel the streams and `join()` those threads before calling `client.deinit()`.
 
 ## Building & Testing
 

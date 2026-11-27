@@ -169,7 +169,7 @@ pub const Stream = struct {
     /// Blocks while the send window is empty; errors on reset/teardown.
     pub fn send(self: *Stream, data: []const u8, end_stream: bool) !void {
         const c = self.client;
-        c.beginOp();
+        if (!c.tryBeginOp()) return error.ConnectionClosed;
         defer c.endOp();
         if (self.local_closed.load(.acquire)) return error.StreamClosed;
         if (data.len == 0) {
@@ -236,7 +236,7 @@ pub const Stream = struct {
     /// `error.ConnectionClosed` when the connection tears down.
     pub fn readEvent(self: *Stream, arena: std.mem.Allocator) !Event {
         const c = self.client;
-        c.beginOp();
+        if (!c.tryBeginOp()) return error.ConnectionClosed;
         defer c.endOp();
         // Credit the flow-control window for a consumed DATA item only after
         // releasing recv_mu (defers run LIFO, so this runs after the unlock
@@ -320,7 +320,7 @@ pub const Stream = struct {
     /// the stream afterwards.
     pub fn cancel(self: *Stream) !void {
         const c = self.client;
-        c.beginOp();
+        if (!c.tryBeginOp()) return error.ConnectionClosed;
         defer c.endOp();
         // Wake local waiters first, so a blocked readEvent/send returns
         // promptly even if writeFrame below blocks or fails.
@@ -356,9 +356,14 @@ pub const Stream = struct {
     ///
     /// After `close` returns, `self` is invalid — do not touch the stream (and
     /// do not `close` it twice, or race it with `readEvent`/`send` on the same
-    /// stream).
+    /// stream). Do NOT call `close` once `Client.deinit` has begun (`deinit`
+    /// reclaims all remaining streams itself); if separate threads hold
+    /// `*Stream` handles with `defer s.close()`, cancel the streams and `join`
+    /// those threads before calling `deinit`.
     pub fn close(self: *Stream) void {
         const c = self.client;
+        if (!c.tryBeginOp()) return; // deinit owns the stream table and frees remaining streams
+        defer c.endOp();
         self.recv_mu.lockUncancelable(c.io);
         // Only skip RST_STREAM when the stream is fully closed (both halves
         // ended), already reset/cancelled, or refused by GOAWAY. A stream in
@@ -451,12 +456,14 @@ pub const Client = struct {
     streams_mu: Io.Mutex = .init,
     streams: std.AutoHashMapUnmanaged(u31, *Stream) = .empty,
 
-    // In-flight readEvent/send accounting. `deinit` waits for this to drain so
-    // it never frees a *Stream while a user thread (e.g. a bidi send/receive
-    // thread) is still inside readEvent/send on it (use-after-free).
+    // In-flight user op accounting (`readEvent`, `send`, `cancel`, `close`,
+    // `openStreamWithBody`). `deinit` waits for `active_ops` to drain to zero
+    // and then sets `deiniting` under `op_mu` before freeing remaining streams,
+    // preventing `close`/`removeStream` from racing final teardown (#46).
     op_mu: Io.Mutex = .init,
     op_cond: Io.Condition = .init,
     active_ops: u32 = 0,
+    deiniting: std.atomic.Value(bool) = .init(false),
 
     // Outbound-stream admission (peer SETTINGS_MAX_CONCURRENT_STREAMS). openStream
     // blocks here until a slot frees. Both fields are guarded by admit_mu.
@@ -569,7 +576,15 @@ pub const Client = struct {
     }
 
     /// Releases the client: stops the reader thread, waits for in-flight
-    /// readEvent/send to drain, then frees all streams.
+    /// stream/client operations to drain, then frees all remaining streams.
+    ///
+    /// Lifecycle contract: `deinit` wakes and waits for calls *already* inside
+    /// `readEvent`, `send`, `cancel`, `close`, or `openStream`/`openStreamWithBody`
+    /// to return. Once `deinit` has begun, callers MUST NOT start any new
+    /// `Client` or `Stream` calls — including `Stream.close()` (`deinit` frees
+    /// every remaining `*Stream` itself). When separate threads hold `*Stream`
+    /// handles with `defer s.close()`, unblock them first (e.g. `s.cancel()`),
+    /// `join` those threads, and only then call `deinit()`.
     ///
     /// On concurrent `std.Io` backends, `deinit` wakes the reader watcher and
     /// cancels the in-flight `readVec` so `reader_thread.join` returns promptly
@@ -589,21 +604,26 @@ pub const Client = struct {
         self.streams_mu.unlock(self.io);
         if (self.reader_thread) |t| t.join();
 
-        // Wait for any user thread still inside readEvent/send (which we just
-        // woke) to release its *Stream before we free them. Callers must not
-        // start new readEvent/send calls once deinit has begun.
+        // Wait for any user thread still inside readEvent/send/cancel/close/
+        // openStream to finish, then seal `deiniting` under `op_mu` so no late
+        // `Stream.close` can enter `removeStream` once we take the stream table.
         self.op_mu.lockUncancelable(self.io);
         while (self.active_ops != 0) self.op_cond.waitUncancelable(self.io, &self.op_mu);
+        self.deiniting.store(true, .release);
         self.op_mu.unlock(self.io);
 
         self.rx_scratch.deinit(self.gpa);
         self.dec.deinit();
-        var it2 = self.streams.valueIterator();
+        self.streams_mu.lockUncancelable(self.io);
+        var streams = self.streams;
+        self.streams = .empty;
+        self.streams_mu.unlock(self.io);
+        var it2 = streams.valueIterator();
         while (it2.next()) |s| {
             s.*.freeQueued(self.gpa);
             self.gpa.destroy(s.*);
         }
-        self.streams.deinit(self.gpa);
+        streams.deinit(self.gpa);
     }
 
     /// Records that a stream reached one/both half-close directions and frees
@@ -632,12 +652,16 @@ pub const Client = struct {
         self.admit_mu.unlock(self.io);
     }
 
-    /// Registers entry into a user-facing stream op (readEvent/send). Paired
-    /// with `endOp`; `deinit` blocks until the count returns to zero.
-    fn beginOp(self: *Client) void {
+    /// Registers entry into a user-facing client/stream op (`readEvent`, `send`,
+    /// `cancel`, `close`, `openStreamWithBody`) unless `deinit` has already
+    /// drained `active_ops` and taken ownership of final stream teardown (#46).
+    fn tryBeginOp(self: *Client) bool {
+        if (self.deiniting.load(.acquire)) return false;
         self.op_mu.lockUncancelable(self.io);
+        defer self.op_mu.unlock(self.io);
+        if (self.deiniting.load(.acquire)) return false;
         self.active_ops += 1;
-        self.op_mu.unlock(self.io);
+        return true;
     }
 
     fn endOp(self: *Client) void {
@@ -802,7 +826,7 @@ pub const Client = struct {
     /// via `Stream.send`; if sending the remainder fails, the stream is closed
     /// and reclaimed before returning the error.
     pub fn openStreamWithBody(self: *Client, head: RequestHead, body: []const u8, end_stream: bool) !*Stream {
-        self.beginOp();
+        if (!self.tryBeginOp()) return error.ConnectionClosed;
         defer self.endOp();
         if (self.dead.load(.acquire)) return error.ConnectionClosed;
 
@@ -958,6 +982,10 @@ pub const Client = struct {
 
     fn removeStream(self: *Client, sid: u31) void {
         self.streams_mu.lockUncancelable(self.io);
+        if (self.deiniting.load(.acquire)) {
+            self.streams_mu.unlock(self.io);
+            return;
+        }
         if (self.streams.fetchRemove(sid)) |kv| {
             self.streams_mu.unlock(self.io);
             // Return the connection window for any DATA the caller never
@@ -5876,4 +5904,223 @@ test "openStreamWithBody handles zero/partial initial window and cleans up on re
         client.admit_mu.unlock(testing.io);
         try testing.expectEqual(@as(u32, 0), active);
     }
+}
+
+const GateAlloc = struct {
+    child: std.mem.Allocator,
+    io: Io,
+    armed: std.atomic.Value(bool) = .init(false),
+    gate_open: std.atomic.Value(bool) = .init(false),
+    closed_count: std.atomic.Value(u32) = .init(0),
+    expect_closed: u32 = 0,
+    deinit_tid: std.Thread.Id = undefined,
+    mu: Io.Mutex = .init,
+    freed: std.AutoHashMapUnmanaged(usize, void) = .empty,
+    gate_hits: std.atomic.Value(u32) = .init(0),
+
+    fn allocator(self: *GateAlloc) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *GateAlloc = @ptrCast(@alignCast(ctx));
+        const p = self.child.rawAlloc(len, alignment, ret_addr);
+        if (p) |ptr| {
+            if (len == @sizeOf(Stream)) {
+                self.mu.lockUncancelable(self.io);
+                defer self.mu.unlock(self.io);
+                _ = self.freed.remove(@intFromPtr(ptr));
+            }
+        }
+        return p;
+    }
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *GateAlloc = @ptrCast(@alignCast(ctx));
+        return self.child.rawResize(memory, alignment, new_len, ret_addr);
+    }
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *GateAlloc = @ptrCast(@alignCast(ctx));
+        return self.child.rawRemap(memory, alignment, new_len, ret_addr);
+    }
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *GateAlloc = @ptrCast(@alignCast(ctx));
+        const is_stream = memory.len == @sizeOf(Stream);
+        if (is_stream) {
+            const addr = @intFromPtr(memory.ptr);
+            {
+                self.mu.lockUncancelable(self.io);
+                defer self.mu.unlock(self.io);
+                if (self.freed.contains(addr)) {
+                    @panic("double free of *Stream (Client.deinit free loop raced Stream.close)");
+                }
+                self.freed.put(std.heap.page_allocator, addr, {}) catch @panic("oom");
+            }
+        }
+        if (is_stream and self.armed.load(.acquire) and std.Thread.getCurrentId() == self.deinit_tid and self.gate_hits.load(.acquire) == 0) {
+            self.gate_hits.store(1, .release);
+            self.gate_open.store(true, .release);
+            var spins: u32 = 0;
+            while (self.closed_count.load(.acquire) < self.expect_closed and spins < 300) : (spins += 1) {
+                Io.sleep(self.io, .{ .nanoseconds = 1 * std.time.ns_per_ms }, .awake) catch {};
+            }
+        }
+        self.child.rawFree(memory, alignment, ret_addr);
+    }
+};
+
+const ReproCtx = struct { s: *Stream, g: *GateAlloc, err: ?anyerror = null };
+
+fn reproCloser(ctx: *ReproCtx) void {
+    const payload = @as([16]u8, @splat('x'));
+    ctx.s.send(&payload, false) catch |e| {
+        ctx.err = e;
+    };
+    while (!ctx.g.gate_open.load(.acquire)) std.atomic.spinLoopHint();
+    ctx.s.close();
+    _ = ctx.g.closed_count.fetchAdd(1, .release);
+}
+
+test "Client.deinit stream free loop does not double-free or race Stream.close (#46)" {
+    const io = testing.io;
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var srv = try addr.listen(io, .{ .mode = .stream, .reuse_address = true });
+    defer srv.deinit(io);
+    const port = srv.socket.address.ip4.port;
+    const caddr = try net.IpAddress.parse("127.0.0.1", port);
+    const cstream = try caddr.connect(io, .{ .mode = .stream });
+    var accepted = try srv.accept(io);
+
+    var gate = GateAlloc{ .child = testing.allocator, .io = io };
+    var crbuf: [65536]u8 = undefined;
+    var cwbuf: [65536]u8 = undefined;
+    var csr = cstream.reader(io, &crbuf);
+    var csw = cstream.writer(io, &cwbuf);
+    var client: Client = undefined;
+    try client.initWithConfig(io, gate.allocator(), &csr.interface, &csw.interface, .{ .connection_window_size = 65535 });
+
+    var arbuf: [65536]u8 = undefined;
+    var awbuf: [65536]u8 = undefined;
+    var asr = accepted.reader(io, &arbuf);
+    var asw = accepted.writer(io, &awbuf);
+    try ctHandshakeFloor(&asr.interface, &asw.interface);
+    var ack1 = try ctRead(testing.allocator, &asr.interface);
+    ack1.deinit(testing.allocator);
+
+    // Zero initial stream window so every send() parks in send_cond.
+    var iw: [6]u8 = undefined;
+    p2.putSetting(&iw, p2.set_initial_window_size, 0);
+    try ctWrite(&asw.interface, .settings, 0, 0, &iw);
+    var ack2 = try ctRead(testing.allocator, &asr.interface);
+    ack2.deinit(testing.allocator);
+
+    const m = 6;
+    var ctxs: [m]ReproCtx = undefined;
+    var ths: [m]std.Thread = undefined;
+    for (0..m) |i| {
+        const s = try client.openStream(.{ .path = "/x" }, false);
+        ctxs[i] = .{ .s = s, .g = &gate };
+    }
+    for (0..m) |i| ths[i] = try std.Thread.spawn(.{}, reproCloser, .{&ctxs[i]});
+    Io.sleep(io, .{ .nanoseconds = 100 * std.time.ns_per_ms }, .awake) catch {};
+
+    gate.armed.store(true, .release);
+    gate.deinit_tid = std.Thread.getCurrentId();
+    gate.expect_closed = m;
+    client.deinit();
+    for (0..m) |i| ths[i].join();
+    for (0..m) |i| try testing.expectEqual(@as(?anyerror, error.ConnectionClosed), ctxs[i].err);
+
+    cstream.close(io);
+    accepted.close(io);
+    gate.freed.deinit(std.heap.page_allocator);
+}
+
+test "Client.deinit waits for an already in-flight Stream.close before returning (#46)" {
+    const PauseFreeAlloc = struct {
+        child: std.mem.Allocator,
+        io: Io,
+        armed: std.atomic.Value(bool) = .init(false),
+        in_free: std.atomic.Value(bool) = .init(false),
+
+        fn allocator(self: *@This()) std.mem.Allocator {
+            return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+        }
+        fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return self.child.rawAlloc(len, alignment, ret_addr);
+        }
+        fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return self.child.rawResize(memory, alignment, new_len, ret_addr);
+        }
+        fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return self.child.rawRemap(memory, alignment, new_len, ret_addr);
+        }
+        fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (memory.len == @sizeOf(Stream) and self.armed.swap(false, .acq_rel)) {
+                self.in_free.store(true, .release);
+                Io.sleep(self.io, .{ .nanoseconds = 40 * std.time.ns_per_ms }, .awake) catch {};
+            }
+            self.child.rawFree(memory, alignment, ret_addr);
+        }
+    };
+
+    const Closer = struct {
+        s: *Stream,
+        done: std.atomic.Value(bool) = .init(false),
+        fn run(self: *@This()) void {
+            self.s.close();
+            self.done.store(true, .release);
+        }
+    };
+
+    const io = testing.io;
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var srv = try addr.listen(io, .{ .mode = .stream, .reuse_address = true });
+    defer srv.deinit(io);
+    const port = srv.socket.address.ip4.port;
+    const caddr = try net.IpAddress.parse("127.0.0.1", port);
+    const cstream = try caddr.connect(io, .{ .mode = .stream });
+    defer cstream.close(io);
+    var accepted = try srv.accept(io);
+    defer accepted.close(io);
+
+    var palloc = PauseFreeAlloc{ .child = testing.allocator, .io = io };
+    var crbuf: [16384]u8 = undefined;
+    var cwbuf: [16384]u8 = undefined;
+    var csr = cstream.reader(io, &crbuf);
+    var csw = cstream.writer(io, &cwbuf);
+    var client: Client = undefined;
+    try client.initWithConfig(io, palloc.allocator(), &csr.interface, &csw.interface, .{ .connection_window_size = 65535 });
+
+    var arbuf: [16384]u8 = undefined;
+    var awbuf: [16384]u8 = undefined;
+    var asr = accepted.reader(io, &arbuf);
+    var asw = accepted.writer(io, &awbuf);
+    try ctHandshakeFloor(&asr.interface, &asw.interface);
+    var ack1 = try ctRead(testing.allocator, &asr.interface);
+    ack1.deinit(testing.allocator);
+
+    const s = try client.openStream(.{ .path = "/in-flight-close" }, true);
+    var req_hdr = try ctRead(testing.allocator, &asr.interface);
+    req_hdr.deinit(testing.allocator);
+
+    // Queue an unconsumed response with DATA so `removeStream` has post-destroy
+    // credit accounting work left after freeing `*Stream`.
+    const ok200 = [_]u8{0x88};
+    try ctWrite(&asw.interface, .headers, p2.flag_end_headers, s.id, &ok200);
+    try ctWrite(&asw.interface, .data, p2.flag_end_stream, s.id, "unconsumed");
+    Io.sleep(io, .{ .nanoseconds = 20 * std.time.ns_per_ms }, .awake) catch {};
+
+    palloc.armed.store(true, .release);
+    var closer = Closer{ .s = s };
+    const th = try std.Thread.spawn(.{}, Closer.run, .{&closer});
+    while (!palloc.in_free.load(.acquire)) std.atomic.spinLoopHint();
+
+    // `s.close()` was started legally BEFORE `deinit()` began and is currently
+    // mid-flight inside `removeStream`; `deinit()` must wait for it to finish.
+    client.deinit();
+    try testing.expect(closer.done.load(.acquire));
+    th.join();
 }

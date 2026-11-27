@@ -27,7 +27,8 @@
 //! bidirectional streaming (separate send/receive threads) are supported — the
 //! shapes a gRPC server/client needs. Client limits: no PUSH_PROMISE (we
 //! advertise ENABLE_PUSH=0 and tear down on a push), no PRIORITY, and `close()`
-//! must be called per stream to reclaim it before `deinit`.
+//! must be called per stream to reclaim it before `deinit` (never after `deinit`
+//! has begun — cancel and join worker threads holding `*Stream` handles first).
 
 const types = @import("types.zig");
 pub const proto = @import("proto.zig");
