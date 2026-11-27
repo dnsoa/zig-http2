@@ -15,9 +15,31 @@
 //!     and any worker thread can call it concurrently. Fully RFC-compliant.
 
 const std = @import("std");
+const types = @import("types.zig");
 const hp = @import("hpack_codec.zig");
 
-pub const Header = struct { name: []const u8, value: []const u8 };
+pub const Header = types.Header;
+
+/// Returns true when `s` points into the static table's `.rodata` blob and
+/// therefore must not be passed to `Allocator.free` (nor re-duped into arenas).
+pub inline fn isStaticSlice(s: []const u8) bool {
+    return hp.StaticTable.isStaticSlice(s);
+}
+
+/// Frees `s` iff it is a non-empty heap slice outside `StaticTable.static_blob`.
+pub inline fn freeSlice(alloc: std.mem.Allocator, s: []const u8) void {
+    if (s.len > 0 and !hp.StaticTable.isStaticSlice(s)) alloc.free(s);
+}
+
+/// Frees a `Header` slice allocated by `Decoder.decode` on a general-purpose
+/// allocator, safely skipping borrowed `StaticTable` slices.
+pub fn freeHeaders(alloc: std.mem.Allocator, hs: []const Header) void {
+    for (hs) |h| {
+        freeSlice(alloc, h.name);
+        freeSlice(alloc, h.value);
+    }
+    alloc.free(hs);
+}
 
 /// Number of entries in the RFC 7541 static table (61). The combined HPACK
 /// index space is `1..=static_len` static, then `static_len+1..` dynamic
@@ -71,11 +93,6 @@ pub const Decoder = struct {
 
     /// Resolves a combined HPACK index (1-based) to a name/value pair, slices
     /// into either static program memory or the dynamic table's storage.
-    ///
-    /// Takes the raw u64 the integer coder produced rather than a pre-narrowed
-    /// usize: a peer can encode an index above `maxInt(usize)`, and narrowing it
-    /// at the call site was a safe-build `@intCast` panic on a 32-bit target.
-    /// Any such index is out of range anyway, so it resolves to InvalidIndex.
     fn lookup(self: *const Decoder, idx: u64) Error!hp.StaticTable.Entry {
         if (idx == 0) return Error.InvalidZeroIndex;
         if (idx <= static_len) return hp.StaticTable.get(@intCast(idx)) orelse Error.InvalidIndex;
@@ -83,18 +100,18 @@ pub const Decoder = struct {
         return self.dyn.get(dyn_idx) orelse Error.InvalidIndex;
     }
 
-    /// Decodes `block` into headers allocated on `arena`. All returned names and
-    /// values are duped onto `arena` so they stay valid after the dynamic table
-    /// evicts entries on a later block (safe to hand to a worker thread).
+    /// Decodes `block` into headers allocated on `arena`. Static-table names
+    /// and values are borrowed directly from `.rodata` with zero `dupe` calls;
+    /// dynamic-table and literal strings are duped onto `arena` so they stay
+    /// valid after later dynamic evictions (safe to hand to a worker thread).
     pub fn decode(self: *Decoder, arena: std.mem.Allocator, block: []const u8) Error![]Header {
         var out: std.ArrayList(Header) = .empty;
         // On any decode error (e.g. a malformed/hostile block), free everything
-        // already duped so a caller passing a real allocator (the client uses
-        // gpa, not an arena) does not leak on every rejected block.
+        // heap-allocated so a caller passing `gpa` does not leak.
         errdefer {
             for (out.items) |h| {
-                arena.free(h.name);
-                arena.free(h.value);
+                freeSlice(arena, h.name);
+                freeSlice(arena, h.value);
             }
             out.deinit(arena);
         }
@@ -110,7 +127,11 @@ pub const Decoder = struct {
                 i += n.len;
                 const e = try self.lookup(n.value);
                 try self.account(&list_size, e.name, e.value);
-                try ownEntry(arena, &out, e);
+                if (n.value <= static_len) {
+                    try out.append(arena, .{ .name = e.name, .value = e.value });
+                } else {
+                    try ownEntry(arena, &out, e);
+                }
             } else if (b & 0xC0 == 0x40) {
                 // 6.2.1 Literal with Incremental Indexing (6-bit prefix).
                 saw_field = true;
@@ -121,8 +142,6 @@ pub const Decoder = struct {
                 try self.dyn.add(h.name, h.value);
             } else if (b & 0xE0 == 0x20) {
                 // 6.3 Dynamic Table Size Update (5-bit prefix).
-                // RFC 7541 §4.2: dynamic table size updates MUST occur at the
-                // beginning of a header block, before any header field.
                 if (saw_field) return Error.InvalidTableSizeUpdate;
                 const n = try decInt(block[i..], 5);
                 i += n.len;
@@ -130,8 +149,6 @@ pub const Decoder = struct {
                 self.dyn.setMaxSize(@intCast(n.value));
             } else {
                 // 6.2.2 Literal without Indexing / 6.2.3 Never Indexed (4-bit prefix).
-                // The never-indexed flag (0x10) only matters for re-encoding, which
-                // a server doesn't do for inbound headers; either way: not indexed.
                 saw_field = true;
                 const h = try self.literal(arena, block[i..], 4);
                 i += h.consumed;
@@ -140,6 +157,90 @@ pub const Decoder = struct {
             }
         }
         return out.toOwnedSlice(arena);
+    }
+
+    /// Advances the HPACK dynamic table and enforces all wire/Huffman/`max_list_size`
+    /// invariants on `block` **without** allocating a `[]Header` output list or
+    /// duping non-indexed strings. Used when refusing streams (`REFUSED_STREAM`,
+    /// `STREAM_CLOSED`) under load so excess streams incur zero output heap churn.
+    pub fn decodeDiscard(self: *Decoder, block: []const u8) Error!void {
+        const gpa = self.dyn.allocator orelse return Error.OutOfMemory;
+        var list_size: usize = 0;
+        var saw_field = false;
+        var i: usize = 0;
+        while (i < block.len) {
+            const b = block[i];
+            if (b & 0x80 != 0) {
+                saw_field = true;
+                const n = try decInt(block[i..], 7);
+                i += n.len;
+                const e = try self.lookup(n.value);
+                try self.account(&list_size, e.name, e.value);
+            } else if (b & 0xC0 == 0x40) {
+                saw_field = true;
+                const n = try decInt(block[i..], 6);
+                i += n.len;
+
+                var name_scratch: [512]u8 = undefined;
+                var val_scratch: [512]u8 = undefined;
+                var name_owned: ?[]u8 = null;
+                defer if (name_owned) |no| gpa.free(no);
+                var val_owned: ?[]u8 = null;
+                defer if (val_owned) |vo| gpa.free(vo);
+
+                var name_slice: []const u8 = undefined;
+                if (n.value != 0) {
+                    const e = try self.lookup(n.value);
+                    if (n.value <= static_len) {
+                        name_slice = e.name;
+                    } else if (e.name.len <= name_scratch.len) {
+                        // Copy out of `self.dyn.storage` before `self.dyn.add`
+                        // can evict or compact the dynamic byte pool.
+                        @memcpy(name_scratch[0..e.name.len], e.name);
+                        name_slice = name_scratch[0..e.name.len];
+                    } else {
+                        const duped = try gpa.dupe(u8, e.name);
+                        name_owned = duped;
+                        name_slice = duped;
+                    }
+                } else {
+                    const ns = try decStrScratch(block[i..], &name_scratch, gpa);
+                    name_owned = ns.owned;
+                    name_slice = ns.slice;
+                    i += ns.consumed;
+                }
+
+                const vs = try decStrScratch(block[i..], &val_scratch, gpa);
+                val_owned = vs.owned;
+                i += vs.consumed;
+
+                try self.account(&list_size, name_slice, vs.slice);
+                try self.dyn.add(name_slice, vs.slice);
+            } else if (b & 0xE0 == 0x20) {
+                if (saw_field) return Error.InvalidTableSizeUpdate;
+                const n = try decInt(block[i..], 5);
+                i += n.len;
+                if (n.value > self.max_table_size) return Error.TableSizeExceeded;
+                self.dyn.setMaxSize(@intCast(n.value));
+            } else {
+                saw_field = true;
+                const n = try decInt(block[i..], 4);
+                i += n.len;
+                var name_len: usize = 0;
+                if (n.value != 0) {
+                    const e = try self.lookup(n.value);
+                    name_len = e.name.len;
+                } else {
+                    const ns = try decStrLenOnly(block[i..]);
+                    name_len = ns.decoded_len;
+                    i += ns.consumed;
+                }
+                const vs = try decStrLenOnly(block[i..]);
+                i += vs.consumed;
+                list_size = list_size +| name_len +| vs.decoded_len +| 32;
+                if (self.max_list_size != 0 and list_size > self.max_list_size) return Error.HeaderListTooLarge;
+            }
+        }
     }
 
     /// Adds one field's RFC 7540 §6.5.2 size (name + value + 32) to the running
@@ -152,26 +253,15 @@ pub const Decoder = struct {
 
     const Literal = struct { name: []const u8, value: []const u8, consumed: usize };
 
-    /// Moves a freshly decoded literal into `out`, which then owns its
-    /// `name`/`value`. Callers do this *before* charging the field against the
-    /// header-list budget: accounting can reject the block
-    /// (`HeaderListTooLarge`), and a pair not yet in `out` is missed by
-    /// `decode`'s errdefer and leaks — which matters because the client decodes
-    /// onto its gpa, not an arena, so a hostile peer could leak ~4KB per
-    /// rejected block, repeatedly. The errdefer here covers only the append
-    /// itself; once it succeeds, `out` is solely responsible for the pair.
     fn own(arena: std.mem.Allocator, out: *std.ArrayList(Header), name: []const u8, value: []const u8) Error!void {
         errdefer {
-            arena.free(name);
-            arena.free(value);
+            freeSlice(arena, name);
+            freeSlice(arena, value);
         }
         try out.append(arena, .{ .name = name, .value = value });
     }
 
-    /// Dupes a table entry onto `arena` and hands ownership to `out`. Both
-    /// errdefers are scoped to this call and it returns only on success, so an
-    /// OOM between the two dupes (or on the append) frees whichever half already
-    /// exists instead of leaking it.
+    /// Dupes a dynamic-table entry onto `arena` and hands ownership to `out`.
     fn ownEntry(arena: std.mem.Allocator, out: *std.ArrayList(Header), e: hp.StaticTable.Entry) Error!void {
         const name = try arena.dupe(u8, e.name);
         errdefer arena.free(name);
@@ -180,25 +270,230 @@ pub const Decoder = struct {
         try out.append(arena, .{ .name = name, .value = value });
     }
 
-    /// Decodes a literal representation whose first byte has an `prefix_bits`-wide
-    /// name index (0 ⇒ literal name follows). Name/value land on `arena`.
+    /// Decodes a literal representation whose first byte has a `prefix_bits`-wide
+    /// name index (0 ⇒ literal name follows). Static-table names are borrowed
+    /// from `.rodata`; dynamic names and literal strings land on `arena`.
     fn literal(self: *const Decoder, arena: std.mem.Allocator, data: []const u8, prefix_bits: u4) Error!Literal {
         const n = try decInt(data, prefix_bits);
         var i = n.len;
         var name: []const u8 = undefined;
         if (n.value != 0) {
             const e = try self.lookup(n.value);
-            name = try arena.dupe(u8, e.name);
+            name = if (n.value <= static_len) e.name else try arena.dupe(u8, e.name);
         } else {
             const s = decStr(data[i..], arena) catch return Error.Truncated;
             name = s.value;
             i += s.len;
         }
-        // `name` is duped; if the value decode fails, free it so it doesn't leak.
-        errdefer arena.free(name);
+        errdefer freeSlice(arena, name);
         const v = decStr(data[i..], arena) catch return Error.Truncated;
         i += v.len;
         return .{ .name = name, .value = v.value, .consumed = i };
+    }
+};
+
+/// Connection-stateful HPACK encoder (RFC 7541) with bounded circular dynamic
+/// table, RFC 7541 §4.2 Dynamic Table Size Update tracking, and CDN-oriented
+/// selective indexing.
+///
+/// Must be invoked exclusively under the connection's outbound write lock in
+/// exact on-wire `HEADERS` emission order.
+pub const EncoderContext = struct {
+    dyn: hp.DynamicTable = .{ .max_size = 4096 },
+    local_max_size: usize = 4096,
+    peer_max_size: usize = 4096,
+    pending_min_size: ?usize = null,
+    pending_target_size: ?usize = null,
+
+    pub fn initWithMaxSize(local_max: usize) EncoderContext {
+        const eff = @min(local_max, 4096);
+        return .{
+            .dyn = .{ .max_size = eff },
+            .local_max_size = local_max,
+            .peer_max_size = 4096,
+            .pending_min_size = if (eff < 4096) eff else null,
+            .pending_target_size = if (eff < 4096) eff else null,
+        };
+    }
+
+    pub fn deinit(self: *EncoderContext, gpa: std.mem.Allocator) void {
+        self.dyn.deinitWithAllocator(gpa);
+    }
+
+    /// Configures `local_max_size` before the first outbound header block on a
+    /// connection (e.g. from `Config.max_encoder_table_size`).
+    pub fn configureLocalMax(self: *EncoderContext, local_max: usize) void {
+        self.local_max_size = local_max;
+        const eff = @min(local_max, self.peer_max_size);
+        if (eff != self.dyn.max_size) {
+            self.pending_min_size = if (self.pending_min_size) |m| @min(m, eff) else eff;
+            self.pending_target_size = eff;
+        }
+    }
+
+    /// Records acknowledged peer `SETTINGS_HEADER_TABLE_SIZE` updates (`min_seen`
+    /// and `last_seen` within a SETTINGS frame). Preserves intermediate minima
+    /// across multiple SETTINGS frames per RFC 7541 §4.2.
+    pub fn notePeerHeaderTableSize(self: *EncoderContext, min_seen: u32, last_seen: u32) void {
+        self.peer_max_size = last_seen;
+        const min_eff = @min(@as(usize, min_seen), self.local_max_size);
+        const target_eff = @min(@as(usize, last_seen), self.local_max_size);
+        if (self.pending_target_size != null) {
+            const prev_min = self.pending_min_size orelse self.dyn.max_size;
+            self.pending_min_size = @min(prev_min, min_eff);
+            self.pending_target_size = target_eff;
+            return;
+        }
+        if (min_eff < self.dyn.max_size or target_eff != self.dyn.max_size) {
+            self.pending_min_size = min_eff;
+            self.pending_target_size = target_eff;
+        }
+    }
+
+    fn flushPendingTableSizeUpdates(self: *EncoderContext, gpa: std.mem.Allocator, out: *std.ArrayList(u8)) Error!void {
+        const target = self.pending_target_size orelse return;
+        const min_s = self.pending_min_size orelse target;
+        var tbuf: [10]u8 = undefined;
+        if (min_s < target) {
+            try out.appendSlice(gpa, Encoder.encodeTableSizeUpdate(min_s, &tbuf));
+            self.dyn.setMaxSize(min_s);
+        }
+        try out.appendSlice(gpa, Encoder.encodeTableSizeUpdate(target, &tbuf));
+        self.dyn.setMaxSize(target);
+        self.pending_min_size = null;
+        self.pending_target_size = null;
+    }
+
+    pub fn encodeResponse(
+        self: *EncoderContext,
+        gpa: std.mem.Allocator,
+        out: *std.ArrayList(u8),
+        status: u16,
+        headers: []const Header,
+        auto_content_length: ?u64,
+    ) Error!void {
+        try self.flushPendingTableSizeUpdates(gpa, out);
+
+        var sbuf: [5]u8 = undefined;
+        const status_str = std.fmt.bufPrint(&sbuf, "{d}", .{status}) catch unreachable;
+        try self.emitFieldLower(gpa, out, ":status", status_str);
+
+        var saw_cl = false;
+        for (headers) |h| {
+            if (isConnectionSpecific(h.name) or std.ascii.eqlIgnoreCase(h.name, "te")) continue;
+            if (auto_content_length != null and !saw_cl and std.ascii.eqlIgnoreCase(h.name, "content-length")) {
+                saw_cl = true;
+            }
+            try self.emitField(gpa, out, h.name, h.value);
+        }
+        if (auto_content_length) |cl| {
+            if (!saw_cl) {
+                var cl_buf: [20]u8 = undefined;
+                const cl_str = std.fmt.bufPrint(&cl_buf, "{d}", .{cl}) catch unreachable;
+                try self.emitFieldLower(gpa, out, "content-length", cl_str);
+            }
+        }
+    }
+
+    pub fn encodeRequest(
+        self: *EncoderContext,
+        gpa: std.mem.Allocator,
+        out: *std.ArrayList(u8),
+        method: []const u8,
+        scheme: []const u8,
+        path: []const u8,
+        authority: []const u8,
+        headers: []const Header,
+    ) Error!void {
+        try self.flushPendingTableSizeUpdates(gpa, out);
+
+        try self.emitFieldLower(gpa, out, ":method", method);
+        try self.emitFieldLower(gpa, out, ":scheme", scheme);
+        try self.emitFieldLower(gpa, out, ":path", path);
+        if (authority.len > 0) try self.emitFieldLower(gpa, out, ":authority", authority);
+
+        for (headers) |h| {
+            if (isConnectionSpecific(h.name)) continue;
+            if (std.ascii.eqlIgnoreCase(h.name, "te")) {
+                const trimmed = std.mem.trim(u8, h.value, " \t");
+                if (!std.ascii.eqlIgnoreCase(trimmed, "trailers")) continue;
+                try self.emitFieldLower(gpa, out, "te", "trailers");
+                continue;
+            }
+            try self.emitField(gpa, out, h.name, h.value);
+        }
+    }
+
+    pub fn encodeTrailers(
+        self: *EncoderContext,
+        gpa: std.mem.Allocator,
+        out: *std.ArrayList(u8),
+        headers: []const Header,
+    ) Error!void {
+        try self.flushPendingTableSizeUpdates(gpa, out);
+        for (headers) |h| {
+            try self.emitField(gpa, out, h.name, h.value);
+        }
+    }
+
+    fn emitField(self: *EncoderContext, gpa: std.mem.Allocator, out: *std.ArrayList(u8), name: []const u8, value: []const u8) Error!void {
+        if (!hasUpper(name)) {
+            return self.emitFieldLower(gpa, out, name, value);
+        }
+        var stack_buf: [256]u8 = undefined;
+        if (name.len <= stack_buf.len) {
+            for (name, 0..) |ch, i| stack_buf[i] = std.ascii.toLower(ch);
+            return self.emitFieldLower(gpa, out, stack_buf[0..name.len], value);
+        }
+        const lname = try gpa.alloc(u8, name.len);
+        defer gpa.free(lname);
+        for (name, 0..) |ch, i| lname[i] = std.ascii.toLower(ch);
+        return self.emitFieldLower(gpa, out, lname, value);
+    }
+
+    fn emitFieldLower(self: *EncoderContext, gpa: std.mem.Allocator, out: *std.ArrayList(u8), lname: []const u8, value: []const u8) Error!void {
+        // 1. Sensitive fields MUST always be emitted as Never Indexed (0x10)
+        //    and MUST NOT enter or match dynamic table values (RFC 7541 §7.1.3).
+        if (isSensitiveLower(lname)) {
+            const nidx = hp.StaticTable.findName(lname) orelse
+                if (self.dyn.find(lname, "").name_only) |dn| static_len + 1 + dn else 0;
+            return Encoder.emitLiteral(gpa, out, nidx, if (nidx == 0) lname else "", value, true);
+        }
+
+        // 2. Exact `(lname, value)` match in the static table (1-byte indexed).
+        if (hp.StaticTable.findNameValue(lname, value)) |s_idx| {
+            return Encoder.emitIndexed(gpa, out, s_idx);
+        }
+
+        // 3. Search connection dynamic table for full or name-only match.
+        const dyn_match = self.dyn.find(lname, value);
+        if (dyn_match.full) |d_idx| {
+            return Encoder.emitIndexed(gpa, out, static_len + 1 + d_idx);
+        }
+
+        const nidx = hp.StaticTable.findName(lname) orelse
+            if (dyn_match.name_only) |dn| static_len + 1 + dn else 0;
+
+        // 4. CDN selective indexing: skip dynamic insertion for high-churn
+        //    per-object fields or entries > 3/4 of `dyn.max_size`.
+        const entry_size = (lname.len +| value.len) +| 32;
+        const can_index = self.dyn.max_size >= 64 and
+            entry_size <= (self.dyn.max_size * 3) / 4 and
+            !shouldSkipIndexingLower(lname);
+
+        if (!can_index) {
+            return Encoder.emitLiteral(gpa, out, nidx, if (nidx == 0) lname else "", value, false);
+        }
+
+        // 6.2.1 Literal Header Field with Incremental Indexing (`0x40`, 6-bit prefix).
+        // Emit using pre-insertion `nidx` FIRST, then insert into `self.dyn`.
+        var buf: [10]u8 = undefined;
+        const n = hp.encodeInteger(nidx, 6, &buf) catch unreachable;
+        buf[0] |= 0x40;
+        try out.appendSlice(gpa, buf[0..n]);
+        if (nidx == 0) try hp.encodeStringShortest(lname, gpa, out);
+        try hp.encodeStringShortest(value, gpa, out);
+        try self.dyn.addWithAllocator(gpa, lname, value);
     }
 };
 
@@ -382,11 +677,40 @@ fn isSensitiveHeader(name: []const u8) bool {
     return false;
 }
 
+fn isSensitiveLower(lname: []const u8) bool {
+    return switch (lname.len) {
+        6 => std.mem.eql(u8, lname, "cookie"),
+        10 => std.mem.eql(u8, lname, "set-cookie"),
+        13 => std.mem.eql(u8, lname, "authorization"),
+        19 => std.mem.eql(u8, lname, "proxy-authorization"),
+        else => false,
+    };
+}
+
+/// High-churn per-request / per-asset fields that should not evict stable site
+/// and caching headers from a connection's 4 KiB HPACK dynamic table.
+fn shouldSkipIndexingLower(lname: []const u8) bool {
+    return switch (lname.len) {
+        3 => std.mem.eql(u8, lname, "age"),
+        4 => std.mem.eql(u8, lname, "etag"),
+        5 => std.mem.eql(u8, lname, ":path") or std.mem.eql(u8, lname, "range"),
+        8 => std.mem.eql(u8, lname, "if-range") or std.mem.eql(u8, lname, "location"),
+        11 => std.mem.eql(u8, lname, "traceparent"),
+        12 => std.mem.eql(u8, lname, "x-request-id"),
+        13 => std.mem.eql(u8, lname, "content-range") or std.mem.eql(u8, lname, "if-none-match"),
+        14 => std.mem.eql(u8, lname, "content-length"),
+        17 => std.mem.eql(u8, lname, "if-modified-since"),
+        else => false,
+    };
+}
+
 // Thin wrappers so the rest of the file reads against local names. They rebuild
 // the result into our own named structs (the codec returns anonymous struct
 // types that don't coerce across a `catch`).
 const IntResult = struct { value: u64, len: usize };
 const StrResult = struct { value: []u8, len: usize };
+const StrLenOnly = struct { decoded_len: usize, consumed: usize };
+const StrScratch = struct { slice: []const u8, owned: ?[]u8, consumed: usize };
 
 inline fn decInt(data: []const u8, prefix_bits: u4) Error!IntResult {
     const r = hp.decodeInteger(data, prefix_bits) catch return Error.Truncated;
@@ -395,6 +719,40 @@ inline fn decInt(data: []const u8, prefix_bits: u4) Error!IntResult {
 inline fn decStr(data: []const u8, arena: std.mem.Allocator) !StrResult {
     const r = try hp.decodeString(data, arena);
     return .{ .value = r.value, .len = r.len };
+}
+
+fn decStrLenOnly(data: []const u8) Error!StrLenOnly {
+    if (data.len == 0) return Error.Truncated;
+    const huffman = (data[0] & 0x80) != 0;
+    const len_res = hp.decodeInteger(data, 7) catch return Error.Truncated;
+    const rem = data.len - len_res.len;
+    if (len_res.value > rem) return Error.Truncated;
+    const str_len: usize = @intCast(len_res.value);
+    const total_len = len_res.len + str_len;
+    const str_data = data[len_res.len..total_len];
+    const dec_len = if (huffman)
+        (hp.HuffmanCodec.decodeLengthOnly(str_data) catch return Error.Truncated)
+    else
+        str_len;
+    return .{ .decoded_len = dec_len, .consumed = total_len };
+}
+
+fn decStrScratch(data: []const u8, scratch: []u8, gpa: std.mem.Allocator) Error!StrScratch {
+    if (data.len == 0) return Error.Truncated;
+    const huffman = (data[0] & 0x80) != 0;
+    const len_res = hp.decodeInteger(data, 7) catch return Error.Truncated;
+    const rem = data.len - len_res.len;
+    if (len_res.value > rem) return Error.Truncated;
+    const str_len: usize = @intCast(len_res.value);
+    const total_len = len_res.len + str_len;
+    const str_data = data[len_res.len..total_len];
+    if (!huffman) {
+        return .{ .slice = str_data, .owned = null, .consumed = total_len };
+    }
+    const r = hp.HuffmanCodec.decodeIntoScratch(str_data, scratch, gpa) catch |err| {
+        return if (err == error.OutOfMemory) Error.OutOfMemory else Error.Truncated;
+    };
+    return .{ .slice = r.slice, .owned = r.owned, .consumed = total_len };
 }
 
 // --- tests ------------------------------------------------------------------
@@ -949,4 +1307,140 @@ test "Encoder avoids temporary allocations when encoding into pre-sized buffer (
     const hs = try dec.decode(dec_arena.allocator(), out.items);
     try testing.expectEqualStrings("application/json; charset=utf-8", findHeader(hs, "content-type").?);
     try testing.expectEqualStrings("HIT-aaaaaaaaaaaaaaaa", findHeader(hs, "x-custom-edge-cache").?);
+}
+
+test "StaticTable.isStaticSlice and Decoder zero-copy static borrowing" {
+    for (hp.StaticTable.entries) |e| {
+        try testing.expect(isStaticSlice(e.name));
+        try testing.expect(isStaticSlice(e.value));
+    }
+    try testing.expect(!isStaticSlice("outside-rodata"));
+
+    var dec = Decoder.init(testing.allocator, 4096);
+    defer dec.deinit();
+
+    // :method GET (0x82), :scheme https (0x87), :path / (0x84), literal static-name :authority = "cdn.example"
+    const block = [_]u8{
+        0x82, 0x87, 0x84, 0x01, 0x0b, 'c', 'd', 'n', '.', 'e', 'x', 'a', 'm', 'p', 'l', 'e',
+    };
+    const hs = try dec.decode(testing.allocator, &block);
+    defer freeHeaders(testing.allocator, hs);
+
+    try testing.expect(isStaticSlice(hs[0].name));
+    try testing.expect(isStaticSlice(hs[0].value));
+    try testing.expect(isStaticSlice(hs[3].name));
+    try testing.expect(!isStaticSlice(hs[3].value));
+    try testing.expectEqualStrings("cdn.example", hs[3].value);
+}
+
+test "DynamicTable contiguous circular byte pool performs zero allocations in steady state" {
+    var backing: [4096]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&backing);
+    const alloc = fba.allocator();
+
+    var dt = hp.DynamicTable.initWithSize(alloc, 256);
+    defer dt.deinit();
+
+    try dt.add("x-seed", "initial");
+    const steady_mark = fba.end_index;
+
+    var kbuf: [16]u8 = undefined;
+    var vbuf: [32]u8 = undefined;
+    for (0..200) |i| {
+        const k = std.fmt.bufPrint(&kbuf, "x-hdr-{d}", .{i}) catch unreachable;
+        const v = std.fmt.bufPrint(&vbuf, "val-{d}-payload", .{i}) catch unreachable;
+        try dt.add(k, v);
+        try testing.expectEqual(steady_mark, fba.end_index);
+        const top = dt.get(0).?;
+        try testing.expectEqualStrings(k, top.name);
+        try testing.expectEqualStrings(v, top.value);
+    }
+}
+
+test "Decoder.decodeDiscard synchronizes dynamic table and rejects bombs with zero output allocs" {
+    var dec = Decoder.init(testing.allocator, 4096);
+    defer dec.deinit();
+
+    var enc = EncoderContext.initWithMaxSize(4096);
+    defer enc.deinit(testing.allocator);
+
+    // Block 1 (refused stream): seeds dynamic table via EncoderContext.
+    var b1: std.ArrayList(u8) = .empty;
+    defer b1.deinit(testing.allocator);
+    try enc.encodeRequest(testing.allocator, &b1, "GET", "https", "/refused", "edge.cdn.test", &.{
+        .{ .name = "x-cdn-pop", .value = "hkg-01" },
+        .{ .name = "user-agent", .value = "zig-cdn-bench/2.0" },
+    });
+    try dec.decodeDiscard(b1.items);
+
+    // Block 2 (accepted stream): references dynamic indices from Block 1!
+    var b2: std.ArrayList(u8) = .empty;
+    defer b2.deinit(testing.allocator);
+    try enc.encodeRequest(testing.allocator, &b2, "GET", "https", "/accepted", "edge.cdn.test", &.{
+        .{ .name = "x-cdn-pop", .value = "hkg-01" },
+        .{ .name = "user-agent", .value = "zig-cdn-bench/2.0" },
+    });
+    try testing.expect(b2.items.len < b1.items.len);
+
+    const hs = try dec.decode(testing.allocator, b2.items);
+    defer freeHeaders(testing.allocator, hs);
+    try testing.expectEqualStrings("edge.cdn.test", findHeader(hs, ":authority").?);
+    try testing.expectEqualStrings("hkg-01", findHeader(hs, "x-cdn-pop").?);
+    try testing.expectEqualStrings("zig-cdn-bench/2.0", findHeader(hs, "user-agent").?);
+}
+
+test "EncoderContext compresses repeatable CDN headers, skips high-churn fields, and emits RFC 7541 §4.2 TSUs" {
+    var enc = EncoderContext.initWithMaxSize(4096);
+    defer enc.deinit(testing.allocator);
+    var dec = Decoder.init(testing.allocator, 4096);
+    defer dec.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const resp_headers = [_]Header{
+        .{ .name = "Server", .value = "zig-cdn-edge/2.0" },
+        .{ .name = "Cache-Control", .value = "public, max-age=31536000, immutable" },
+        .{ .name = "Strict-Transport-Security", .value = "max-age=63072000; includeSubDomains" },
+        .{ .name = "ETag", .value = "\"obj-1\"" }, // high-churn -> not indexed
+        .{ .name = "Set-Cookie", .value = "sid=topsecret" }, // sensitive -> Never Indexed (0x10)
+    };
+
+    var out1: std.ArrayList(u8) = .empty;
+    defer out1.deinit(testing.allocator);
+    try enc.encodeResponse(testing.allocator, &out1, 200, &resp_headers, 1024);
+    const hs1 = try dec.decode(arena, out1.items);
+    try testing.expectEqualStrings("zig-cdn-edge/2.0", findHeader(hs1, "server").?);
+    try testing.expectEqualStrings("1024", findHeader(hs1, "content-length").?);
+
+    // ETag and Content-Length must NOT have entered the encoder's dynamic table,
+    // while Server, Cache-Control, and Strict-Transport-Security MUST be indexed (3 entries).
+    try testing.expectEqual(@as(usize, 3), enc.dyn.len());
+
+    var out2: std.ArrayList(u8) = .empty;
+    defer out2.deinit(testing.allocator);
+    try enc.encodeResponse(testing.allocator, &out2, 200, &resp_headers, 2048);
+    // Second response compresses the 3 long headers to 3 single-byte indices!
+    try testing.expect(out2.items.len * 2 < out1.items.len);
+    const hs2 = try dec.decode(arena, out2.items);
+    try testing.expectEqualStrings("public, max-age=31536000, immutable", findHeader(hs2, "cache-control").?);
+    try testing.expectEqualStrings("sid=topsecret", findHeader(hs2, "set-cookie").?);
+    try testing.expectEqualStrings("2048", findHeader(hs2, "content-length").?);
+
+    // Simulate peer shrinking SETTINGS_HEADER_TABLE_SIZE to 64 then raising to 2048:
+    // RFC 7541 §4.2 requires emitting TSU(64) followed by TSU(2048) on next block.
+    enc.notePeerHeaderTableSize(64, 64);
+    enc.notePeerHeaderTableSize(2048, 2048);
+
+    var out3: std.ArrayList(u8) = .empty;
+    defer out3.deinit(testing.allocator);
+    try enc.encodeResponse(testing.allocator, &out3, 204, &.{.{ .name = "x-after", .value = "resize" }}, null);
+    // TSU(64): 0x20 | 31 = 0x3f, 64 - 31 = 33 (0x21)
+    try testing.expectEqual(@as(u8, 0x3f), out3.items[0]);
+    try testing.expectEqual(@as(u8, 33), out3.items[1]);
+    const hs3 = try dec.decode(arena, out3.items);
+    try testing.expectEqual(@as(usize, 2048), dec.dyn.max_size);
+    try testing.expectEqualStrings("204", findHeader(hs3, ":status").?);
+    try testing.expectEqualStrings("resize", findHeader(hs3, "x-after").?);
 }

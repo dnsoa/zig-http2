@@ -336,3 +336,136 @@ test "CDN streaming round trip: large response batches with custom max_frame_siz
     }
     try testing.expectEqual(payload_size, total);
 }
+
+test "CDN phase 2 end-to-end: stateful HPACK compression, static zero-copy, and concurrent multi-stream flow control" {
+    const std = @import("std");
+    const testing = std.testing;
+    const Helper = struct {
+        fn serve(srv: *Server, fd: std.posix.fd_t) void {
+            defer _ = std.c.close(fd);
+            const s: std.Io.net.Stream = .{ .socket = .{
+                .handle = fd,
+                .address = std.Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable,
+            } };
+            var rbuf: [16384]u8 = undefined;
+            var wbuf: [32768]u8 = undefined;
+            var sr = s.reader(srv.io, &rbuf);
+            var sw = s.writer(srv.io, &wbuf);
+            serveConn(srv, &sr.interface, &sw.interface, "203.0.113.9", "https");
+        }
+        fn cdnEdge(ctx: *Context) anyerror!void {
+            const pop = ctx.req.get("x-cdn-pop") orelse "none";
+            const auth = ctx.req.get("authorization") orelse "missing";
+            try ctx.res.header("server", "zig-cdn-edge/2.0");
+            try ctx.res.header("cache-control", "public, max-age=31536000, immutable");
+            try ctx.res.header("strict-transport-security", "max-age=63072000; includeSubDomains");
+            try ctx.res.header("x-served-by", pop);
+            try ctx.res.header("set-cookie", auth);
+            try ctx.res.header("etag", ctx.req.path());
+            if (std.mem.eql(u8, ctx.req.path(), "/stream")) {
+                const body: [48_000]u8 = @splat('S');
+                try ctx.res.send(200, "application/octet-stream", &body);
+            } else {
+                try ctx.res.send(200, "text/plain", ctx.req.path());
+            }
+        }
+    };
+
+    var fds: [2]c_int = undefined;
+    if (std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds) != 0) return error.SocketPairFailed;
+    errdefer _ = std.c.close(fds[1]);
+
+    var srv: Server = .{
+        .io = testing.io,
+        .gpa = testing.allocator,
+        .handler = Helper.cdnEdge,
+        .config = .{ .idle_timeout_ms = 10_000, .max_encoder_table_size = 4096 },
+    };
+    const th = try std.Thread.spawn(.{}, Helper.serve, .{ &srv, fds[0] });
+    defer th.join();
+    defer _ = std.c.close(fds[1]);
+
+    const peer: std.Io.net.Stream = .{ .socket = .{
+        .handle = fds[1],
+        .address = std.Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable,
+    } };
+    var rbuf: [16384]u8 = undefined;
+    var wbuf: [16384]u8 = undefined;
+    var sr = peer.reader(testing.io, &rbuf);
+    var sw = peer.writer(testing.io, &wbuf);
+
+    var client: Client = undefined;
+    try client.initWithConfig(testing.io, testing.allocator, &sr.interface, &sw.interface, .{
+        .connection_window_size = 256 * 1024,
+        .initial_window_size = 32 * 1024,
+        .max_encoder_table_size = 4096,
+    });
+    defer client.deinit();
+
+    // 25 sequential hits exercising bidirectional dynamic HPACK compression + static zero-copy.
+    var pbuf: [32]u8 = undefined;
+    for (0..25) |i| {
+        const req_path = std.fmt.bufPrint(&pbuf, "/hit/{d}", .{i}) catch unreachable;
+        const s = try client.openStream(.{
+            .method = "GET",
+            .path = req_path,
+            .authority = "cdn.example.com",
+            .headers = &.{
+                .{ .name = "x-cdn-pop", .value = "sin-01" },
+                .{ .name = "user-agent", .value = "zig-cdn-probe/2.0" },
+                .{ .name = "authorization", .value = "Bearer tok-xyz" },
+            },
+        }, true);
+        defer s.close();
+
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        const ev = try s.readEvent(arena_state.allocator());
+        try testing.expect(ev == .headers);
+        // `:status: 200` is borrowed directly from `.rodata` StaticTable.
+        try testing.expect(hpack.isStaticSlice(ev.headers.headers[0].name));
+        try testing.expect(hpack.isStaticSlice(ev.headers.headers[0].value));
+
+        var out_buf: [64]u8 = undefined;
+        const n = try s.readBody(&out_buf);
+        try testing.expectEqualStrings(req_path, out_buf[0..n]);
+        try testing.expectEqual(@as(usize, 0), try s.readBody(&out_buf));
+    }
+
+    // Concurrent multi-stream downloads exercising lock-free `op_state` and per-stream `send_cond`.
+    const Worker = struct {
+        c: *Client,
+        ok: bool = false,
+        fn run(self: *@This()) void {
+            const st = self.c.openStream(.{
+                .method = "GET",
+                .path = "/stream",
+                .authority = "cdn.example.com",
+                .headers = &.{
+                    .{ .name = "x-cdn-pop", .value = "sin-01" },
+                    .{ .name = "authorization", .value = "Bearer tok-xyz" },
+                },
+            }, true) catch return;
+            defer st.close();
+
+            var hdr_mem: [1024]u8 = undefined;
+            var fba = std.heap.FixedBufferAllocator.init(&hdr_mem);
+            const ev = st.readEvent(fba.allocator()) catch return;
+            if (ev != .headers) return;
+
+            var got: usize = 0;
+            var chunk: [8192]u8 = undefined;
+            while (true) {
+                const n = st.readBody(&chunk) catch return;
+                if (n == 0) break;
+                got += n;
+            }
+            self.ok = (got == 48_000);
+        }
+    };
+    var workers: [4]Worker = @splat(.{ .c = &client });
+    var threads: [4]std.Thread = undefined;
+    for (&workers, 0..) |*w, idx| threads[idx] = try std.Thread.spawn(.{}, Worker.run, .{w});
+    for (&threads) |t| t.join();
+    for (&workers) |w| try testing.expect(w.ok);
+}
