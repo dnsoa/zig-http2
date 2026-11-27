@@ -66,6 +66,116 @@ pub fn clampInitialWindow(v: u32) u32 {
     return @min(v, 0x7fff_ffff);
 }
 
+/// Clamps a configured `SETTINGS_MAX_FRAME_SIZE` to the RFC 9113 §6.5.2 range
+/// `[16384, 16777215]` (`[2^14, 2^24-1]`).
+pub fn clampMaxFrameSize(v: u32) u32 {
+    return @min(@max(v, our_max_frame_size), 16777215);
+}
+
+const TimedOp = union(enum) { work: anyerror!void, timer: void };
+
+fn timerThunk(io: std.Io, ms: u64) void {
+    std.Io.sleep(io, .{ .nanoseconds = @as(i96, ms) * std.time.ns_per_ms }, .awake) catch {};
+}
+
+/// Runs blocking `f(args...)` (must return `anyerror!void`) raced against a `ms`
+/// deadline; returns `error.Timeout` when the deadline wins. The loser is
+/// canceled. `ms == 0` disables the deadline and invokes `f` inline.
+pub fn runTimed(io: std.Io, ms: u64, f: anytype, args: anytype) anyerror!void {
+    if (ms == 0) return @call(.auto, f, args);
+    var buf: [2]TimedOp = undefined;
+    var sel = std.Io.Select(TimedOp).init(io, &buf);
+    // Spawn the timer first so if only one concurrency slot is available and
+    // `.work` fails to spawn, `.work` is never cancelled mid-flight after
+    // consuming or emitting partial transport bytes.
+    sel.concurrent(.timer, timerThunk, .{ io, ms }) catch return @call(.auto, f, args);
+    sel.concurrent(.work, f, args) catch {
+        while (sel.cancel()) |_| {}
+        return @call(.auto, f, args);
+    };
+    const first = try sel.await();
+    var ok = switch (first) {
+        .work => |r| if (r) |_| true else |_| false,
+        .timer => false,
+    };
+    var work_err: ?anyerror = switch (first) {
+        .work => |r| if (r) |_| null else |e| e,
+        .timer => null,
+    };
+    while (sel.cancel()) |leftover| switch (leftover) {
+        .work => |r| if (r) |_| {
+            ok = true;
+        } else |e| {
+            if (work_err == null) work_err = e;
+        },
+        .timer => {},
+    };
+    if (ok) return;
+    return switch (first) {
+        .timer => error.Timeout,
+        .work => work_err.?,
+    };
+}
+
+/// Bounded circular byte buffer for inbound HTTP/2 stream DATA (`O(window_size)`
+/// across sustained streaming reads even when never drained completely to zero).
+pub const RxRing = struct {
+    buf: []u8 = &.{},
+    head: usize = 0,
+    len: usize = 0,
+
+    pub fn deinit(self: *RxRing, gpa: std.mem.Allocator) void {
+        if (self.buf.len > 0) gpa.free(self.buf);
+        self.* = .{};
+    }
+
+    pub fn appendSlice(self: *RxRing, gpa: std.mem.Allocator, data: []const u8) !void {
+        if (data.len == 0) return;
+        const needed = try std.math.add(usize, self.len, data.len);
+        if (needed > self.buf.len) {
+            var new_cap: usize = if (self.buf.len == 0) 4096 else self.buf.len;
+            while (new_cap < needed) {
+                new_cap = std.math.mul(usize, new_cap, 2) catch needed;
+            }
+            const new_buf = try gpa.alloc(u8, new_cap);
+            if (self.len > 0) {
+                const first = @min(self.len, self.buf.len - self.head);
+                @memcpy(new_buf[0..first], self.buf[self.head..][0..first]);
+                if (first < self.len) {
+                    @memcpy(new_buf[first..self.len], self.buf[0 .. self.len - first]);
+                }
+            }
+            if (self.buf.len > 0) gpa.free(self.buf);
+            self.buf = new_buf;
+            self.head = 0;
+        }
+        const tail = (self.head + self.len) % self.buf.len;
+        const first = @min(data.len, self.buf.len - tail);
+        @memcpy(self.buf[tail..][0..first], data[0..first]);
+        if (first < data.len) {
+            @memcpy(self.buf[0 .. data.len - first], data[first..]);
+        }
+        self.len += data.len;
+    }
+
+    pub fn read(self: *RxRing, dst: []u8) usize {
+        const n = @min(self.len, dst.len);
+        if (n == 0) return 0;
+        const first = @min(n, self.buf.len - self.head);
+        @memcpy(dst[0..first], self.buf[self.head..][0..first]);
+        if (first < n) {
+            @memcpy(dst[first..n], self.buf[0 .. n - first]);
+        }
+        self.len -= n;
+        if (self.len == 0) {
+            self.head = 0;
+        } else {
+            self.head = (self.head + n) % self.buf.len;
+        }
+        return n;
+    }
+};
+
 pub const ParsedHeader = struct { length: u32, ftype: FrameType, flags: u8, sid: u31 };
 
 pub fn putHeader(buf: *[9]u8, length: usize, ftype: FrameType, flags: u8, sid: u31) void {
@@ -244,4 +354,9 @@ test "proto field and token validators enforce RFC 9113 / RFC 9110 rules" {
     try testing.expectEqual(@as(u32, 131072), clampInitialWindow(131072));
     try testing.expectEqual(@as(u32, 0x7fff_ffff), clampInitialWindow(0x8000_0000));
     try testing.expectEqual(@as(u32, 0x7fff_ffff), clampInitialWindow(0xffff_ffff));
+
+    try testing.expectEqual(@as(u32, 16384), clampMaxFrameSize(0));
+    try testing.expectEqual(@as(u32, 16384), clampMaxFrameSize(4096));
+    try testing.expectEqual(@as(u32, 65536), clampMaxFrameSize(65536));
+    try testing.expectEqual(@as(u32, 16777215), clampMaxFrameSize(32 * 1024 * 1024));
 }

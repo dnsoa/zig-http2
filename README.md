@@ -5,13 +5,14 @@ A dependency-free, transport-agnostic HTTP/2 (RFC 9113) and HPACK (RFC 7541) ser
 ## Features
 
 - **Transport-agnostic**: Runs over any `*std.Io.Reader` / `*std.Io.Writer` pair (TLS-wrapped sockets, TCP, Unix sockets, in-memory pipes).
-- **Server & Client**: Full multiplexed HTTP/2 framing, stream & connection flow control, trailers, streaming request/response bodies (`ctx.body_reader`), and bidirectional streaming (gRPC-ready).
+- **Server & Client**: Full multiplexed HTTP/2 framing, stream & connection flow control, bounded 64 KiB multi-frame write batching + vectored writes, trailers, zero-allocation streaming request/response bodies (`ctx.body_reader`, `stream.readBody` / `stream.bodyReader()`), and bidirectional streaming (gRPC & CDN origin-ready).
 - **HPACK (RFC 7541)**: Separate decoder/encoder direction split with dynamic table ring buffer, Huffman shorter-of-two encoding, Never-Indexed marking for sensitive headers (`authorization`, `cookie`, `set-cookie`, `proxy-authorization`), and decompression-bomb limits (`SETTINGS_MAX_HEADER_LIST_SIZE`).
 - **Hardened & RFC 9113 compliant**:
   - Strict header/pseudo-header/content-length validation and `cookie` joining.
-  - Protections against Rapid Reset (CVE-2023-44487), CONTINUATION floods (CVE-2024-27316), and control-frame / empty-DATA floods (CVE-2019-9512 / 9515 / 9518).
-  - Bounded circular request body buffer (`O(initial_window_size)`).
-  - Per-RPC deadlines (`ctx.setDeadline` / `ctx.setDeadlineIn`), graceful shutdown (`Server.requestStop()` + `drain_timeout_ms`), and client keepalive PINGs.
+  - Protections against Rapid Reset (CVE-2023-44487), CONTINUATION floods (CVE-2024-27316), control-frame / empty-DATA floods (CVE-2019-9512 / 9515 / 9518), and 1-byte `WINDOW_UPDATE` silly-window amplification.
+  - Non-blocking high-priority control-frame piggybacking (`PING`/`SETTINGS` ACKs, `WINDOW_UPDATE`, `RST_STREAM`) and configurable outbound `write_timeout_ms` (anti-slow-read / TCP zero-window DoS).
+  - Bounded circular request & response body buffers (`O(initial_window_size)`).
+  - Per-RPC deadlines (`ctx.setDeadline` / `ctx.setDeadlineIn`), O(1) leader-elected graceful shutdown (`Server.requestStop()` + `drain_timeout_ms`), and `std.Io` task-driven client reader with keepalive PINGs.
 
 ## Requirements
 
@@ -69,6 +70,8 @@ var client: h2.Client = undefined;
 try client.initWithConfig(io, gpa, &reader, &writer, .{
     .connection_window_size = 1 << 20,
     .initial_window_size = 1 << 20,
+    .max_frame_size = 64 * 1024,
+    .write_timeout_ms = 30_000,
     .keepalive_time_ms = 30_000,
     .keepalive_timeout_ms = 10_000,
 });
@@ -81,15 +84,15 @@ const stream = try client.openStreamWithBody(.{
 }, "hello over h2", true);
 defer stream.close();
 
-while (true) {
-    const ev = stream.readEvent(arena) catch |err| switch (err) {
-        error.EndOfStream => break,
-        else => return err,
-    };
-    switch (ev) {
-        .headers => |h| if (h.end_stream) break,
-        .data => |d| if (d.end_stream) break,
-        .rst, .goaway => break,
+// Read initial response headers (on a short-lived header arena), then stream
+// the response body into a fixed buffer with zero per-frame heap allocations:
+const ev = try stream.readEvent(arena);
+if (ev == .headers and !ev.headers.end_stream) {
+    var buf: [16384]u8 = undefined;
+    while (true) {
+        const n = try stream.readBody(&buf);
+        if (n == 0) break;
+        // process buf[0..n]
     }
 }
 ```

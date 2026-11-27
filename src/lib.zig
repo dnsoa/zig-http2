@@ -252,3 +252,87 @@ test "Client.openStreamWithBody echoes unary and multi-frame bodies with Server 
         try testing.expectEqualSlices(u8, big, got.items);
     }
 }
+
+test "CDN streaming round trip: large response batches with custom max_frame_size and zero-alloc Stream.readBody" {
+    const std = @import("std");
+    const testing = std.testing;
+    const payload_size: usize = 150_000;
+    const Helper = struct {
+        fn serve(srv: *Server, fd: std.posix.fd_t) void {
+            defer _ = std.c.close(fd);
+            const s: std.Io.net.Stream = .{ .socket = .{
+                .handle = fd,
+                .address = std.Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable,
+            } };
+            var rbuf: [16384]u8 = undefined;
+            var wbuf: [65536]u8 = undefined;
+            var sr = s.reader(srv.io, &rbuf);
+            var sw = s.writer(srv.io, &wbuf);
+            serveConn(srv, &sr.interface, &sw.interface, null, "https");
+        }
+        fn originHandler(ctx: *Context) anyerror!void {
+            ctx.res.status(200);
+            try ctx.res.header("content-type", "application/octet-stream");
+            ctx.res.setContentLength(payload_size);
+            var chunk: [50_000]u8 = undefined;
+            for (0..3) |part| {
+                for (&chunk, 0..) |*b, idx| b.* = @truncate((part * 50_000 + idx) *% 13 +% 5);
+                try ctx.res.write(&chunk);
+            }
+            try ctx.res.finish();
+        }
+    };
+
+    var fds: [2]c_int = undefined;
+    if (std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds) != 0) return error.SocketPairFailed;
+    errdefer _ = std.c.close(fds[1]);
+
+    var srv: Server = .{
+        .io = testing.io,
+        .gpa = testing.allocator,
+        .handler = Helper.originHandler,
+        .config = .{ .idle_timeout_ms = 10_000, .max_frame_size = 32768 },
+    };
+    const th = try std.Thread.spawn(.{}, Helper.serve, .{ &srv, fds[0] });
+    defer th.join();
+    defer _ = std.c.close(fds[1]);
+
+    const peer: std.Io.net.Stream = .{ .socket = .{
+        .handle = fds[1],
+        .address = std.Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable,
+    } };
+    var rbuf: [32768]u8 = undefined;
+    var wbuf: [16384]u8 = undefined;
+    var sr = peer.reader(testing.io, &rbuf);
+    var sw = peer.writer(testing.io, &wbuf);
+
+    var client: Client = undefined;
+    try client.initWithConfig(testing.io, testing.allocator, &sr.interface, &sw.interface, .{
+        .connection_window_size = 512 * 1024,
+        .initial_window_size = 512 * 1024,
+        .max_frame_size = 32768,
+    });
+    defer client.deinit();
+
+    const s = try client.openStream(.{ .method = "GET", .path = "/asset.bin", .authority = "cdn.example.com" }, true);
+    defer s.close();
+
+    var hdr_buf: [512]u8 = undefined;
+    var hdr_fba = std.heap.FixedBufferAllocator.init(&hdr_buf);
+    const ev = try s.readEvent(hdr_fba.allocator());
+    try testing.expect(ev == .headers);
+    try testing.expect(!ev.headers.end_stream);
+
+    var total: usize = 0;
+    var buf: [16384]u8 = undefined;
+    while (true) {
+        const n = try s.readBody(&buf);
+        if (n == 0) break;
+        for (buf[0..n], 0..) |byte, idx| {
+            const exp: u8 = @truncate((total + idx) *% 13 +% 5);
+            try testing.expectEqual(exp, byte);
+        }
+        total += n;
+    }
+    try testing.expectEqual(payload_size, total);
+}
