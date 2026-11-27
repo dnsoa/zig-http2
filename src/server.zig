@@ -5114,16 +5114,29 @@ test "h2: graceful GOAWAY does not abort a handler that outlives idle_timeout_ms
     try testing.expectEqualStrings("pong", body[0..body_len]);
 }
 
-test "h2: graceful GOAWAY drain works under ConcurrencyUnavailable fallback (#17)" {
+test "h2: graceful GOAWAY drain works under ConcurrencyUnavailable fallback (#17, #47)" {
+    const Helper = struct {
+        fn echoWithSafetyDeadline(ctx: *types.Context) anyerror!void {
+            // Bound `BodyReader.read` so if `readDrainHeader` regresses and
+            // exits early into `drainWorkers(true)`, `deadlineWaiter` wakes the
+            // stranded worker instead of hanging `t.join()` until CI timeout (#47).
+            ctx.setDeadlineIn(1_500 * std.time.ns_per_ms);
+            return h2EchoHandler(ctx);
+        }
+    };
+
     var threaded = std.Io.Threaded.init(testing.allocator, .{ .concurrent_limit = .nothing });
     defer threaded.deinit();
     const io = threaded.io();
 
     const fds = try newSocketPair();
-    var srv: Server = .{ .io = io, .gpa = testing.allocator, .handler = h2EchoHandler, .config = .{} };
+    var srv: Server = .{ .io = io, .gpa = testing.allocator, .handler = Helper.echoWithSafetyDeadline, .config = .{} };
     const t = try std.Thread.spawn(.{}, serveRawH2OnFd, .{ &srv, fds[0] });
     defer t.join();
-    defer _ = c.close(fds[1]);
+    defer {
+        _ = std.c.shutdown(fds[1], std.posix.SHUT.RDWR);
+        _ = c.close(fds[1]);
+    }
 
     var rbuf: [4096]u8 = undefined;
     var wbuf: [4096]u8 = undefined;
@@ -5131,21 +5144,25 @@ test "h2: graceful GOAWAY drain works under ConcurrencyUnavailable fallback (#17
     var writer = peerStream(fds[1]).writer(io, &wbuf);
     try rawHandshake(&reader.interface, &writer.interface);
 
-    // Open stream 1 without END_STREAM, send graceful GOAWAY, then send the body:
-    // readDrainHeader's synchronous fallback must keep reading DATA instead of
-    // handing off to drainWorkers(true) and hanging the blocked worker.
+    // Open stream 1 without END_STREAM, send graceful GOAWAY, sleep so GOAWAY is
+    // drained and `r.bufferedLen() == 0`, then send DATA: `readDrainHeader` must
+    // take its `ConcurrencyUnavailable` synchronous-read fallback rather than the
+    // buffered fast path (#47), and keep reading DATA instead of handing off to
+    // `drainWorkers(true)` and hanging the blocked worker (#17).
     try writeFrame(&writer.interface, .headers, flag_end_headers, 1, &trailers_req_block);
     var goaway: [8]u8 = @splat(0);
     try writeFrame(&writer.interface, .goaway, 0, 0, &goaway);
+    Io.sleep(testing.io, .{ .nanoseconds = 150 * std.time.ns_per_ms }, .awake) catch {};
     try writeFrame(&writer.interface, .data, flag_end_stream, 1, "sync-body");
 
     var body: [64]u8 = undefined;
     var body_len: usize = 0;
     var ended = false;
-    for (0..30) |_| {
+    for (0..20) |_| {
         const maybe = nextFrameWithin(testing.allocator, &reader.interface, fds[1], 100) catch break;
         var f = maybe orelse continue;
         defer f.deinit(testing.allocator);
+        if (f.header.ftype == .rst_stream and f.header.sid == 1) break;
         if (f.header.ftype != .data or f.header.sid != 1) continue;
         @memcpy(body[body_len..][0..f.payload.len], f.payload);
         body_len += f.payload.len;
