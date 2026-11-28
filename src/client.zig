@@ -25,6 +25,8 @@ const Io = std.Io;
 const types = @import("types.zig");
 const hpack = @import("hpack.zig");
 const p2 = @import("proto.zig");
+const frame_writer = @import("frame_writer.zig");
+const priority_sched = @import("priority_sched.zig");
 
 pub const Header = hpack.Header;
 
@@ -53,14 +55,64 @@ pub const Event = union(enum) {
     goaway,
 };
 
+/// Contiguous single-slab header block queued on a `Stream`: both the `[]Header`
+/// array and all non-static name/value bytes reside in `slab` (`1` alloc on
+/// enqueue, `1` free on consume/teardown; static-table strings stay zero-copy).
+const QueuedHeaders = struct {
+    headers: []const Header,
+    slab: []align(@alignOf(Header)) u8,
+
+    fn deinit(self: QueuedHeaders, gpa: std.mem.Allocator) void {
+        if (self.slab.len > 0) gpa.free(self.slab);
+    }
+};
+
 /// One inbound item buffered on a stream's queue. Response DATA bytes are
 /// stored in the stream's contiguous circular `rx_buf` (`proto.RxRing`) rather
-/// than individual `gpa`-allocated slices; `Queued.data` tracks only the
-/// unpadded byte length (`len`) and wire flow-control cost (`fc_cost`).
-const Queued = union(enum) {
-    headers: []const Header,
+/// than individual `gpa`-allocated slices; `data` tracks only `len` and `fc_cost`.
+const QueuedKind = union(enum) {
+    headers: QueuedHeaders,
     data: struct { len: u32, fc_cost: u32 },
 };
+
+const QueuedItem = struct {
+    end_stream: bool,
+    kind: QueuedKind,
+};
+
+fn packQueuedHeaders(gpa: std.mem.Allocator, decoded: []const Header) !QueuedHeaders {
+    if (decoded.len == 0) return .{ .headers = &.{}, .slab = &.{} };
+    const hdr_bytes = std.math.mul(usize, decoded.len, @sizeOf(Header)) catch return error.OutOfMemory;
+    var total_bytes = hdr_bytes;
+    for (decoded) |h| {
+        if (!hpack.isStaticSlice(h.name)) {
+            total_bytes = std.math.add(usize, total_bytes, h.name.len) catch return error.OutOfMemory;
+        }
+        if (!hpack.isStaticSlice(h.value)) {
+            total_bytes = std.math.add(usize, total_bytes, h.value.len) catch return error.OutOfMemory;
+        }
+    }
+    const slab = try gpa.alignedAlloc(u8, .of(Header), total_bytes);
+    const out_hdrs: []Header = @as([*]Header, @ptrCast(slab.ptr))[0..decoded.len];
+    var off: usize = hdr_bytes;
+    for (decoded, 0..) |h, i| {
+        const nm: []const u8 = if (hpack.isStaticSlice(h.name)) h.name else blk: {
+            const dst = slab[off .. off + h.name.len];
+            @memcpy(dst, h.name);
+            off += h.name.len;
+            break :blk dst;
+        };
+        const vl: []const u8 = if (hpack.isStaticSlice(h.value)) h.value else blk: {
+            const dst = slab[off .. off + h.value.len];
+            @memcpy(dst, h.value);
+            off += h.value.len;
+            break :blk dst;
+        };
+        out_hdrs[i] = .{ .name = nm, .value = vl };
+    }
+    std.debug.assert(off == total_bytes);
+    return .{ .headers = out_hdrs, .slab = slab };
+}
 
 /// Hard cap on one response's accumulated header block across HEADERS +
 /// CONTINUATION (CVE-2024-27316 class); matches the server's bound.
@@ -83,8 +135,9 @@ pub const Config = struct {
     /// Connection-level inbound flow-control window, aggregated across streams.
     /// RFC 9113 fixes the initial connection window at 65535; anything larger is
     /// advertised via a stream-0 WINDOW_UPDATE during handshake. Clamped to
-    /// [65535, 2^31-1]. Default 1 MiB matches the server (#39).
-    connection_window_size: u32 = 1 << 20,
+    /// [65535, 2^31-1]. Default 4 MiB lets multi-stream origin downloads run at
+    /// `initial_window_size = 1 MiB` without connection-level head-of-line stalls.
+    connection_window_size: u32 = 4 << 20,
     /// `SETTINGS_INITIAL_WINDOW_SIZE` advertised for each stream we open.
     /// Clamped to [0, 2^31-1]. Default 1 MiB (#39).
     initial_window_size: u32 = 1 << 20,
@@ -106,6 +159,10 @@ pub const Config = struct {
     /// capping per-connection memory even if the server advertises a massive
     /// `SETTINGS_HEADER_TABLE_SIZE`. Set to 0 to disable dynamic-table encoding.
     max_encoder_table_size: u32 = p2.our_header_table_size,
+    /// Inbound `SETTINGS_HEADER_TABLE_SIZE` enforced on our HPACK decoder dynamic
+    /// table (and advertised in initial `SETTINGS` when `!= 4096`). Set to `0` to
+    /// disable inbound dynamic-table indexing.
+    max_decoder_table_size: u32 = p2.our_header_table_size,
     /// `SETTINGS_MAX_HEADER_LIST_SIZE` advertised and enforced inbound on
     /// decoded response/trailer header lists. Set to `0` to disable the cap
     /// and omit `SETTINGS_MAX_HEADER_LIST_SIZE`.
@@ -135,6 +192,13 @@ pub const Stream = struct {
     /// True while parked on `client.send_cond` waiting for connection send window.
     /// Guarded by `client.send_mu`.
     waiting_conn_window: bool = false,
+    /// RFC 9218 Extensible Priority & intrusive 8-bucket outbound `DATA` scheduler
+    /// links (guarded by `client.send_mu`, zero heap allocations).
+    priority: p2.StreamPriority = .{},
+    sched_prev: ?*Stream = null,
+    sched_next: ?*Stream = null,
+    in_sched: bool = false,
+    sched_bucket: u3 = 3,
     /// Flow-control window for DATA we receive (RFC 7540 §6.9.2), decremented
     /// by the reader thread on each DATA frame and credited back as the caller
     /// consumes items. Guarded by `recv_mu`; written by the reader under
@@ -147,15 +211,9 @@ pub const Stream = struct {
     recv_mu: Io.Mutex = .init,
     recv_cond: Io.Condition = .init,
     rx_buf: p2.RxRing = .{},
-    queue: std.ArrayList(Queued) = .empty,
-    /// end_stream flags for the queued items — tracked alongside so a queued
-    /// DATA/HEADERS can report whether it closes the stream.
-    end_flags: std.ArrayList(bool) = .empty,
-    is_headers: std.ArrayList(bool) = .empty,
-    /// Read cursor into the queues: `readEvent` advances this instead of
-    /// `orderedRemove(0)` (which is O(n) per event → O(n²) per stream). The
-    /// backing arrays are cleared once fully drained (`q_head == len`), which
-    /// happens every flow-control cycle, so they stay bounded.
+    queue: std.ArrayList(QueuedItem) = .empty,
+    /// Read cursor into `queue`: `readEvent`/`readBody` advances this instead of
+    /// `orderedRemove(0)` (`O(1)` per event). Backing array is cleared once drained.
     q_head: usize = 0,
     reset: ?u32 = null,
     rst_delivered: bool = false,
@@ -196,10 +254,7 @@ pub const Stream = struct {
     fn advanceQueue(self: *Stream) void {
         self.q_head += 1;
         if (self.q_head == self.queue.items.len) {
-            // Fully drained: reclaim the backing arrays and reset the cursor.
             self.queue.clearRetainingCapacity();
-            self.end_flags.clearRetainingCapacity();
-            self.is_headers.clearRetainingCapacity();
             self.q_head = 0;
         }
     }
@@ -229,67 +284,124 @@ pub const Stream = struct {
     /// Sends `data` as flow-controlled DATA frames; `end_stream` half-closes.
     /// Blocks while the send window is empty; errors on reset/teardown.
     pub fn send(self: *Stream, data: []const u8, end_stream: bool) !void {
+        const one = [_][]const u8{data};
+        return self.sendVec(&one, end_stream);
+    }
+
+    /// Sends scatter-gather `slices` as flow-controlled `DATA` frames without
+    /// copying into an intermediate contiguous buffer, scheduled by RFC 9218
+    /// `urgency` (`0..7`) and `incremental` fairness when `conn_send_window` is contended.
+    pub fn sendVec(self: *Stream, slices: []const []const u8, end_stream: bool) !void {
         const c = self.client;
         if (!c.tryBeginOp()) return error.ConnectionClosed;
         defer c.endOp();
         if (self.local_closed.load(.acquire)) return error.StreamClosed;
-        if (data.len == 0) {
+
+        var total_len: usize = 0;
+        for (slices) |s| total_len += s.len;
+        if (total_len == 0) {
             if (end_stream) {
-                try c.writeDataForStream(self, "", true);
-                c.noteEnd(self, true, false); // local half-closed
+                var idx0: usize = 0;
+                var off0: usize = 0;
+                try c.writeDataVecWindowForStream(self, &.{}, &idx0, &off0, 0, true);
+                c.noteEnd(self, true, false);
             }
             return;
         }
+
         var off: usize = 0;
-        while (off < data.len) {
+        var s_idx: usize = 0;
+        var s_off: usize = 0;
+        var rotate_on_reentry = false;
+        while (off < total_len) {
+            const max_frame: usize = c.peer_max_frame.load(.acquire);
+            const batch_cap: i64 = @intCast(@max(max_write_batch, max_frame));
+            var stayed_in_sched = false;
             c.send_mu.lockUncancelable(c.io);
+            if (rotate_on_reentry) {
+                rotate_on_reentry = false;
+                c.sched.rotateTail(self);
+                c.sched.wakeNext(c.io, c.conn_send_window);
+            }
             const n = blk: while (true) {
                 if (c.dead.load(.acquire)) {
+                    c.sched.leaveAndWake(c.io, self, c.conn_send_window);
                     c.send_mu.unlock(c.io);
                     return error.ConnectionClosed;
                 }
                 if (self.aborted.load(.acquire)) {
+                    c.sched.leaveAndWake(c.io, self, c.conn_send_window);
                     c.send_mu.unlock(c.io);
                     return error.StreamReset;
                 }
                 if (self.local_closed.load(.acquire)) {
+                    c.sched.leaveAndWake(c.io, self, c.conn_send_window);
                     c.send_mu.unlock(c.io);
                     return error.StreamClosed;
                 }
                 if (self.send_window <= 0) {
+                    c.sched.leaveAndWake(c.io, self, c.conn_send_window);
                     self.send_cond.waitUncancelable(c.io, &c.send_mu);
                     continue;
                 }
+                const remaining = total_len - off;
+                // Uncontended single-stream fast path: zero scheduler list touches.
+                if (!self.in_sched and c.sched.count == 0 and c.conn_send_window > 0 and remaining <= @as(usize, @intCast(@min(@min(self.send_window, c.conn_send_window), batch_cap)))) {
+                    const avail = @min(self.send_window, c.conn_send_window);
+                    const want: i64 = @min(@as(i64, @intCast(remaining)), @min(avail, batch_cap));
+                    self.send_window -= want;
+                    c.conn_send_window -= want;
+                    break :blk @as(usize, @intCast(want));
+                }
+
+                c.sched.pushTail(self);
                 if (c.conn_send_window <= 0) {
                     self.waiting_conn_window = true;
                     defer self.waiting_conn_window = false;
                     c.send_cond.waitUncancelable(c.io, &c.send_mu);
                     continue;
                 }
+                if (c.sched.top()) |top| {
+                    if (top != self) {
+                        self.send_cond.waitUncancelable(c.io, &c.send_mu);
+                        continue;
+                    }
+                }
+
+                const quantum: i64 = if (c.sched.count > 1) @intCast(max_frame) else batch_cap;
                 const avail = @min(self.send_window, c.conn_send_window);
-                const batch_cap: usize = @max(max_write_batch, c.peer_max_frame.load(.acquire));
-                const want: i64 = @min(@as(i64, @intCast(data.len - off)), @min(avail, @as(i64, @intCast(batch_cap))));
+                const want: i64 = @min(@as(i64, @intCast(remaining)), @min(avail, quantum));
                 self.send_window -= want;
                 c.conn_send_window -= want;
-                break :blk @as(usize, @intCast(want));
+                const got: usize = @intCast(want);
+                stayed_in_sched = true;
+                if (off + got < total_len and self.priority.incremental) {
+                    rotate_on_reentry = true;
+                }
+                break :blk got;
             };
             c.send_mu.unlock(c.io);
-            const last = off + n == data.len;
-            c.writeDataForStream(self, data[off .. off + n], end_stream and last) catch |err| {
+            const last = off + n == total_len;
+            c.writeDataVecWindowForStream(self, slices, &s_idx, &s_off, n, end_stream and last) catch |err| {
+                c.send_mu.lockUncancelable(c.io);
                 if (err == error.StreamReset or err == error.StreamClosed) {
-                    // Frame was not written on the wire; return both stream and connection send credit.
-                    c.send_mu.lockUncancelable(c.io);
                     self.send_window += @as(i64, @intCast(n));
                     c.conn_send_window += @as(i64, @intCast(n));
                     c.send_cond.broadcast(c.io);
-                    c.send_mu.unlock(c.io);
                 }
+                c.sched.leaveAndWake(c.io, self, c.conn_send_window);
+                c.send_mu.unlock(c.io);
                 return err;
             };
             off += n;
+            if (last and stayed_in_sched) {
+                c.send_mu.lockUncancelable(c.io);
+                c.sched.leaveAndWake(c.io, self, c.conn_send_window);
+                c.send_mu.unlock(c.io);
+            }
         }
         if (end_stream) {
-            c.noteEnd(self, true, false); // local half-closed
+            c.noteEnd(self, true, false);
         }
     }
 
@@ -318,9 +430,17 @@ pub const Stream = struct {
     }
 
     /// Emits an RFC 9218 `PRIORITY_UPDATE` frame on stream `0` dynamically
-    /// updating this stream's urgency (`0..7`) and `incremental` flag.
+    /// updating this stream's local outbound scheduler priority AND signaling
+    /// the peer's inbound response scheduler (`urgency 0..7`, `incremental`).
     pub fn setPriority(self: *Stream, prio: p2.StreamPriority) !void {
-        return self.client.sendPriorityUpdate(self.id, prio);
+        const c = self.client;
+        if (!c.tryBeginOp()) return error.ConnectionClosed;
+        defer c.endOp();
+        if (c.dead.load(.acquire)) return error.ConnectionClosed;
+        c.send_mu.lockUncancelable(c.io);
+        c.sched.reprioritize(c.io, self, prio, c.conn_send_window);
+        c.send_mu.unlock(c.io);
+        try c.emitPriorityUpdateFrame(self.id, prio);
     }
 
     /// Reads the next event on this stream, blocking until one is available.
@@ -343,50 +463,54 @@ pub const Stream = struct {
         self.recv_mu.lockUncancelable(c.io);
         defer self.recv_mu.unlock(c.io);
         while (true) {
-            // A local cancel() takes priority: return promptly (dropping any
-            // buffered items) so a blocked reader wakes the moment another
-            // thread cancels the stream.
             if (self.cancelled) return error.StreamCancelled;
             if (self.queue.items.len > self.q_head) {
-                const item = self.queue.items[self.q_head];
-                const end_stream = self.end_flags.items[self.q_head];
-                const is_hdr = self.is_headers.items[self.q_head];
-                // Allocate on `arena` BEFORE popping from `self.queue`/`rx_buf`:
-                // if `arena` OOMs, the buffered item stays queued so `close`/
-                // `deinit` still frees it and returns its flow-control credit.
-                if (is_hdr) {
-                    const hs = item.headers;
-                    const out = try arena.alloc(Header, hs.len);
-                    var copied: usize = 0;
-                    errdefer {
-                        for (out[0..copied]) |h| {
-                            hpack.freeSlice(arena, h.name);
-                            hpack.freeSlice(arena, h.value);
+                const entry = self.queue.items[self.q_head];
+                const end_stream = entry.end_stream;
+                switch (entry.kind) {
+                    .headers => |qh| {
+                        const hs = qh.headers;
+                        const out = try arena.alloc(Header, hs.len);
+                        errdefer arena.free(out);
+                        var str_bytes: usize = 0;
+                        for (hs) |h| {
+                            if (!hpack.isStaticSlice(h.name)) str_bytes += h.name.len;
+                            if (!hpack.isStaticSlice(h.value)) str_bytes += h.value.len;
                         }
-                        arena.free(out);
-                    }
-                    for (hs, 0..) |h, i| {
-                        const name = if (hpack.isStaticSlice(h.name)) h.name else try arena.dupe(u8, h.name);
-                        errdefer hpack.freeSlice(arena, name);
-                        const value = if (hpack.isStaticSlice(h.value)) h.value else try arena.dupe(u8, h.value);
-                        out[i] = .{ .name = name, .value = value };
-                        copied = i + 1;
-                    }
-                    self.advanceQueue();
-                    freeHeaders(c.gpa, hs);
-                    return .{ .headers = .{ .sid = self.id, .headers = out, .end_stream = end_stream } };
-                } else {
-                    const data_len: usize = item.data.len;
-                    const out = try arena.alloc(u8, data_len);
-                    const got = self.rx_buf.read(out);
-                    std.debug.assert(got == data_len);
-                    const fc = item.data.fc_cost;
-                    self.advanceQueue();
-                    const sw = self.consumeStreamWindowLocked(fc);
-                    credit = fc;
-                    stream_wu = sw.stream_amt;
-                    stream_ended = sw.stream_ended;
-                    return .{ .data = .{ .sid = self.id, .payload = out, .end_stream = end_stream } };
+                        const str_slab: []u8 = if (str_bytes > 0) try arena.alloc(u8, str_bytes) else &.{};
+                        var soff: usize = 0;
+                        for (hs, 0..) |h, i| {
+                            const name = if (hpack.isStaticSlice(h.name)) h.name else blk: {
+                                const dst = str_slab[soff .. soff + h.name.len];
+                                @memcpy(dst, h.name);
+                                soff += h.name.len;
+                                break :blk dst;
+                            };
+                            const value = if (hpack.isStaticSlice(h.value)) h.value else blk: {
+                                const dst = str_slab[soff .. soff + h.value.len];
+                                @memcpy(dst, h.value);
+                                soff += h.value.len;
+                                break :blk dst;
+                            };
+                            out[i] = .{ .name = name, .value = value };
+                        }
+                        self.advanceQueue();
+                        qh.deinit(c.gpa);
+                        return .{ .headers = .{ .sid = self.id, .headers = out, .end_stream = end_stream } };
+                    },
+                    .data => |d| {
+                        const data_len: usize = d.len;
+                        const out = try arena.alloc(u8, data_len);
+                        const got = self.rx_buf.readWithShrink(out, c.gpa, p2.rx_ring_retain_cap);
+                        std.debug.assert(got == data_len);
+                        const fc = d.fc_cost;
+                        self.advanceQueue();
+                        const sw = self.consumeStreamWindowLocked(fc);
+                        credit = fc;
+                        stream_wu = sw.stream_amt;
+                        stream_ended = sw.stream_ended;
+                        return .{ .data = .{ .sid = self.id, .payload = out, .end_stream = end_stream } };
+                    },
                 }
             }
             if (self.reset != null) {
@@ -442,46 +566,49 @@ pub const Stream = struct {
             if (self.cancelled) return error.StreamCancelled;
             var hit_eof = false;
             while (self.queue.items.len > self.q_head) {
-                const is_hdr = self.is_headers.items[self.q_head];
-                const end_stream = self.end_flags.items[self.q_head];
-                if (is_hdr) {
-                    if (copied > 0) {
-                        const sw = self.consumeStreamWindowLocked(credit);
-                        stream_wu = sw.stream_amt;
-                        stream_ended = sw.stream_ended;
-                        return copied;
-                    }
-                    if (end_stream) return 0; // Trailers (or Trailers-Only): body is complete.
-                    return error.HeadersPending;
-                }
-                const item = &self.queue.items[self.q_head].data;
-                const overhead: u32 = item.fc_cost - item.len;
-                if (item.len == 0) {
-                    credit += item.fc_cost;
-                    self.advanceQueue();
-                    if (end_stream) {
-                        hit_eof = true;
-                        break;
-                    }
-                    continue;
-                }
-                if (copied == dst.len) break;
-                const want: usize = @min(dst.len - copied, @as(usize, item.len));
-                const got = self.rx_buf.read(dst[copied .. copied + want]);
-                std.debug.assert(got == want);
-                copied += got;
-                const got_u32: u32 = @intCast(got);
-                const fc_take: u32 = got_u32 + overhead;
-                credit += fc_take;
-                item.len -= got_u32;
-                item.fc_cost -= fc_take;
-                if (item.len == 0) {
-                    std.debug.assert(item.fc_cost == 0);
-                    self.advanceQueue();
-                    if (end_stream) {
-                        hit_eof = true;
-                        break;
-                    }
+                const entry = &self.queue.items[self.q_head];
+                const end_stream = entry.end_stream;
+                switch (entry.kind) {
+                    .headers => {
+                        if (copied > 0) {
+                            const sw = self.consumeStreamWindowLocked(credit);
+                            stream_wu = sw.stream_amt;
+                            stream_ended = sw.stream_ended;
+                            return copied;
+                        }
+                        if (end_stream) return 0; // Trailers (or Trailers-Only): body is complete.
+                        return error.HeadersPending;
+                    },
+                    .data => |*item| {
+                        const overhead: u32 = item.fc_cost - item.len;
+                        if (item.len == 0) {
+                            credit += item.fc_cost;
+                            self.advanceQueue();
+                            if (end_stream) {
+                                hit_eof = true;
+                                break;
+                            }
+                            continue;
+                        }
+                        if (copied == dst.len) break;
+                        const want: usize = @min(dst.len - copied, @as(usize, item.len));
+                        const got = self.rx_buf.readWithShrink(dst[copied .. copied + want], c.gpa, p2.rx_ring_retain_cap);
+                        std.debug.assert(got == want);
+                        copied += got;
+                        const got_u32: u32 = @intCast(got);
+                        const fc_take: u32 = got_u32 + overhead;
+                        credit += fc_take;
+                        item.len -= got_u32;
+                        item.fc_cost -= fc_take;
+                        if (item.len == 0) {
+                            std.debug.assert(item.fc_cost == 0);
+                            self.advanceQueue();
+                            if (end_stream) {
+                                hit_eof = true;
+                                break;
+                            }
+                        }
+                    },
                 }
             }
             if (copied > 0) {
@@ -597,13 +724,14 @@ pub const Stream = struct {
     /// were already consumed (and freed) by `readEvent`/`readBody`, so only
     /// `[q_head..]` remains to free alongside `rx_buf`.
     fn freeQueued(self: *Stream, gpa: std.mem.Allocator) void {
-        for (self.queue.items[self.q_head..], self.is_headers.items[self.q_head..]) |item, is_hdr| {
-            if (is_hdr) freeHeaders(gpa, item.headers);
+        for (self.queue.items[self.q_head..]) |entry| {
+            switch (entry.kind) {
+                .headers => |qh| qh.deinit(gpa),
+                .data => {},
+            }
         }
         self.rx_buf.deinit(gpa);
         self.queue.deinit(gpa);
-        self.end_flags.deinit(gpa);
-        self.is_headers.deinit(gpa);
     }
 
     /// Sum of the flow-control cost of DATA still buffered (from `q_head`) — the
@@ -611,14 +739,17 @@ pub const Stream = struct {
     /// the caller consumes it.
     fn unconsumedFcCost(self: *const Stream) u32 {
         var sum: u32 = 0;
-        for (self.queue.items[self.q_head..], self.is_headers.items[self.q_head..]) |item, is_hdr| {
-            if (!is_hdr) sum += item.data.fc_cost;
+        for (self.queue.items[self.q_head..]) |entry| {
+            switch (entry.kind) {
+                .headers => {},
+                .data => |d| sum += d.fc_cost,
+            }
         }
         return sum;
     }
 };
 
-const HtsUpdate = struct { min: u32, last: u32 };
+const HtsUpdate = frame_writer.HtsUpdate;
 const op_wait_bit: u32 = 1 << 30;
 const op_sealed_bit: u32 = 1 << 31;
 const op_count_mask: u32 = ~(op_wait_bit | op_sealed_bit);
@@ -649,32 +780,19 @@ pub const Client = struct {
     /// True once the peer has advertised `SETTINGS_NO_RFC7540_PRIORITIES = 1` (RFC 9218).
     peer_no_rfc7540_priorities: std.atomic.Value(bool) = .init(false),
 
-    write_mu: Io.Mutex = .init,
-    /// Active outbound write timeout (ms); 0 = unbounded (default for whitebox
-    /// struct-literal tests; initialized from `cfg.write_timeout_ms` in `init`).
-    write_timeout_ms: u64 = 0,
-    /// Guarded by write_mu: poisoned on any write/flush failure or timeout so
-    /// later frames cannot land misaligned after a partial write.
-    write_broken: bool = false,
-    /// Guarded by write_mu: connection-stateful outbound HPACK encoder &
-    /// reusable buffer, mutated strictly in on-wire `HEADERS` emission order.
-    enc: hpack.EncoderContext = .{},
-    hpack_buf: std.ArrayList(u8) = .empty,
+    /// Shared serialized frame writer, connection-stateful outbound HPACK
+    /// encoder, and non-blocking control-frame piggyback queue.
+    fw: frame_writer.FrameWriter = .{
+        .io = undefined,
+        .w = undefined,
+    },
+    fw_bound: bool = false,
 
-    /// Non-blocking control-frame piggyback queue for `readerLoop` / `replenish`
-    /// when `write_mu` is actively held by a concurrent `DATA`/`HEADERS` sender.
-    /// Lock order: `write_mu -> ctrl_mu` (or `ctrl_mu` standalone on `tryLock` miss).
-    ctrl_mu: Io.Mutex = .init,
-    ctrl_buf: std.ArrayList(u8) = .empty,
-    ctrl_drain: std.ArrayList(u8) = .empty,
-    ctrl_hts_min: ?u32 = null,
-    ctrl_hts_last: ?u32 = null,
-    ctrl_broken: bool = false,
-
-    // Send-side flow control (connection + per-stream windows live here).
+    // Send-side flow control & RFC 9218 priority scheduler (guarded by `send_mu`).
     send_mu: Io.Mutex = .init,
     send_cond: Io.Condition = .init,
     conn_send_window: i64 = p2.default_window,
+    sched: priority_sched.PriorityScheduler(Stream) = .{},
 
     // Inbound (receive) flow control, connection level: every DATA frame is
     // deducted in full (padding included) on arrival and credited back only as
@@ -706,6 +824,7 @@ pub const Client = struct {
     peer_max_streams_snap: std.atomic.Value(u32) = .init(std.math.maxInt(u32)),
     active_streams_snap: std.atomic.Value(u32) = .init(0),
     ids_exhausted: std.atomic.Value(bool) = .init(false),
+    local_draining: std.atomic.Value(bool) = .init(false),
 
     keepalive_time_ms: std.atomic.Value(u64) = .init(0),
     keepalive_timeout_ms: std.atomic.Value(u64) = .init(0),
@@ -716,8 +835,9 @@ pub const Client = struct {
     reader_group: Io.Group = .init,
     reader_done: Io.Event = .unset,
     reader_group_started: std.atomic.Value(bool) = .init(false),
-    /// Reusable inbound frame payload scratch buffer (reader-thread-only, #41).
+    /// Reusable inbound frame payload scratch buffer & header decode arena (reader-thread-only).
     rx_scratch: std.ArrayList(u8) = .empty,
+    hdr_decode_arena: ?std.heap.ArenaAllocator = null,
     /// Shared anti-flood guard against hostile/compromised custom origins (reader-thread-only).
     flood: p2.FloodGuard = .{},
     /// Event-driven wakeup for the keepalive/teardown watcher on `deinit()`,
@@ -748,15 +868,36 @@ pub const Client = struct {
         return p2.clampMaxFrameSize(self.cfg.max_frame_size);
     }
 
-    fn initHandshakeThunk(self: *Client, settings: []const u8, cwnd: i64) anyerror!void {
-        try self.w.writeAll(p2.preface);
-        try self.writeFrameLocked(.settings, 0, 0, settings);
+    fn onWriterBroken(ctx: *anyopaque) void {
+        const self: *Client = @ptrCast(@alignCast(ctx));
+        self.kill();
+    }
+
+    fn writer(self: *Client) *frame_writer.FrameWriter {
+        if (!self.fw_bound) {
+            self.fw.io = self.io;
+            self.fw.w = self.w;
+            self.fw.gpa = self.gpa;
+            self.fw.write_timeout_ms = self.cfg.write_timeout_ms;
+            self.fw.on_broken_ctx = self;
+            self.fw.on_broken_fn = onWriterBroken;
+            self.fw_bound = true;
+        } else if (self.fw.on_broken_fn == null) {
+            self.fw.on_broken_ctx = self;
+            self.fw.on_broken_fn = onWriterBroken;
+        }
+        return &self.fw;
+    }
+
+    fn initHandshakeThunk(fw: *frame_writer.FrameWriter, settings: []const u8, cwnd: i64) anyerror!void {
+        try fw.w.writeAll(p2.preface);
+        try fw.frameLocked(.settings, 0, 0, settings);
         if (cwnd > p2.default_window) {
             var wu: [4]u8 = undefined;
             std.mem.writeInt(u32, &wu, @intCast(cwnd - p2.default_window), .big);
-            try self.writeFrameLocked(.window_update, 0, 0, &wu);
+            try fw.frameLocked(.window_update, 0, 0, &wu);
         }
-        try self.w.flush();
+        try fw.w.flush();
     }
 
     /// As `init`, with explicit receive-window, frame-size, timeout, and keepalive configuration.
@@ -764,7 +905,7 @@ pub const Client = struct {
         const cwnd = p2.clampConnWindow(cfg.connection_window_size);
         const iw = p2.clampInitialWindow(cfg.initial_window_size);
         const mfs = p2.clampMaxFrameSize(cfg.max_frame_size);
-        var dec = hpack.Decoder.init(gpa, p2.our_header_table_size);
+        var dec = hpack.Decoder.init(gpa, cfg.max_decoder_table_size);
         dec.max_list_size = cfg.max_header_list_size;
         self.* = .{
             .io = io,
@@ -772,31 +913,42 @@ pub const Client = struct {
             .r = r,
             .w = w,
             .dec = dec,
-            .enc = hpack.EncoderContext.initWithMaxSize(cfg.max_encoder_table_size),
+            .fw = .{
+                .io = io,
+                .w = w,
+                .gpa = gpa,
+                .write_timeout_ms = cfg.write_timeout_ms,
+                .enc = hpack.EncoderContext.initWithMaxSize(cfg.max_encoder_table_size),
+            },
+            .fw_bound = true,
             .cfg = cfg,
-            .write_timeout_ms = cfg.write_timeout_ms,
             .conn_recv_window = cwnd,
             .keepalive_time_ms = .init(cfg.keepalive_time_ms),
             .keepalive_timeout_ms = .init(cfg.keepalive_timeout_ms),
         };
-        errdefer self.dec.deinit();
+        const fw = self.writer();
+        errdefer {
+            fw.deinitWithAllocator(gpa);
+            self.dec.deinit();
+        }
         {
-            self.write_mu.lockUncancelable(self.io);
-            defer self.write_mu.unlock(self.io);
-            // Advertise ENABLE_PUSH=0, MAX_FRAME_SIZE, INITIAL_WINDOW_SIZE,
-            // and MAX_HEADER_LIST_SIZE (when > 0), plus stream-0 WINDOW_UPDATE
-            // if > 65535, coalesced into a single flush.
-            var settings: [24]u8 = undefined;
+            fw.lock();
+            defer fw.unlock();
+            var settings: [30]u8 = undefined;
             var slen: usize = 18;
             p2.putSetting(settings[0..6], p2.set_enable_push, 0);
             p2.putSetting(settings[6..12], p2.set_max_frame_size, mfs);
             p2.putSetting(settings[12..18], p2.set_initial_window_size, iw);
-            if (self.dec.max_list_size > 0) {
-                p2.putSetting(settings[18..24], p2.set_max_header_list_size, @intCast(@min(self.dec.max_list_size, std.math.maxInt(u32))));
-                slen = 24;
+            if (cfg.max_decoder_table_size != p2.our_header_table_size) {
+                p2.putSetting(settings[slen..][0..6], p2.set_header_table_size, cfg.max_decoder_table_size);
+                slen += 6;
             }
-            p2.runTimed(self.io, self.write_timeout_ms, initHandshakeThunk, .{ self, settings[0..slen], cwnd }) catch |err| {
-                self.write_broken = true;
+            if (self.dec.max_list_size > 0) {
+                p2.putSetting(settings[slen..][0..6], p2.set_max_header_list_size, @intCast(@min(self.dec.max_list_size, std.math.maxInt(u32))));
+                slen += 6;
+            }
+            p2.runTimed(self.io, fw.write_timeout_ms, initHandshakeThunk, .{ fw, settings[0..slen], cwnd }) catch |err| {
+                fw.broken = true;
                 return err;
             };
         }
@@ -858,10 +1010,10 @@ pub const Client = struct {
     }
 
     /// Lock-free count of concurrency slots immediately available for `tryOpenStream`.
-    /// Returns `0` once the connection is dead, sealed, draining after `GOAWAY`,
-    /// out of client stream IDs, or at `peerMaxStreams()`.
+    /// Returns `0` once the connection is dead, sealed, draining (`GOAWAY` or
+    /// `startDrain()`), out of client stream IDs, or at `peerMaxStreams()`.
     pub fn availableStreams(self: *const Client) u32 {
-        if (self.isSealed() or self.dead.load(.acquire) or self.hasGoaway() or self.ids_exhausted.load(.acquire)) {
+        if (self.isSealed() or self.dead.load(.acquire) or self.hasGoaway() or self.local_draining.load(.acquire) or self.ids_exhausted.load(.acquire)) {
             return 0;
         }
         return self.peer_max_streams_snap.load(.acquire) -| self.active_streams_snap.load(.acquire);
@@ -870,6 +1022,31 @@ pub const Client = struct {
     /// Lock-free health & capacity check for CDN origin connection-pool routers.
     pub fn canOpenStream(self: *const Client) bool {
         return self.availableStreams() > 0;
+    }
+
+    /// Returns `true` if graceful drain has been initiated locally (`startDrain()`)
+    /// or remotely (peer `GOAWAY` received).
+    pub fn isDraining(self: *const Client) bool {
+        return self.local_draining.load(.acquire) or self.hasGoaway();
+    }
+
+    /// Initiates graceful client connection drain for origin pool rotation:
+    /// marks the connection draining (`canOpenStream() == false`, new `openStream*`
+    /// calls return `error.GoingAway`), wakes any callers waiting in `admit_cond`,
+    /// and emits `GOAWAY(NO_ERROR, last_stream_id = 0)` while allowing all
+    /// already-open in-flight streams to finish normally. Idempotent.
+    pub fn startDrain(self: *Client) !void {
+        if (!self.tryBeginOp()) return error.ConnectionClosed;
+        defer self.endOp();
+        if (self.dead.load(.acquire)) return error.ConnectionClosed;
+        const already = self.local_draining.swap(true, .acq_rel);
+        self.wakeAdmit();
+        if (!already) {
+            var p: [8]u8 = undefined;
+            std.mem.writeInt(u32, p[0..4], 0, .big);
+            std.mem.writeInt(u32, p[4..8], @backingInt(p2.ErrorCode.no_error), .big);
+            try self.writeFrame(.goaway, 0, 0, &p);
+        }
     }
 
     /// Returns `true` once the server has advertised `SETTINGS_ENABLE_CONNECT_PROTOCOL = 1` (RFC 8441).
@@ -882,18 +1059,30 @@ pub const Client = struct {
         return self.peer_no_rfc7540_priorities.load(.acquire);
     }
 
-    /// Emits an RFC 9218 `PRIORITY_UPDATE` frame on stream `0` for `sid` (`> 0` odd client ID).
-    pub fn sendPriorityUpdate(self: *Client, sid: u31, prio: p2.StreamPriority) !void {
-        if (sid == 0 or sid % 2 == 0) return error.InvalidStreamId;
-        if (!self.tryBeginOp()) return error.ConnectionClosed;
-        defer self.endOp();
-        if (self.dead.load(.acquire)) return error.ConnectionClosed;
+    fn emitPriorityUpdateFrame(self: *Client, sid: u31, prio: p2.StreamPriority) !void {
         var payload: [20]u8 = undefined;
         std.mem.writeInt(u32, payload[0..4], @as(u32, sid), .big);
         var fbuf: [16]u8 = undefined;
         const fv = p2.formatPriorityField(prio, &fbuf);
         @memcpy(payload[4 .. 4 + fv.len], fv);
         try self.writeFrame(.priority_update, 0, 0, payload[0 .. 4 + fv.len]);
+    }
+
+    /// Emits an RFC 9218 `PRIORITY_UPDATE` frame on stream `0` for `sid` (`> 0` odd client ID)
+    /// and updates the local outbound scheduler if `sid` is currently open.
+    pub fn sendPriorityUpdate(self: *Client, sid: u31, prio: p2.StreamPriority) !void {
+        if (sid == 0 or sid % 2 == 0) return error.InvalidStreamId;
+        if (!self.tryBeginOp()) return error.ConnectionClosed;
+        defer self.endOp();
+        if (self.dead.load(.acquire)) return error.ConnectionClosed;
+        self.streams_mu.lockUncancelable(self.io);
+        if (self.streams.get(sid)) |st| {
+            self.send_mu.lockUncancelable(self.io);
+            self.sched.reprioritize(self.io, st, prio, self.conn_send_window);
+            self.send_mu.unlock(self.io);
+        }
+        self.streams_mu.unlock(self.io);
+        try self.emitPriorityUpdateFrame(sid, prio);
     }
 
     /// Releases the client: stops the reader thread, waits for in-flight
@@ -942,10 +1131,8 @@ pub const Client = struct {
             cur_op = self.op_state.load(.acquire);
         }
 
-        self.ctrl_buf.deinit(self.gpa);
-        self.ctrl_drain.deinit(self.gpa);
-        self.hpack_buf.deinit(self.gpa);
-        self.enc.deinit(self.gpa);
+        self.fw.deinitWithAllocator(self.gpa);
+        if (self.hdr_decode_arena) |*da| da.deinit();
         self.rx_scratch.deinit(self.gpa);
         self.dec.deinit();
         self.streams_mu.lockUncancelable(self.io);
@@ -1015,276 +1202,107 @@ pub const Client = struct {
         return (self.op_state.load(.acquire) & op_sealed_bit) != 0;
     }
 
-    fn markWriteBrokenLocked(self: *Client) void {
-        self.write_broken = true;
-        self.ctrl_mu.lockUncancelable(self.io);
-        self.ctrl_broken = true;
-        self.ctrl_buf.clearRetainingCapacity();
-        self.ctrl_hts_min = null;
-        self.ctrl_hts_last = null;
-        self.ctrl_mu.unlock(self.io);
-    }
-
-    fn failCtrlAllocAndUnlock(self: *Client, kill_on_err: bool) void {
-        self.ctrl_broken = true;
-        self.ctrl_buf.clearRetainingCapacity();
-        self.ctrl_hts_min = null;
-        self.ctrl_hts_last = null;
-        self.ctrl_mu.unlock(self.io);
-        if (self.write_mu.tryLock()) {
-            self.write_broken = true;
-            self.write_mu.unlock(self.io);
-        }
-        if (kill_on_err) self.kill();
-    }
-
-    fn writeFrameLocked(self: *Client, ftype: p2.FrameType, flags: u8, sid: u31, payload: []const u8) !void {
-        var hb: [9]u8 = undefined;
-        p2.putHeader(&hb, payload.len, ftype, flags, sid);
-        if (payload.len > 0) {
-            var vecs = [_][]const u8{ &hb, payload };
-            try self.w.writeVecAll(&vecs);
-        } else {
-            try self.w.writeAll(&hb);
-        }
-    }
-
-    fn writeHeaderBlockLocked(self: *Client, sid: u31, end_stream: bool, max_frame: usize, block: []const u8) !void {
-        const es: u8 = if (end_stream) p2.flag_end_stream else 0;
-        if (block.len <= max_frame) {
-            try self.writeFrameLocked(.headers, p2.flag_end_headers | es, sid, block);
-        } else {
-            try self.writeFrameLocked(.headers, es, sid, block[0..max_frame]);
-            var off: usize = max_frame;
-            while (off < block.len) {
-                const end = @min(off + max_frame, block.len);
-                const last = end == block.len;
-                try self.writeFrameLocked(.continuation, if (last) p2.flag_end_headers else 0, sid, block[off..end]);
-                off = end;
-            }
-        }
-    }
-
-    fn drainCtrlToBufferLocked(self: *Client) !void {
-        while (true) {
-            self.ctrl_mu.lockUncancelable(self.io);
-            if (self.ctrl_broken) {
-                self.ctrl_mu.unlock(self.io);
-                return error.WriteFailed;
-            }
-            if (self.ctrl_buf.items.len == 0) {
-                self.ctrl_mu.unlock(self.io);
-                return;
-            }
-            std.mem.swap(std.ArrayList(u8), &self.ctrl_buf, &self.ctrl_drain);
-            if (self.ctrl_hts_last) |last_hts| {
-                self.enc.notePeerHeaderTableSize(self.ctrl_hts_min orelse last_hts, last_hts);
-                self.ctrl_hts_min = null;
-                self.ctrl_hts_last = null;
-            }
-            self.ctrl_mu.unlock(self.io);
-            defer self.ctrl_drain.clearRetainingCapacity();
-            try self.w.writeAll(self.ctrl_drain.items);
-        }
-    }
-
-    fn writeAndFlushCtrlSliceThunk(w: *Io.Writer, bytes: []const u8) anyerror!void {
-        if (bytes.len > 0) try w.writeAll(bytes);
-        try w.flush();
-    }
-
-    /// Drains any control frames queued while `write_mu` was held, flushes
-    /// under `write_timeout_ms`, and performs hand-over-hand unlock of
-    /// `write_mu` under `ctrl_mu` so no queued control frame is ever stranded.
-    fn finishWriteAndUnlock(self: *Client, write_err: ?anyerror, kill_on_err: bool) !void {
-        if (write_err) |err| {
-            self.markWriteBrokenLocked();
-            self.write_mu.unlock(self.io);
-            if (kill_on_err) self.kill();
-            return err;
-        }
-        while (true) {
-            self.ctrl_mu.lockUncancelable(self.io);
-            if (self.ctrl_broken) {
-                self.ctrl_mu.unlock(self.io);
-                self.markWriteBrokenLocked();
-                self.write_mu.unlock(self.io);
-                if (kill_on_err) self.kill();
-                return error.WriteFailed;
-            }
-            if (self.ctrl_buf.items.len == 0) {
-                self.write_mu.unlock(self.io);
-                self.ctrl_mu.unlock(self.io);
-                return;
-            }
-            std.mem.swap(std.ArrayList(u8), &self.ctrl_buf, &self.ctrl_drain);
-            if (self.ctrl_hts_last) |last_hts| {
-                self.enc.notePeerHeaderTableSize(self.ctrl_hts_min orelse last_hts, last_hts);
-                self.ctrl_hts_min = null;
-                self.ctrl_hts_last = null;
-            }
-            self.ctrl_mu.unlock(self.io);
-            const err_opt: ?anyerror = if (p2.runTimed(self.io, self.write_timeout_ms, writeAndFlushCtrlSliceThunk, .{ self.w, self.ctrl_drain.items })) |_|
-                null
-            else |e|
-                e;
-            self.ctrl_drain.clearRetainingCapacity();
-            if (err_opt) |err| {
-                self.markWriteBrokenLocked();
-                self.write_mu.unlock(self.io);
-                if (kill_on_err) self.kill();
-                return err;
-            }
-        }
-    }
-
-    fn writeSingleFrameThunk(self: *Client, ftype: p2.FrameType, flags: u8, sid: u31, payload: []const u8) anyerror!void {
-        try self.drainCtrlToBufferLocked();
-        try self.writeFrameLocked(ftype, flags, sid, payload);
-        try self.drainCtrlToBufferLocked();
-        try self.w.flush();
-    }
-
-    fn writeControlFrame(self: *Client, ftype: p2.FrameType, flags: u8, sid: u31, payload: []const u8, hts_update: ?HtsUpdate, kill_on_err: bool) !void {
-        if (self.write_mu.tryLock()) {
-            if (self.write_broken) {
-                self.write_mu.unlock(self.io);
-                return error.WriteFailed;
-            }
-            const err_opt: ?anyerror = if (p2.runTimed(self.io, self.write_timeout_ms, writeSingleFrameThunk, .{ self, ftype, flags, sid, payload })) |_|
-                null
-            else |e|
-                e;
-            if (err_opt == null) {
-                if (hts_update) |u| self.enc.notePeerHeaderTableSize(u.min, u.last);
-            }
-            return self.finishWriteAndUnlock(err_opt, kill_on_err);
-        }
-        self.ctrl_mu.lockUncancelable(self.io);
-        if (self.ctrl_broken) {
-            self.ctrl_mu.unlock(self.io);
-            return error.WriteFailed;
-        }
-        var hb: [9]u8 = undefined;
-        p2.putHeader(&hb, payload.len, ftype, flags, sid);
-        self.ctrl_buf.ensureUnusedCapacity(self.gpa, 9 + payload.len) catch |err| {
-            self.failCtrlAllocAndUnlock(kill_on_err);
-            return err;
-        };
-        self.ctrl_buf.appendSliceAssumeCapacity(&hb);
-        if (payload.len > 0) self.ctrl_buf.appendSliceAssumeCapacity(payload);
-        if (hts_update) |u| {
-            self.ctrl_hts_min = if (self.ctrl_hts_min) |prev| @min(prev, u.min) else u.min;
-            self.ctrl_hts_last = u.last;
-        }
-        self.ctrl_mu.unlock(self.io);
-
-        if (self.write_mu.tryLock()) {
-            if (self.write_broken) {
-                self.write_mu.unlock(self.io);
-                return error.WriteFailed;
-            }
-            return self.finishWriteAndUnlock(null, kill_on_err);
-        }
-    }
-
     fn ackPeerSettings(self: *Client, hts_update: ?HtsUpdate) !void {
-        return self.writeControlFrame(.settings, p2.flag_ack, 0, "", hts_update, true);
+        return self.writer().writeControlFrame(.settings, p2.flag_ack, 0, "", hts_update, true);
     }
 
     fn writeFrame(self: *Client, ftype: p2.FrameType, flags: u8, sid: u31, payload: []const u8) !void {
         const kill_on_err = self.reader_thread != null or self.reader_group_started.load(.acquire);
-        return self.writeControlFrame(ftype, flags, sid, payload, null, kill_on_err);
+        return self.writer().writeControlFrame(ftype, flags, sid, payload, null, kill_on_err);
     }
 
-    /// Writes `data` as one or more DATA frames (each <= `max_frame`) without
-    /// flushing. Caller holds `write_mu`. When `data.len == 0` and `end_stream`
-    /// is true, emits a single 0-byte DATA(END_STREAM) frame.
-    fn writeDataFramesLocked(self: *Client, sid: u31, data: []const u8, end_stream: bool, max_frame: usize) !void {
-        std.debug.assert(max_frame > 0);
-        if (data.len == 0) {
-            if (end_stream) try self.writeFrameLocked(.data, p2.flag_end_stream, sid, "");
-            return;
-        }
-        var off: usize = 0;
-        while (off < data.len) {
-            const chunk_len = @min(data.len - off, max_frame);
-            const is_last = off + chunk_len == data.len;
-            const flags: u8 = if (end_stream and is_last) p2.flag_end_stream else 0;
-            try self.writeFrameLocked(.data, flags, sid, data[off .. off + chunk_len]);
-            off += chunk_len;
-        }
+    fn writeStreamDataVecWindowThunk(
+        fw: *frame_writer.FrameWriter,
+        sid: u31,
+        slices: []const []const u8,
+        start_idx: *usize,
+        start_off: *usize,
+        byte_count: usize,
+        end_stream: bool,
+        max: usize,
+    ) anyerror!void {
+        try fw.drainCtrlToBufferLocked();
+        try fw.writeDataVecWindowLocked(sid, slices, start_idx, start_off, byte_count, end_stream, max);
+        try fw.drainCtrlToBufferLocked();
+        try fw.w.flush();
     }
 
-    fn writeStreamDataBatchThunk(self: *Client, sid: u31, data: []const u8, end_stream: bool, max: usize) anyerror!void {
-        try self.drainCtrlToBufferLocked();
-        try self.writeDataFramesLocked(sid, data, end_stream, max);
-        try self.drainCtrlToBufferLocked();
-        try self.w.flush();
-    }
-
-    fn writeDataForStream(self: *Client, st: *Stream, data: []const u8, end_stream: bool) !void {
-        self.write_mu.lockUncancelable(self.io);
-        if (self.dead.load(.acquire) or self.write_broken) {
-            self.write_mu.unlock(self.io);
+    fn writeDataVecWindowForStream(
+        self: *Client,
+        st: *Stream,
+        slices: []const []const u8,
+        start_idx: *usize,
+        start_off: *usize,
+        byte_count: usize,
+        end_stream: bool,
+    ) !void {
+        const fw = self.writer();
+        fw.lock();
+        if (self.dead.load(.acquire) or fw.broken) {
+            fw.unlock();
             return error.ConnectionClosed;
         }
-        self.drainCtrlToBufferLocked() catch |err| {
-            return self.finishWriteAndUnlock(err, true);
+        fw.drainCtrlToBufferLocked() catch |err| {
+            return fw.finishAndUnlockEx(err, true);
         };
         if (st.aborted.load(.acquire)) {
-            try self.finishWriteAndUnlock(null, true);
+            try fw.finishAndUnlockEx(null, true);
             return error.StreamReset;
         }
         if (st.local_closed.load(.acquire)) {
-            try self.finishWriteAndUnlock(null, true);
+            try fw.finishAndUnlockEx(null, true);
             return error.StreamClosed;
         }
         const max: usize = self.peer_max_frame.load(.acquire);
-        const err_opt: ?anyerror = if (p2.runTimed(self.io, self.write_timeout_ms, writeStreamDataBatchThunk, .{ self, st.id, data, end_stream, max })) |_|
+        const err_opt: ?anyerror = if (p2.runTimed(self.io, fw.write_timeout_ms, writeStreamDataVecWindowThunk, .{ fw, st.id, slices, start_idx, start_off, byte_count, end_stream, max })) |_|
             null
         else |e|
             e;
         if (err_opt == null and end_stream) st.local_closed.store(true, .release);
-        try self.finishWriteAndUnlock(err_opt, true);
+        try fw.finishAndUnlockEx(err_opt, true);
     }
 
-    fn writeStreamTrailersThunk(self: *Client, sid: u31, max: usize, block: []const u8) anyerror!void {
-        try self.drainCtrlToBufferLocked();
-        try self.writeHeaderBlockLocked(sid, true, max, block);
-        try self.drainCtrlToBufferLocked();
-        try self.w.flush();
+    fn writeStreamTrailersThunk(fw: *frame_writer.FrameWriter, sid: u31, max: usize, block: []const u8) anyerror!void {
+        try fw.drainCtrlToBufferLocked();
+        try fw.writeHeaderBlockLocked(sid, true, max, block);
+        try fw.drainCtrlToBufferLocked();
+        try fw.w.flush();
     }
 
     fn writeTrailersForStream(self: *Client, st: *Stream, trailers: []const Header) !void {
-        self.write_mu.lockUncancelable(self.io);
-        if (self.dead.load(.acquire) or self.write_broken) {
-            self.write_mu.unlock(self.io);
+        const fw = self.writer();
+        fw.lock();
+        if (self.dead.load(.acquire) or fw.broken) {
+            fw.unlock();
             return error.ConnectionClosed;
         }
-        self.drainCtrlToBufferLocked() catch |err| {
-            return self.finishWriteAndUnlock(err, true);
+        fw.drainCtrlToBufferLocked() catch |err| {
+            return fw.finishAndUnlockEx(err, true);
         };
         if (st.aborted.load(.acquire)) {
-            try self.finishWriteAndUnlock(null, true);
+            try fw.finishAndUnlockEx(null, true);
             return error.StreamReset;
         }
         if (st.local_closed.load(.acquire)) {
-            try self.finishWriteAndUnlock(null, true);
+            try fw.finishAndUnlockEx(null, true);
             return error.StreamClosed;
         }
-        self.hpack_buf.clearRetainingCapacity();
-        self.enc.encodeTrailers(self.gpa, &self.hpack_buf, trailers) catch |err| {
-            self.finishWriteAndUnlock(err, true) catch {};
+        fw.hpack_buf.clearRetainingCapacity();
+        fw.enc.encodeTrailers(self.gpa, &fw.hpack_buf, trailers) catch |err| {
+            if (err == error.InvalidHeader) {
+                try fw.finishAndUnlockEx(null, true);
+                return error.InvalidTrailer;
+            }
+            fw.finishAndUnlockEx(err, true) catch {};
             return if (err == error.OutOfMemory) error.OutOfMemory else error.ConnectionClosed;
         };
         const max: usize = self.peer_max_frame.load(.acquire);
-        const err_opt: ?anyerror = if (p2.runTimed(self.io, self.write_timeout_ms, writeStreamTrailersThunk, .{ self, st.id, max, self.hpack_buf.items })) |_|
+        const err_opt: ?anyerror = if (p2.runTimed(self.io, fw.write_timeout_ms, writeStreamTrailersThunk, .{ fw, st.id, max, fw.hpack_buf.items })) |_|
             null
         else |e|
             e;
         if (err_opt == null) st.local_closed.store(true, .release);
-        try self.finishWriteAndUnlock(err_opt, true);
+        try fw.finishAndUnlockEx(err_opt, true);
     }
 
     /// Returns true if `sid` is in the idle state (never initiated: even push
@@ -1292,9 +1310,10 @@ pub const Client = struct {
     fn isIdleStream(self: *Client, sid: u31) bool {
         if (sid == 0) return false;
         if (sid % 2 == 0) return true;
-        self.write_mu.lockUncancelable(self.io);
-        const idle = sid >= self.next_id;
-        self.write_mu.unlock(self.io);
+        const fw = self.writer();
+        fw.lock();
+        const idle = !self.ids_exhausted.load(.acquire) and sid >= self.next_id;
+        fw.unlock();
         return idle;
     }
 
@@ -1308,7 +1327,7 @@ pub const Client = struct {
     }
 
     fn writeOpenStreamThunk(
-        self: *Client,
+        fw: *frame_writer.FrameWriter,
         sid: u31,
         max: usize,
         block: []const u8,
@@ -1316,13 +1335,13 @@ pub const Client = struct {
         hdr_end_stream: bool,
         data_end_stream: bool,
     ) anyerror!void {
-        try self.drainCtrlToBufferLocked();
-        try self.writeHeaderBlockLocked(sid, hdr_end_stream, max, block);
+        try fw.drainCtrlToBufferLocked();
+        try fw.writeHeaderBlockLocked(sid, hdr_end_stream, max, block);
         if (initial_body.len > 0) {
-            try self.writeDataFramesLocked(sid, initial_body, data_end_stream, max);
+            try fw.writeDataFramesLocked(sid, initial_body, data_end_stream, max);
         }
-        try self.drainCtrlToBufferLocked();
-        try self.w.flush();
+        try fw.drainCtrlToBufferLocked();
+        try fw.w.flush();
     }
 
     fn estimateMaxEncodedBytes(head: RequestHead) usize {
@@ -1378,6 +1397,15 @@ pub const Client = struct {
         return self.openStreamWithBodyImpl(head, body, end_stream, true);
     }
 
+    fn resolveInitialPriority(head: RequestHead) p2.StreamPriority {
+        for (head.headers) |h| {
+            if (std.ascii.eqlIgnoreCase(h.name, "priority")) {
+                return p2.parsePriorityField(h.value);
+            }
+        }
+        return head.priority orelse .{};
+    }
+
     fn openStreamWithBodyImpl(self: *Client, head: RequestHead, body: []const u8, end_stream: bool, non_blocking: bool) !*Stream {
         if (!self.tryBeginOp()) return error.ConnectionClosed;
         defer self.endOp();
@@ -1395,14 +1423,30 @@ pub const Client = struct {
             if (!self.peerSupportsExtendedConnect()) return error.ExtendedConnectUnsupported;
         }
 
+        if (!p2.isValidToken(head.method) or !p2.isValidScheme(head.scheme) or head.path.len == 0) {
+            return error.InvalidHeader;
+        }
+        for (head.path) |ch| {
+            if (ch <= 0x20 or ch >= 0x7f) return error.InvalidHeader;
+        }
+        for (head.authority) |ch| {
+            if (ch <= 0x20 or ch >= 0x7f or ch == '@') return error.InvalidHeader;
+        }
+        for (head.headers) |h| {
+            if (!p2.isValidOutboundHeaderName(h.name) or !p2.isValidFieldValue(h.value)) {
+                return error.InvalidHeader;
+            }
+        }
+
         var prio_buf: [16]u8 = undefined;
         const emit_prio: ?[]const u8 = if (head.priority) |pr|
             (if (!hasExplicitHeader(head.headers, "priority")) p2.formatPriorityField(pr, &prio_buf) else null)
         else
             null;
+        const init_prio = resolveInitialPriority(head);
 
         // Pre-validate huge header sets (`> ~256 KiB` worst case) using stateless
-        // encoding BEFORE acquiring slots or mutating `self.enc.dyn`.
+        // encoding BEFORE acquiring slots or mutating `fw.enc.dyn`.
         var huge_stateless: std.ArrayList(u8) = .empty;
         defer huge_stateless.deinit(self.gpa);
         const use_stateless = estimateMaxEncodedBytes(head) > max_header_block - 64;
@@ -1414,16 +1458,13 @@ pub const Client = struct {
             if (huge_stateless.items.len > max_header_block - 20) return error.HeadersTooLarge;
         }
 
-        // Admission: block until a concurrency slot is free (peer
-        // MAX_CONCURRENT_STREAMS), return immediately when `non_blocking`,
-        // or bail if the connection is closing.
         self.admit_mu.lockUncancelable(self.io);
         while (true) {
             if (self.dead.load(.acquire)) {
                 self.admit_mu.unlock(self.io);
                 return error.ConnectionClosed;
             }
-            if (self.hasGoaway()) {
+            if (self.hasGoaway() or self.local_draining.load(.acquire)) {
                 self.admit_mu.unlock(self.io);
                 return error.GoingAway;
             }
@@ -1438,30 +1479,30 @@ pub const Client = struct {
         self.active_streams_snap.store(self.active_streams, .release);
         self.admit_mu.unlock(self.io);
 
-        self.write_mu.lockUncancelable(self.io);
-        if (self.write_broken) {
-            self.write_mu.unlock(self.io);
+        const fw = self.writer();
+        fw.lock();
+        if (fw.broken) {
+            fw.unlock();
             self.admitCancel();
             return error.ConnectionClosed;
         }
-        // Drain any queued control frames (including SETTINGS(ACK) carrying
-        // peer `SETTINGS_HEADER_TABLE_SIZE` updates) BEFORE encoding `HEADERS`!
-        self.drainCtrlToBufferLocked() catch |err| {
+        fw.drainCtrlToBufferLocked() catch |err| {
             self.admitCancel();
-            self.finishWriteAndUnlock(err, true) catch {};
+            fw.finishAndUnlockEx(err, true) catch {};
             return error.ConnectionClosed;
         };
 
-        const sid = self.next_id;
-        const next_sid = std.math.add(u31, sid, 2) catch {
-            self.ids_exhausted.store(true, .release);
-            self.write_mu.unlock(self.io);
+        if (self.ids_exhausted.load(.acquire)) {
+            fw.unlock();
             self.admitCancel();
             return error.StreamIdsExhausted;
-        };
+        }
+        const sid = self.next_id;
+        const is_final_sid = (sid == std.math.maxInt(u31));
+        const next_sid: u31 = if (is_final_sid) sid else sid + 2;
 
         const st = self.gpa.create(Stream) catch {
-            self.write_mu.unlock(self.io);
+            fw.unlock();
             self.admitCancel();
             return error.OutOfMemory;
         };
@@ -1469,6 +1510,7 @@ pub const Client = struct {
             .client = self,
             .id = sid,
             .send_window = 0,
+            .priority = init_prio,
             .recv_window = p2.clampInitialWindow(self.cfg.initial_window_size),
             .local_closed = .init(false),
             .is_head_request = std.mem.eql(u8, head.method, "HEAD"),
@@ -1480,38 +1522,38 @@ pub const Client = struct {
         self.streams_mu.lockUncancelable(self.io);
         if (self.dead.load(.acquire)) {
             self.streams_mu.unlock(self.io);
-            self.write_mu.unlock(self.io);
+            fw.unlock();
             self.releaseSlot(st);
             self.gpa.destroy(st);
             return error.ConnectionClosed;
         }
-        if (self.hasGoaway()) {
+        if (self.hasGoaway() or self.local_draining.load(.acquire)) {
             self.streams_mu.unlock(self.io);
-            self.write_mu.unlock(self.io);
+            fw.unlock();
             self.releaseSlot(st);
             self.gpa.destroy(st);
             return error.GoingAway;
         }
         self.streams.put(self.gpa, sid, st) catch {
             self.streams_mu.unlock(self.io);
-            self.write_mu.unlock(self.io);
+            fw.unlock();
             self.releaseSlot(st);
             self.gpa.destroy(st);
             return error.OutOfMemory;
         };
         self.next_id = next_sid;
-        if (next_sid == std.math.maxInt(u31)) {
-            // `next_sid` (`0x7fff_ffff`) is the final valid odd stream ID; once it
-            // is allocated on the next open, `ids_exhausted` will flip.
+        if (is_final_sid) {
+            self.ids_exhausted.store(true, .release);
         }
         {
             self.send_mu.lockUncancelable(self.io);
             defer self.send_mu.unlock(self.io);
             st.send_window = self.peer_initial_window.load(.acquire);
-            if (body.len > 0) {
+            if (body.len > 0 and self.sched.canSendImmediate(st, true)) {
                 const avail = @min(st.send_window, self.conn_send_window);
                 if (avail > 0) {
-                    const want: i64 = @min(@as(i64, @intCast(body.len)), @min(avail, @as(i64, @intCast(batch_cap))));
+                    const cap: i64 = if (self.sched.count > 0) @intCast(max) else @intCast(batch_cap);
+                    const want: i64 = @min(@as(i64, @intCast(body.len)), @min(avail, cap));
                     st.send_window -= want;
                     self.conn_send_window -= want;
                     first_chunk = @intCast(want);
@@ -1522,41 +1564,48 @@ pub const Client = struct {
         if (end_stream and all_sent) st.local_closed.store(true, .release);
         self.streams_mu.unlock(self.io);
 
-        self.hpack_buf.clearRetainingCapacity();
+        fw.hpack_buf.clearRetainingCapacity();
         const enc_res = if (use_stateless) blk: {
-            if (self.enc.pending_target_size) |target| {
-                const min_s = self.enc.pending_min_size orelse target;
+            if (fw.enc.pending_target_size) |target| {
+                const min_s = fw.enc.pending_min_size orelse target;
                 var tbuf: [10]u8 = undefined;
                 if (min_s < target) {
-                    self.hpack_buf.appendSlice(self.gpa, hpack.Encoder.encodeTableSizeUpdate(min_s, &tbuf)) catch |e| break :blk @as(anyerror!void, e);
-                    self.enc.dyn.setMaxSize(min_s);
+                    fw.hpack_buf.appendSlice(self.gpa, hpack.Encoder.encodeTableSizeUpdate(min_s, &tbuf)) catch |e| break :blk @as(anyerror!void, e);
+                    fw.enc.dyn.setMaxSize(min_s);
                 }
-                self.hpack_buf.appendSlice(self.gpa, hpack.Encoder.encodeTableSizeUpdate(target, &tbuf)) catch |e| break :blk @as(anyerror!void, e);
-                self.enc.dyn.setMaxSize(target);
-                self.enc.pending_min_size = null;
-                self.enc.pending_target_size = null;
+                fw.hpack_buf.appendSlice(self.gpa, hpack.Encoder.encodeTableSizeUpdate(target, &tbuf)) catch |e| break :blk @as(anyerror!void, e);
+                fw.enc.dyn.setMaxSize(target);
+                fw.enc.pending_min_size = null;
+                fw.enc.pending_target_size = null;
             }
-            break :blk @as(anyerror!void, self.hpack_buf.appendSlice(self.gpa, huge_stateless.items));
+            break :blk @as(anyerror!void, fw.hpack_buf.appendSlice(self.gpa, huge_stateless.items));
         } else blk: {
-            self.enc.encodeRequestEx(self.gpa, &self.hpack_buf, head.method, head.scheme, head.path, head.authority, head.protocol, head.headers) catch |e| break :blk @as(anyerror!void, e);
+            fw.enc.encodeRequestEx(self.gpa, &fw.hpack_buf, head.method, head.scheme, head.path, head.authority, head.protocol, head.headers) catch |e| break :blk @as(anyerror!void, e);
             if (emit_prio) |ps| {
-                self.enc.encodeTrailers(self.gpa, &self.hpack_buf, &.{.{ .name = "priority", .value = ps }}) catch |e| break :blk @as(anyerror!void, e);
+                fw.enc.encodeTrailers(self.gpa, &fw.hpack_buf, &.{.{ .name = "priority", .value = ps }}) catch |e| break :blk @as(anyerror!void, e);
             }
             break :blk @as(anyerror!void, {});
         };
 
         if (enc_res) |_| {} else |enc_err| {
-            self.finishWriteAndUnlock(enc_err, true) catch {};
+            if (first_chunk > 0) {
+                self.send_mu.lockUncancelable(self.io);
+                self.conn_send_window += @as(i64, @intCast(first_chunk));
+                self.send_cond.broadcast(self.io);
+                self.sched.wakeNext(self.io, self.conn_send_window);
+                self.send_mu.unlock(self.io);
+            }
+            fw.finishAndUnlockEx(enc_err, true) catch {};
             self.removeStream(sid);
             return if (enc_err == error.OutOfMemory) error.OutOfMemory else error.ConnectionClosed;
         }
 
         const hdr_end_stream = end_stream and body.len == 0;
-        const open_err: ?anyerror = if (p2.runTimed(self.io, self.write_timeout_ms, writeOpenStreamThunk, .{
-            self,
+        const open_err: ?anyerror = if (p2.runTimed(self.io, fw.write_timeout_ms, writeOpenStreamThunk, .{
+            fw,
             sid,
             max,
-            self.hpack_buf.items,
+            fw.hpack_buf.items,
             body[0..first_chunk],
             hdr_end_stream,
             end_stream and all_sent,
@@ -1564,8 +1613,8 @@ pub const Client = struct {
             null
         else |e|
             e;
-        self.finishWriteAndUnlock(open_err, true) catch {
-            self.removeStream(sid); // releases the slot
+        fw.finishAndUnlockEx(open_err, true) catch {
+            self.removeStream(sid);
             return error.ConnectionClosed;
         };
 
@@ -1601,17 +1650,14 @@ pub const Client = struct {
         }
         if (self.streams.fetchRemove(sid)) |kv| {
             self.streams_mu.unlock(self.io);
-            // Return the connection window for any DATA the caller never
-            // consumed, so tearing streams down doesn't leak it (only while the
-            // connection is still live — a dead peer needs no credit). The
-            // ledger must grow with the credit granted, same as replenish.
+            self.send_mu.lockUncancelable(self.io);
+            self.sched.leaveAndWake(self.io, kv.value, self.conn_send_window);
+            self.send_mu.unlock(self.io);
             const owed = kv.value.unconsumedFcCost();
-            self.releaseSlot(kv.value); // backstop: free the slot if not already
+            self.releaseSlot(kv.value);
             kv.value.freeQueued(self.gpa);
             self.gpa.destroy(kv.value);
             if (!self.dead.load(.acquire)) {
-                // Flush both unconsumed DATA and any remaining sub-threshold
-                // conn_recv_pending so closing a stream never strands peer credit.
                 const conn_amt = self.creditConn(owed, true);
                 self.writeWindowUpdates(conn_amt, 0, 0);
             }
@@ -1847,9 +1893,13 @@ pub const Client = struct {
                     try self.readContinuations(fh.sid, &cont_block);
                     break :blk cont_block.items;
                 };
-                const hs = self.dec.decode(self.gpa, hdr_block) catch |err| {
-                    // RFC 9113 §4.3: HPACK decode failure is connection-fatal; map
-                    // `HeaderListTooLarge` to `ENHANCE_YOUR_CALM`.
+                if (self.hdr_decode_arena == null) {
+                    self.hdr_decode_arena = std.heap.ArenaAllocator.init(self.gpa);
+                }
+                const has_bg_reader = self.reader_thread != null or self.reader_group_started.load(.acquire);
+                defer _ = self.hdr_decode_arena.?.reset(if (has_bg_reader) .{ .retain_with_limit = 8 * 1024 } else .free_all);
+
+                const raw_hs = self.dec.decode(self.hdr_decode_arena.?.allocator(), hdr_block) catch |err| {
                     const code: p2.ErrorCode = switch (err) {
                         error.OutOfMemory => .internal_error,
                         error.HeaderListTooLarge => .enhance_your_calm,
@@ -1858,7 +1908,11 @@ pub const Client = struct {
                     self.sendGoaway(code);
                     return err;
                 };
-                try self.deliver(fh.sid, true, hs, &[_]u8{}, fh.flags & p2.flag_end_stream != 0, 0);
+                const qh = packQueuedHeaders(self.gpa, raw_hs) catch |err| {
+                    self.sendGoaway(.internal_error);
+                    return err;
+                };
+                try self.deliver(fh.sid, .{ .headers = qh }, &[_]u8{}, fh.flags & p2.flag_end_stream != 0);
             },
             .data => {
                 // Flow control counts the whole frame (pad octet + data + pad).
@@ -1886,7 +1940,7 @@ pub const Client = struct {
                     }
                 }
                 const end_stream = fh.flags & p2.flag_end_stream != 0;
-                try self.deliver(fh.sid, false, &[_]hpack.Header{}, body, end_stream, fc_cost);
+                try self.deliver(fh.sid, .{ .data = .{ .len = @intCast(body.len), .fc_cost = fc_cost } }, body, end_stream);
                 if (body.len == 0 and !end_stream) {
                     if (self.recordEmptyDataFlood()) {
                         self.sendGoaway(.enhance_your_calm);
@@ -1930,7 +1984,12 @@ pub const Client = struct {
     /// a stream error — freed and RST — while the connection-level window is
     /// returned immediately, since closed streams still consume conn credit
     /// (RFC 7540 §6.9).
-    fn deliver(self: *Client, sid: u31, is_headers: bool, hs: []const Header, bytes: []const u8, end_stream: bool, fc_cost: u32) !void {
+    fn deliver(self: *Client, sid: u31, kind: QueuedKind, bytes: []const u8, end_stream: bool) !void {
+        const is_headers = (kind == .headers);
+        const fc_cost: u32 = switch (kind) {
+            .headers => 0,
+            .data => |d| d.fc_cost,
+        };
         self.streams_mu.lockUncancelable(self.io);
         const st = self.streams.get(sid);
         if (st) |s| {
@@ -1938,33 +1997,25 @@ pub const Client = struct {
             if (s.reset != null or s.cancelled or s.goaway_refused) {
                 s.recv_mu.unlock(self.io);
                 self.streams_mu.unlock(self.io);
-                if (is_headers) freeHeaders(self.gpa, hs);
-                // Stream is already closed locally (e.g. reset by us on a
-                // WINDOW_UPDATE overflow or cancelled): ignore later inbound
-                // frames, but still return the connection-level window credit
-                // deducted on arrival (RFC 7540 §6.9).
+                if (kind == .headers) kind.headers.deinit(self.gpa);
                 if (fc_cost > 0) {
                     const conn_amt = self.creditConn(fc_cost, true);
                     self.writeWindowUpdates(conn_amt, 0, 0);
                 }
                 return;
             }
-            const item: Queued = if (is_headers) .{ .headers = hs } else .{ .data = .{ .len = @intCast(bytes.len), .fc_cost = fc_cost } };
             var rst: ?p2.ErrorCode = null;
             if (s.remote_closed) {
-                // RFC 9113 §5.1: DATA/HEADERS after END_STREAM is a connection
-                // STREAM_CLOSED error if the stream is fully closed, or a stream
-                // STREAM_CLOSED error if still half-closed (remote).
                 if (s.local_closed.load(.acquire)) {
                     s.recv_mu.unlock(self.io);
                     self.streams_mu.unlock(self.io);
-                    if (is_headers) freeHeaders(self.gpa, hs);
+                    if (kind == .headers) kind.headers.deinit(self.gpa);
                     self.sendGoaway(.stream_closed);
                     return error.ProtocolError;
                 }
                 rst = .stream_closed;
-            } else if (is_headers) {
-                if (!validateStreamHeaders(s, hs, end_stream)) {
+            } else if (kind == .headers) {
+                if (!validateStreamHeaders(s, kind.headers.headers, end_stream)) {
                     rst = .protocol_error;
                 }
             } else {
@@ -1973,7 +2024,7 @@ pub const Client = struct {
                 } else {
                     s.recv_window -= @as(i64, fc_cost);
                     if (s.recv_window < 0) {
-                        s.recv_window += @as(i64, fc_cost); // nothing delivered: no stream credit owed
+                        s.recv_window += @as(i64, fc_cost);
                         rst = .flow_control_error;
                     } else {
                         if (std.math.add(u64, s.rx_body_bytes, bytes.len)) |new_total| {
@@ -2004,50 +2055,31 @@ pub const Client = struct {
                     if (!oom) rx_appended = true;
                 }
                 if (!oom) {
-                    s.queue.append(self.gpa, item) catch {
-                        if (rx_appended) s.rx_buf.len -= bytes.len;
-                        oom = true;
-                    };
-                }
-                if (!oom) {
-                    s.end_flags.append(self.gpa, end_stream) catch {
-                        s.queue.items.len -= 1;
-                        if (rx_appended) s.rx_buf.len -= bytes.len;
-                        oom = true;
-                    };
-                }
-                if (!oom) {
-                    s.is_headers.append(self.gpa, is_headers) catch {
-                        s.queue.items.len -= 1;
-                        s.end_flags.items.len -= 1;
+                    s.queue.append(self.gpa, .{ .end_stream = end_stream, .kind = kind }) catch {
                         if (rx_appended) s.rx_buf.len -= bytes.len;
                         oom = true;
                     };
                 }
                 if (oom) {
-                    if (is_headers) freeHeaders(self.gpa, hs);
+                    if (kind == .headers) kind.headers.deinit(self.gpa);
                     s.recv_mu.unlock(self.io);
                     self.streams_mu.unlock(self.io);
                     return error.OutOfMemory;
                 }
             } else {
-                if (is_headers) freeHeaders(self.gpa, hs);
+                if (kind == .headers) kind.headers.deinit(self.gpa);
             }
             if (rst) |code| {
                 s.aborted.store(true, .release);
                 s.reset = @backingInt(code);
                 s.recv_cond.broadcast(self.io);
                 s.recv_mu.unlock(self.io);
-                self.wakeStreamSender(s); // release a sender blocked on this stream's window
-                self.noteEnd(s, true, true); // reset frees its slot
+                self.wakeStreamSender(s);
+                self.noteEnd(s, true, true);
                 self.streams_mu.unlock(self.io);
                 var p: [4]u8 = undefined;
                 std.mem.writeInt(u32, &p, @backingInt(code), .big);
                 self.writeFrame(.rst_stream, 0, sid, &p) catch {};
-                // The frame is dropped: return the connection window we
-                // deducted on arrival, and keep our ledger in step with the
-                // credit we grant (RFC 7540 §6.9 — conn flow control spans
-                // reset/closed streams).
                 if (fc_cost > 0) {
                     const conn_amt = self.creditConn(fc_cost, true);
                     self.writeWindowUpdates(conn_amt, 0, 0);
@@ -2057,38 +2089,26 @@ pub const Client = struct {
             if (end_stream) s.remote_closed = true;
             s.recv_cond.broadcast(self.io);
             s.recv_mu.unlock(self.io);
-            if (end_stream) self.noteEnd(s, false, true); // remote half-closed
+            if (end_stream) self.noteEnd(s, false, true);
             self.streams_mu.unlock(self.io);
         } else {
             self.streams_mu.unlock(self.io);
             const idle = self.isIdleStream(sid);
-            if (is_headers) {
-                freeHeaders(self.gpa, hs);
-                // RFC 9113 §5.1 / §5.1.1: HEADERS on an idle stream (even push
-                // id with ENABLE_PUSH=0, or client id never opened) is a
-                // connection PROTOCOL_ERROR. Frames for a stream we already
-                // closed/reset may still arrive in-flight and are ignored.
+            if (kind == .headers) {
+                kind.headers.deinit(self.gpa);
                 if (idle) {
                     self.sendGoaway(.protocol_error);
                     return error.ProtocolError;
                 }
             } else {
-                // DATA on an idle stream (even push id or >= next_id) is a
-                // connection PROTOCOL_ERROR (RFC 9113 §5.1).
                 if (idle) {
                     self.sendGoaway(.protocol_error);
                     return error.ProtocolError;
                 }
-                // An odd id below next_id that is no longer open was closed: a
-                // stream error — RST STREAM_CLOSED, keeping the connection.
                 var p: [4]u8 = undefined;
                 std.mem.writeInt(u32, &p, @backingInt(p2.ErrorCode.stream_closed), .big);
                 self.writeFrame(.rst_stream, 0, sid, &p) catch {};
             }
-            // Stream already gone, but the connection window must still be
-            // returned for its DATA (RFC 7540 §6.9 — conn flow control spans
-            // closed streams), or a hostile peer could leak it to zero. The
-            // ledger grows with the credit granted, same as replenish.
             if (fc_cost > 0) {
                 const conn_amt = self.creditConn(fc_cost, true);
                 self.writeWindowUpdates(conn_amt, 0, 0);
@@ -2119,75 +2139,12 @@ pub const Client = struct {
         return 0;
     }
 
-    /// Coalesces connection-level and stream-level WINDOW_UPDATE frames into a
-    /// single `write_mu` lock acquisition and a single `w.flush()` (#39).
-    fn writeWindowUpdatesThunk(self: *Client, conn_amt: u32, sid: u31, stream_amt: u32) anyerror!void {
-        try self.drainCtrlToBufferLocked();
-        if (conn_amt > 0) {
-            var wu: [4]u8 = undefined;
-            std.mem.writeInt(u32, &wu, conn_amt, .big);
-            try self.writeFrameLocked(.window_update, 0, 0, &wu);
-        }
-        if (stream_amt > 0) {
-            var wu: [4]u8 = undefined;
-            std.mem.writeInt(u32, &wu, stream_amt, .big);
-            try self.writeFrameLocked(.window_update, 0, sid, &wu);
-        }
-        try self.drainCtrlToBufferLocked();
-        try self.w.flush();
-    }
-
+    /// Coalesces connection-level and stream-level WINDOW_UPDATE frames (`0` then `sid`)
+    /// into a single `FrameWriter` lock acquisition or non-blocking `ctrl_buf` entry (#39).
     fn writeWindowUpdates(self: *Client, conn_amt: u32, sid: u31, stream_amt: u32) void {
         if (conn_amt == 0 and stream_amt == 0) return;
         const kill_on_err = self.reader_thread != null or self.reader_group_started.load(.acquire);
-        if (self.write_mu.tryLock()) {
-            if (self.write_broken) {
-                self.write_mu.unlock(self.io);
-                return;
-            }
-            const err_opt: ?anyerror = if (p2.runTimed(self.io, self.write_timeout_ms, writeWindowUpdatesThunk, .{ self, conn_amt, sid, stream_amt })) |_|
-                null
-            else |e|
-                e;
-            self.finishWriteAndUnlock(err_opt, kill_on_err) catch {};
-            return;
-        }
-        self.ctrl_mu.lockUncancelable(self.io);
-        if (self.ctrl_broken) {
-            self.ctrl_mu.unlock(self.io);
-            return;
-        }
-        const count: usize = @as(usize, if (conn_amt > 0) 13 else 0) + @as(usize, if (stream_amt > 0) 13 else 0);
-        self.ctrl_buf.ensureUnusedCapacity(self.gpa, count) catch {
-            // Local receive-window ledgers were already incremented; tear down
-            // rather than silently dropping the peer's WINDOW_UPDATE credit.
-            self.failCtrlAllocAndUnlock(kill_on_err);
-            return;
-        };
-        if (conn_amt > 0) {
-            var hb: [9]u8 = undefined;
-            var wu: [4]u8 = undefined;
-            p2.putHeader(&hb, 4, .window_update, 0, 0);
-            std.mem.writeInt(u32, &wu, conn_amt, .big);
-            self.ctrl_buf.appendSliceAssumeCapacity(&hb);
-            self.ctrl_buf.appendSliceAssumeCapacity(&wu);
-        }
-        if (stream_amt > 0) {
-            var hb: [9]u8 = undefined;
-            var wu: [4]u8 = undefined;
-            p2.putHeader(&hb, 4, .window_update, 0, sid);
-            std.mem.writeInt(u32, &wu, stream_amt, .big);
-            self.ctrl_buf.appendSliceAssumeCapacity(&hb);
-            self.ctrl_buf.appendSliceAssumeCapacity(&wu);
-        }
-        self.ctrl_mu.unlock(self.io);
-        if (self.write_mu.tryLock()) {
-            if (self.write_broken) {
-                self.write_mu.unlock(self.io);
-                return;
-            }
-            self.finishWriteAndUnlock(null, kill_on_err) catch {};
-        }
+        self.writer().writeWindowUpdatesOrdered(0, conn_amt, sid, stream_amt, kill_on_err);
     }
 
     /// Credits both the connection and the stream receive windows for `amt`
@@ -2275,7 +2232,10 @@ pub const Client = struct {
                         conn_overflow = true;
                     } else {
                         self.conn_send_window += incr;
-                        if (self.conn_send_window > 0) self.send_cond.broadcast(self.io);
+                        if (self.conn_send_window > 0) {
+                            self.send_cond.broadcast(self.io);
+                            self.sched.wakeNext(self.io, self.conn_send_window);
+                        }
                     }
                 } else if (self.streams.get(sid)) |st| {
                     if (!st.aborted.load(.acquire)) {
@@ -5638,7 +5598,7 @@ test "Client.writeFrame poisons subsequent writes after a partial write failure"
 
     const zero_ping: [8]u8 = @splat(0);
     try testing.expectError(error.WriteFailed, client.writeFrame(.ping, 0, 0, &zero_ping));
-    try testing.expect(client.write_broken);
+    try testing.expect(client.fw.broken);
     try testing.expectError(error.WriteFailed, client.writeFrame(.settings, p2.flag_ack, 0, ""));
 }
 
@@ -7146,16 +7106,17 @@ test "Client enforces write_timeout_ms on stalled writes and supports non-blocki
             .w = &sink.writer,
             .dec = hpack.Decoder.init(testing.allocator, p2.our_header_table_size),
         };
+        _ = client.writer();
         defer client.deinit();
 
         const Holder = struct {
             c: *Client,
             locked: std.atomic.Value(bool) = .init(false),
             fn run(self: *@This()) void {
-                self.c.write_mu.lockUncancelable(testing.io);
+                self.c.fw.lock();
                 self.locked.store(true, .release);
                 Io.sleep(testing.io, .{ .nanoseconds = 80 * std.time.ns_per_ms }, .awake) catch {};
-                self.c.finishWriteAndUnlock(null, false) catch {};
+                self.c.fw.finishAndUnlockEx(null, false) catch {};
             }
         };
         var holder: Holder = .{ .c = &client };
@@ -7198,9 +7159,14 @@ test "Client enforces write_timeout_ms on stalled writes and supports non-blocki
 test "Client.deinit never hangs when Io.Group readerLoop exits immediately on instant EOF (#49)" {
     const NoopSink = struct {
         writer: Io.Writer,
-        fn drain(w: *Io.Writer, data: []const []const u8, _: usize) Io.Writer.Error!usize {
+        fn drain(w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
             w.end = 0;
-            return data[0].len;
+            var total: usize = 0;
+            if (data.len > 0) {
+                for (data[0 .. data.len - 1]) |s| total += s.len;
+                total += data[data.len - 1].len * splat;
+            }
+            return total;
         }
     };
 
@@ -7220,8 +7186,14 @@ test "Client.deinit never hangs when Io.Group readerLoop exits immediately on in
 test "Client.writeWindowUpdates tears down connection on ctrl_buf OOM instead of dropping credit (#49)" {
     const NoopSink = struct {
         writer: Io.Writer,
-        fn drain(_: *Io.Writer, data: []const []const u8, _: usize) Io.Writer.Error!usize {
-            return data[0].len;
+        fn drain(w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
+            w.end = 0;
+            var total: usize = 0;
+            if (data.len > 0) {
+                for (data[0 .. data.len - 1]) |s| total += s.len;
+                total += data[data.len - 1].len * splat;
+            }
+            return total;
         }
     };
     var ns: NoopSink = .{ .writer = .{ .buffer = &.{}, .vtable = &.{ .drain = NoopSink.drain } } };
@@ -7235,6 +7207,7 @@ test "Client.writeWindowUpdates tears down connection on ctrl_buf OOM instead of
     };
     client.reader_group_started.store(true, .release);
     client.reader_done.set(testing.io);
+    _ = client.writer();
     defer client.deinit();
 
     const Holder = struct {
@@ -7243,12 +7216,12 @@ test "Client.writeWindowUpdates tears down connection on ctrl_buf OOM instead of
         release: std.atomic.Value(bool) = .init(false),
         err: ?anyerror = null,
         fn run(self: *@This()) void {
-            self.c.write_mu.lockUncancelable(testing.io);
+            self.c.fw.lock();
             self.locked.store(true, .release);
             while (!self.release.load(.acquire)) {
                 Io.sleep(testing.io, .{ .nanoseconds = 1 * std.time.ns_per_ms }, .awake) catch {};
             }
-            self.c.finishWriteAndUnlock(null, true) catch |e| {
+            self.c.fw.finishAndUnlockEx(null, true) catch |e| {
                 self.err = e;
             };
         }
@@ -7265,23 +7238,32 @@ test "Client.writeWindowUpdates tears down connection on ctrl_buf OOM instead of
     h.release.store(true, .release);
     th.join();
     try testing.expectEqual(@as(?anyerror, error.WriteFailed), h.err);
-    try testing.expect(client.write_broken);
+    try testing.expect(client.fw.broken);
 }
 
 test "client stateful HPACK EncoderContext compresses repeated origin headers and guards HeadersTooLarge" {
     const CountingWriter = struct {
         writer: Io.Writer,
         bytes: std.ArrayList(u8) = .empty,
-        fn drain(w: *Io.Writer, data: []const []const u8, _: usize) Io.Writer.Error!usize {
+        fn drain(w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
             const self: *@This() = @fieldParentPtr("writer", w);
             if (w.end > 0) {
                 self.bytes.appendSlice(testing.allocator, w.buffer[0..w.end]) catch return error.WriteFailed;
                 w.end = 0;
             }
-            for (data) |s| {
-                if (s.len > 0) self.bytes.appendSlice(testing.allocator, s) catch return error.WriteFailed;
+            var total: usize = 0;
+            if (data.len > 0) {
+                for (data[0 .. data.len - 1]) |s| {
+                    if (s.len > 0) self.bytes.appendSlice(testing.allocator, s) catch return error.WriteFailed;
+                    total += s.len;
+                }
+                const last = data[data.len - 1];
+                for (0..splat) |_| {
+                    if (last.len > 0) self.bytes.appendSlice(testing.allocator, last) catch return error.WriteFailed;
+                    total += last.len;
+                }
             }
-            return data[0].len;
+            return total;
         }
     };
 
@@ -7295,11 +7277,18 @@ test "client stateful HPACK EncoderContext compresses repeated origin headers an
         .r = &dummy_r,
         .w = &cw.writer,
         .dec = hpack.Decoder.init(testing.allocator, p2.our_header_table_size),
-        .enc = hpack.EncoderContext.initWithMaxSize(4096),
+        .fw = .{
+            .io = testing.io,
+            .w = &cw.writer,
+            .gpa = testing.allocator,
+            .enc = hpack.EncoderContext.initWithMaxSize(4096),
+        },
+        .fw_bound = true,
     };
+    _ = client.writer();
     defer client.deinit();
 
-    // Oversized header set (> 256 KiB) must return `HeadersTooLarge` WITHOUT mutating `client.enc.dyn`.
+    // Oversized header set (> 256 KiB) must return `HeadersTooLarge` WITHOUT mutating `client.fw.enc.dyn`.
     const huge_val = try testing.allocator.alloc(u8, 300_000);
     defer testing.allocator.free(huge_val);
     @memset(huge_val, 'q');
@@ -7312,7 +7301,7 @@ test "client stateful HPACK EncoderContext compresses repeated origin headers an
             .{ .name = "x-giant", .value = huge_val },
         },
     }, true));
-    try testing.expectEqual(@as(usize, 0), client.enc.dyn.len());
+    try testing.expectEqual(@as(usize, 0), client.fw.enc.dyn.len());
 
     const origin_headers = [_]Header{
         .{ .name = "user-agent", .value = "zig-cdn-origin-fetcher/2.0" },
@@ -7366,9 +7355,14 @@ test "client stateful HPACK EncoderContext compresses repeated origin headers an
 test "client lock-free op_state drains concurrent operations cleanly on deinit" {
     const NoopSink = struct {
         writer: Io.Writer,
-        fn drain(w: *Io.Writer, data: []const []const u8, _: usize) Io.Writer.Error!usize {
+        fn drain(w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
             w.end = 0;
-            return data[0].len;
+            var total: usize = 0;
+            if (data.len > 0) {
+                for (data[0 .. data.len - 1]) |s| total += s.len;
+                total += data[data.len - 1].len * splat;
+            }
+            return total;
         }
     };
     const io = testing.io;
@@ -7601,5 +7595,239 @@ test "client FloodGuard cuts off hostile origin floods and tryOpenStream enables
                 break;
             }
         }
+    }
+}
+
+test "Phase 4 client: 4 MiB default window, max_decoder_table_size, InvalidHeader guard, startDrain, sendVec, and outbound priority scheduler" {
+    const io = testing.io;
+
+    // 1. Default 4 MiB connection window, `max_decoder_table_size = 0`, outbound `InvalidHeader`
+    //    pre-flight guard, graceful `startDrain()`, and `ids_exhausted` at `maxInt(u31)`.
+    {
+        const cfg_def: Config = .{};
+        try testing.expectEqual(@as(u32, 4 << 20), cfg_def.connection_window_size);
+
+        const addr = try net.IpAddress.parse("127.0.0.1", 0);
+        var srv = try addr.listen(io, .{ .mode = .stream, .reuse_address = true });
+        defer srv.deinit(io);
+        const port = srv.socket.address.ip4.port;
+        const caddr = try net.IpAddress.parse("127.0.0.1", port);
+        const cstream = try caddr.connect(io, .{ .mode = .stream });
+        defer cstream.close(io);
+        var accepted = try srv.accept(io);
+        defer accepted.close(io);
+
+        var crbuf: [8192]u8 = undefined;
+        var cwbuf: [8192]u8 = undefined;
+        var csr = cstream.reader(io, &crbuf);
+        var csw = cstream.writer(io, &cwbuf);
+        var client: Client = undefined;
+        try client.initWithConfig(io, testing.allocator, &csr.interface, &csw.interface, .{
+            .max_decoder_table_size = 0,
+        });
+        defer client.deinit();
+
+        var arbuf: [8192]u8 = undefined;
+        var awbuf: [8192]u8 = undefined;
+        var asr = accepted.reader(io, &arbuf);
+        var asw = accepted.writer(io, &awbuf);
+
+        var pf: [p2.preface.len]u8 = undefined;
+        try asr.interface.readSliceAll(&pf);
+        var cs = try ctRead(testing.allocator, &asr.interface);
+        var saw_hts_zero = false;
+        var si: usize = 0;
+        while (si + 6 <= cs.payload.len) : (si += 6) {
+            const id = std.mem.readInt(u16, cs.payload[si..][0..2], .big);
+            const val = std.mem.readInt(u32, cs.payload[si + 2 ..][0..4], .big);
+            if (id == p2.set_header_table_size and val == 0) saw_hts_zero = true;
+        }
+        cs.deinit(testing.allocator);
+        try testing.expect(saw_hts_zero);
+
+        var wu0 = try ctRead(testing.allocator, &asr.interface);
+        try testing.expectEqual(p2.FrameType.window_update, wu0.hdr.ftype);
+        try testing.expectEqual(@as(u32, (4 << 20) - 65535), std.mem.readInt(u32, wu0.payload[0..4], .big) & 0x7fff_ffff);
+        wu0.deinit(testing.allocator);
+
+        try ctWrite(&asw.interface, .settings, 0, 0, "");
+        try ctWrite(&asw.interface, .settings, p2.flag_ack, 0, "");
+
+        // Outbound InvalidHeader guard rejects bad header name/value/path BEFORE consuming `next_id`!
+        try testing.expectError(error.InvalidHeader, client.openStream(.{
+            .path = "/ok",
+            .headers = &.{.{ .name = "bad hdr", .value = "x" }},
+        }, true));
+        try testing.expectError(error.InvalidHeader, client.openStream(.{
+            .path = "/ok",
+            .headers = &.{.{ .name = "x-inj", .value = "a\r\nb" }},
+        }, true));
+        try testing.expectError(error.InvalidHeader, client.openStream(.{
+            .path = "/bad path",
+        }, true));
+        try testing.expectEqual(@as(u31, 1), client.next_id);
+        try testing.expect(client.canOpenStream());
+
+        // Open sid=1, then initiate graceful `startDrain()`: sid=1 keeps streaming via `sendVec`
+        // while `canOpenStream()` flips false and new `openStream` returns `error.GoingAway`!
+        const s1 = try client.openStream(.{ .path = "/in-flight" }, false);
+        defer s1.close();
+        try testing.expectEqual(@as(u31, 1), s1.id);
+
+        try client.startDrain();
+        try testing.expect(client.isDraining());
+        try testing.expect(!client.canOpenStream());
+        try testing.expectEqual(@as(u32, 0), client.availableStreams());
+        try testing.expectError(error.GoingAway, client.openStream(.{ .path = "/rejected" }, true));
+
+        const vecs = [_][]const u8{ "part1-", "", "part2" };
+        try s1.sendVec(&vecs, true);
+
+        var saw_goaway = false;
+        var got_req_body: std.ArrayList(u8) = .empty;
+        defer got_req_body.deinit(testing.allocator);
+        while (true) {
+            var f = try ctRead(testing.allocator, &asr.interface);
+            defer f.deinit(testing.allocator);
+            if (f.hdr.ftype == .goaway) saw_goaway = true;
+            if (f.hdr.ftype == .data and f.hdr.sid == 1) {
+                try got_req_body.appendSlice(testing.allocator, f.payload);
+                if (f.hdr.flags & p2.flag_end_stream != 0) break;
+            }
+        }
+        try testing.expect(saw_goaway);
+        try testing.expectEqualStrings("part1-part2", got_req_body.items);
+
+        // Server responds on sid=1 with multi-header block + burst > 16 KiB body;
+        // exercises single-slab `QueuedHeaders` + `RxRing.readWithShrink`!
+        var resp_blk: std.ArrayList(u8) = .empty;
+        defer resp_blk.deinit(testing.allocator);
+        try hpack.Encoder.encodeResponse(testing.allocator, &resp_blk, 200, &.{
+            .{ .name = "content-length", .value = "20000" },
+            .{ .name = "x-custom-a", .value = "alpha" },
+            .{ .name = "x-custom-b", .value = "beta" },
+        });
+        try ctWrite(&asw.interface, .headers, p2.flag_end_headers, 1, resp_blk.items);
+        const d1: [16_000]u8 = @splat('m');
+        const d2: [4_000]u8 = @splat('n');
+        try ctWrite(&asw.interface, .data, 0, 1, &d1);
+        try ctWrite(&asw.interface, .data, p2.flag_end_stream, 1, &d2);
+        Io.sleep(io, .{ .nanoseconds = 15 * std.time.ns_per_ms }, .awake) catch {};
+
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        const ev = try s1.readEvent(arena_state.allocator());
+        try testing.expect(ev == .headers);
+        var rbuf_out: [8192]u8 = undefined;
+        var total_out: usize = 0;
+        while (true) {
+            const n = try s1.readBody(&rbuf_out);
+            if (n == 0) break;
+            total_out += n;
+        }
+        try testing.expectEqual(@as(usize, 20_000), total_out);
+        try testing.expectEqual(@as(usize, 0), s1.rx_buf.buf.len); // shrunk back to 0 after >16 KiB burst!
+    }
+
+    // 2. Client outbound RFC 9218 PriorityScheduler (`u=6` preempted by `u=0`) + early `ids_exhausted`.
+    {
+        const addr = try net.IpAddress.parse("127.0.0.1", 0);
+        var srv = try addr.listen(io, .{ .mode = .stream, .reuse_address = true });
+        defer srv.deinit(io);
+        const port = srv.socket.address.ip4.port;
+        const caddr = try net.IpAddress.parse("127.0.0.1", port);
+        const cstream = try caddr.connect(io, .{ .mode = .stream });
+        defer cstream.close(io);
+        var accepted = try srv.accept(io);
+        defer accepted.close(io);
+
+        var crbuf: [8192]u8 = undefined;
+        var cwbuf: [8192]u8 = undefined;
+        var csr = cstream.reader(io, &crbuf);
+        var csw = cstream.writer(io, &cwbuf);
+        var client: Client = undefined;
+        try client.init(io, testing.allocator, &csr.interface, &csw.interface);
+        defer client.deinit();
+
+        var arbuf: [16384]u8 = undefined;
+        var awbuf: [4096]u8 = undefined;
+        var asr = accepted.reader(io, &arbuf);
+        var asw = accepted.writer(io, &awbuf);
+
+        var pf: [p2.preface.len]u8 = undefined;
+        try asr.interface.readSliceAll(&pf);
+        var cs = try ctRead(testing.allocator, &asr.interface);
+        cs.deinit(testing.allocator);
+        var wu = try ctRead(testing.allocator, &asr.interface);
+        wu.deinit(testing.allocator);
+        try ctWrite(&asw.interface, .settings, 0, 0, "");
+        try ctWrite(&asw.interface, .settings, p2.flag_ack, 0, "");
+
+        // Drain initial 65535-byte `conn_send_window` on sid=1 so sid=3 (`u=6`) and sid=5 (`u=0`)
+        // queue in `client.sched` with per-stream window > 0!
+        const drain_body: [65_535]u8 = @splat('d');
+        const s_drain = try client.openStreamWithBody(.{ .path = "/drain" }, &drain_body, true);
+        defer s_drain.close();
+        while (true) {
+            var f = try ctRead(testing.allocator, &asr.interface);
+            const done = f.hdr.sid == 1 and f.hdr.ftype == .data and (f.hdr.flags & p2.flag_end_stream != 0);
+            f.deinit(testing.allocator);
+            if (done) break;
+        }
+
+        const s_low = try client.openStream(.{ .path = "/low", .priority = .{ .urgency = 6 } }, false);
+        defer s_low.close();
+        const s_high = try client.openStream(.{ .path = "/high", .priority = .{ .urgency = 0 } }, false);
+        defer s_high.close();
+
+        const Uploader = struct {
+            st: *Stream,
+            ch: u8,
+            fn run(self: *@This()) void {
+                const payload: [16_384]u8 = @splat(self.ch);
+                self.st.send(&payload, true) catch {};
+            }
+        };
+        var up_low: Uploader = .{ .st = s_low, .ch = 'L' };
+        var up_high: Uploader = .{ .st = s_high, .ch = 'H' };
+        const t_low = try std.Thread.spawn(.{}, Uploader.run, .{&up_low});
+        const t_high = try std.Thread.spawn(.{}, Uploader.run, .{&up_high});
+        while (true) {
+            client.send_mu.lockUncancelable(io);
+            const both = client.sched.count == 2;
+            client.send_mu.unlock(io);
+            if (both) break;
+            Io.sleep(io, .{ .nanoseconds = 1 * std.time.ns_per_ms }, .awake) catch {};
+        }
+
+        // Grant 32 KiB connection send credit: `s_high` (sid=5, u=0) MUST emit DATA before `s_low` (sid=3, u=6)!
+        var cwu: [4]u8 = undefined;
+        std.mem.writeInt(u32, &cwu, 32_768, .big);
+        try ctWrite(&asw.interface, .window_update, 0, 0, &cwu);
+
+        var first_data_sid: u31 = 0;
+        var seen_data: usize = 0;
+        while (seen_data < 2) {
+            var f = try ctRead(testing.allocator, &asr.interface);
+            defer f.deinit(testing.allocator);
+            if (f.hdr.ftype == .data and f.payload.len > 0) {
+                if (first_data_sid == 0) first_data_sid = f.hdr.sid;
+                seen_data += 1;
+            }
+        }
+        t_high.join();
+        t_low.join();
+        try testing.expectEqual(@as(u31, 5), first_data_sid);
+
+        // Verify `maxInt(u31)` allocation flips `ids_exhausted` immediately!
+        client.fw.lock();
+        client.next_id = std.math.maxInt(u31);
+        client.fw.unlock();
+        try testing.expect(client.canOpenStream());
+        const s_last = try client.openStream(.{ .path = "/last-id" }, true);
+        defer s_last.close();
+        try testing.expectEqual(std.math.maxInt(u31), s_last.id);
+        try testing.expect(!client.canOpenStream());
+        try testing.expectError(error.StreamIdsExhausted, client.openStream(.{ .path = "/overflow" }, true));
     }
 }

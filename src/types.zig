@@ -12,6 +12,21 @@ const proto = @import("proto.zig");
 pub const Header = struct { name: []const u8, value: []const u8 };
 pub const StreamPriority = proto.StreamPriority;
 
+pub const HeaderValueIterator = struct {
+    headers: []const Header,
+    name: []const u8,
+    index: usize = 0,
+
+    pub fn next(self: *HeaderValueIterator) ?[]const u8 {
+        while (self.index < self.headers.len) {
+            const h = self.headers[self.index];
+            self.index += 1;
+            if (std.ascii.eqlIgnoreCase(h.name, self.name)) return h.value;
+        }
+        return null;
+    }
+};
+
 pub const Request = struct {
     method: []const u8,
     target: []const u8,
@@ -21,6 +36,10 @@ pub const Request = struct {
     headers: []const Header,
     content_length: ?u64,
     keep_alive: bool,
+    /// Wire `:scheme` pseudo-header (e.g. `"https"` / `"http"`), when provided by the driver.
+    scheme: []const u8 = "",
+    /// Wire `:authority` pseudo-header, when provided by the driver.
+    authority: []const u8 = "",
     /// RFC 8441 Extended `CONNECT` `:protocol` pseudo-header (e.g. `"websocket"`),
     /// or `null` for standard HTTP requests.
     protocol: ?[]const u8 = null,
@@ -34,6 +53,12 @@ pub const Request = struct {
             if (std.ascii.eqlIgnoreCase(h.name, name)) return h.value;
         }
         return null;
+    }
+
+    /// Returns a zero-allocation iterator yielding every header value matching
+    /// `name` (case-insensitive) in wire order.
+    pub fn getAll(self: *const Request, name: []const u8) HeaderValueIterator {
+        return .{ .headers = self.headers, .name = name };
     }
 
     pub fn getTrailer(self: *const Request, name: []const u8) ?[]const u8 {
@@ -72,8 +97,17 @@ pub const Sink = struct {
         /// Optional `1xx` informational HEADERS emission (e.g. `103 Early Hints`,
         /// `100 Continue`) before the final response head is sent.
         sendInformational: ?*const fn (ctx: *anyopaque, status_code: u16, headers: []const Header) anyerror!void = null,
+        /// Optional scatter-gather body emission (`slices` already counted in `res.body_bytes`),
+        /// coalescing multi-chunk writes into a single lock + flush.
+        writeBodyVec: ?*const fn (ctx: *anyopaque, res: *Response, slices: []const []const u8) anyerror!void = null,
+        /// Optional transport flush hook invoked by `Response.flush()`.
+        flush: ?*const fn (ctx: *anyopaque, res: *Response) anyerror!void = null,
     };
 };
+
+/// Default cork buffer watermark (16 KiB, matching one standard HTTP/2 frame)
+/// before `Response.write` auto-flushes while corked.
+pub const response_cork_watermark: usize = 16 * 1024;
 
 /// Streaming response writer. Headers are accumulated, then flushed lazily on
 /// the first body write (or on `finish`) via the `Sink`.
@@ -97,12 +131,20 @@ pub const Response = struct {
     finished: bool = false,
     /// Total body bytes written (for access logging / metrics).
     body_bytes: u64 = 0,
+    /// When `true`, small `write()` chunks accumulate in `cork_buf` up to
+    /// `response_cork_watermark` (or `flush()` / `finish()`) to avoid emitting
+    /// tiny DATA frames and per-chunk TLS/socket flushes.
+    corked: bool = false,
+    cork_buf: std.ArrayList(u8) = .empty,
 
     pub fn status(self: *Response, code: u16) void {
         self.status_code = code;
     }
 
     pub fn header(self: *Response, name: []const u8, value: []const u8) !void {
+        if (!proto.isValidOutboundHeaderName(name) or !proto.isValidFieldValue(value)) {
+            return error.InvalidHeader;
+        }
         try self.extra.append(self.arena, .{
             .name = try self.arena.dupe(u8, name),
             .value = try self.arena.dupe(u8, value),
@@ -115,6 +157,11 @@ pub const Response = struct {
 
     /// Adds a trailing header (emitted after the body as HTTP/2 trailers).
     pub fn trailer(self: *Response, name: []const u8, value: []const u8) !void {
+        if (!proto.isValidOutboundHeaderName(name) or !proto.isValidFieldValue(value) or
+            proto.isConnectionSpecificHeader(name) or std.ascii.eqlIgnoreCase(name, "te"))
+        {
+            return error.InvalidHeader;
+        }
         try self.trailers.append(self.arena, .{
             .name = try self.arena.dupe(u8, name),
             .value = try self.arena.dupe(u8, value),
@@ -166,13 +213,76 @@ pub const Response = struct {
         return self.sendInformational(103, headers);
     }
 
-    /// Writes a body chunk, streaming it to the client immediately.
+    fn flushCorkBuf(self: *Response) !void {
+        if (self.cork_buf.items.len == 0) return;
+        const pending = self.cork_buf.items;
+        self.cork_buf.items.len = 0;
+        try self.ensureHead();
+        self.body_bytes += pending.len;
+        try self.sink.vtable.writeBody(self.sink.ctx, self, pending);
+    }
+
+    /// Enables or disables response corking. Disabling corking immediately
+    /// flushes any buffered body bytes to the underlying sink.
+    pub fn setCork(self: *Response, enabled: bool) !void {
+        if (self.finished) return error.ResponseFinished;
+        self.corked = enabled;
+        if (!enabled) try self.flushCorkBuf();
+    }
+
+    /// Flushes any corked body bytes (and the response head if pending) to the
+    /// underlying transport.
+    pub fn flush(self: *Response) !void {
+        if (self.finished) return error.ResponseFinished;
+        try self.flushCorkBuf();
+        try self.ensureHead();
+        if (self.sink.vtable.flush) |f| try f(self.sink.ctx, self);
+    }
+
+    /// Writes a body chunk, streaming it immediately (or coalescing into
+    /// `cork_buf` up to `response_cork_watermark` when `corked == true`).
     pub fn write(self: *Response, bytes: []const u8) !void {
         if (self.finished) return error.ResponseFinished;
+        if (bytes.len == 0) {
+            if (!self.corked) try self.ensureHead();
+            return;
+        }
+        if (self.corked) {
+            if (self.cork_buf.items.len + bytes.len < response_cork_watermark) {
+                try self.cork_buf.appendSlice(self.arena, bytes);
+                return;
+            }
+            if (self.cork_buf.items.len > 0) {
+                const slices = [_][]const u8{ self.cork_buf.items, bytes };
+                self.cork_buf.items.len = 0;
+                return self.writeVec(&slices);
+            }
+        }
         try self.ensureHead();
-        if (bytes.len == 0) return;
         self.body_bytes += bytes.len;
         try self.sink.vtable.writeBody(self.sink.ctx, self, bytes);
+    }
+
+    /// Writes multiple body slices (e.g. CDN slab/page cache chunks) in a single
+    /// sink batch without copying into a contiguous intermediate buffer.
+    pub fn writeVec(self: *Response, slices: []const []const u8) !void {
+        if (self.finished) return error.ResponseFinished;
+        var total: usize = 0;
+        for (slices) |s| total += s.len;
+        if (total == 0) {
+            if (!self.corked) try self.ensureHead();
+            return;
+        }
+        if (self.cork_buf.items.len > 0) try self.flushCorkBuf();
+        try self.ensureHead();
+        self.body_bytes += total;
+        if (self.sink.vtable.writeBodyVec) |wbv| {
+            try wbv(self.sink.ctx, self, slices);
+            return;
+        }
+        for (slices) |s| {
+            if (s.len > 0) try self.sink.vtable.writeBody(self.sink.ctx, self, s);
+        }
     }
 
     pub fn print(self: *Response, comptime fmt: []const u8, args: anytype) !void {
@@ -188,8 +298,8 @@ pub const Response = struct {
         if (self.finished) return error.ResponseFinished;
         self.status(code);
         try self.header("content-type", content_type);
-        self.setContentLength(body.len);
-        if (!self.head_sent and self.trailers.items.len == 0) {
+        if (self.cork_buf.items.len == 0) self.setContentLength(body.len);
+        if (!self.head_sent and self.trailers.items.len == 0 and self.cork_buf.items.len == 0) {
             if (self.sink.vtable.sendComplete) |send_complete| {
                 self.body_bytes += body.len;
                 try send_complete(self.sink.ctx, self, body);
@@ -198,19 +308,30 @@ pub const Response = struct {
                 return;
             }
         }
-        try self.write(body);
+        try self.flushCorkBuf();
+        if (body.len > 0) {
+            try self.ensureHead();
+            self.body_bytes += body.len;
+            try self.sink.vtable.writeBody(self.sink.ctx, self, body);
+        } else {
+            try self.ensureHead();
+        }
     }
 
     pub fn finish(self: *Response) !void {
         if (self.finished) return;
         if (!self.head_sent and self.trailers.items.len == 0) {
             if (self.sink.vtable.sendComplete) |send_complete| {
-                try send_complete(self.sink.ctx, self, "");
+                const body = self.cork_buf.items;
+                self.cork_buf.items.len = 0;
+                self.body_bytes += body.len;
+                try send_complete(self.sink.ctx, self, body);
                 self.head_sent = true;
                 self.finished = true;
                 return;
             }
         }
+        try self.flushCorkBuf();
         try self.ensureHead();
         try self.sink.vtable.finish(self.sink.ctx, self);
         self.finished = true;
@@ -406,4 +527,79 @@ test "Response.sendInformational and sendEarlyHints enforce RFC 9113 / RFC 9110 
     try std.testing.expect(res.head_sent);
     try std.testing.expectEqual(@as(usize, 1), is.heads);
     try std.testing.expectError(error.HeadAlreadySent, res.sendEarlyHints(&.{}));
+}
+
+test "Response corking, writeVec, outbound InvalidHeader guard, and Request.getAll" {
+    const BatchSink = struct {
+        writes: usize = 0,
+        vec_calls: usize = 0,
+        complete_calls: usize = 0,
+        out: std.ArrayList(u8) = .empty,
+        fn sendHead(_: *anyopaque, _: *Response) anyerror!void {}
+        fn writeBody(ctx: *anyopaque, _: *Response, b: []const u8) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.writes += 1;
+            try self.out.appendSlice(std.testing.allocator, b);
+        }
+        fn writeBodyVec(ctx: *anyopaque, _: *Response, slices: []const []const u8) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.vec_calls += 1;
+            for (slices) |s| try self.out.appendSlice(std.testing.allocator, s);
+        }
+        fn sendComplete(ctx: *anyopaque, _: *Response, b: []const u8) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.complete_calls += 1;
+            try self.out.appendSlice(std.testing.allocator, b);
+        }
+        fn finish(_: *anyopaque, _: *Response) anyerror!void {}
+    };
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var bs: BatchSink = .{};
+    defer bs.out.deinit(std.testing.allocator);
+    const vtable: Sink.Vtable = .{
+        .sendHead = BatchSink.sendHead,
+        .writeBody = BatchSink.writeBody,
+        .writeBodyVec = BatchSink.writeBodyVec,
+        .sendComplete = BatchSink.sendComplete,
+        .finish = BatchSink.finish,
+    };
+    var res: Response = .{
+        .arena = arena_state.allocator(),
+        .sink = .{ .ctx = &bs, .vtable = &vtable },
+    };
+
+    // Outbound CRLF / pseudo-header injection rejected locally with `error.InvalidHeader`.
+    try std.testing.expectError(error.InvalidHeader, res.header(":status", "200"));
+    try std.testing.expectError(error.InvalidHeader, res.header("x-bad", "val\r\ninjected: 1"));
+    try std.testing.expectError(error.InvalidHeader, res.trailer("connection", "close"));
+
+    // 10 small corked writes coalesce into `sendComplete` on `finish()` with 0 intermediate `writeBody` calls!
+    try res.setCork(true);
+    for (0..10) |_| try res.write("chunk-");
+    try std.testing.expectEqual(@as(usize, 0), bs.writes);
+    try res.finish();
+    try std.testing.expectEqual(@as(usize, 1), bs.complete_calls);
+    try std.testing.expectEqual(@as(u64, 60), res.body_bytes);
+
+    // Request.getAll yields all matching headers case-insensitively.
+    const hdrs = [_]Header{
+        .{ .name = "accept-encoding", .value = "br" },
+        .{ .name = "x-other", .value = "1" },
+        .{ .name = "Accept-Encoding", .value = "gzip" },
+    };
+    const req: Request = .{
+        .method = "GET",
+        .target = "/",
+        .minor_version = 0,
+        .headers = &hdrs,
+        .content_length = null,
+        .keep_alive = true,
+        .scheme = "https",
+        .authority = "cdn.example.com",
+    };
+    var it = req.getAll("accept-encoding");
+    try std.testing.expectEqualStrings("br", it.next().?);
+    try std.testing.expectEqualStrings("gzip", it.next().?);
+    try std.testing.expectEqual(@as(?[]const u8, null), it.next());
 }

@@ -17,6 +17,7 @@ const c = struct {
 };
 
 fn echoHandler(ctx: *h2.Context) anyerror!void {
+    try ctx.res.setCork(true);
     ctx.res.status(200);
     try ctx.res.header("content-type", "text/plain");
     if (ctx.body_reader) |br| {
