@@ -19,6 +19,8 @@ const Io = std.Io;
 const net = std.Io.net;
 const types = @import("types.zig");
 const hpack = @import("hpack.zig");
+const frame_writer = @import("frame_writer.zig");
+const priority_sched = @import("priority_sched.zig");
 
 const log = std.log.scoped(.http2);
 
@@ -126,6 +128,10 @@ pub const Config = struct {
     /// capping per-connection memory even if a peer advertises a massive
     /// `SETTINGS_HEADER_TABLE_SIZE`. Set to 0 to disable dynamic-table encoding.
     max_encoder_table_size: u32 = our_header_table_size,
+    /// `SETTINGS_HEADER_TABLE_SIZE` advertised to peers and enforced as the hard
+    /// cap on our per-connection inbound HPACK decoder dynamic table (bytes).
+    /// Set to `0` to disable inbound dynamic-table indexing (`0` per-conn table RAM).
+    max_decoder_table_size: u32 = our_header_table_size,
     /// `SETTINGS_MAX_HEADER_LIST_SIZE` advertised and enforced inbound on
     /// decoded header lists (`sum(name.len + value.len + 32)`). Set to `0` to
     /// disable the decoded-list cap and omit `SETTINGS_MAX_HEADER_LIST_SIZE`.
@@ -145,6 +151,17 @@ pub const Config = struct {
     /// contended outbound `DATA` frames by `Priority` / `PRIORITY_UPDATE` urgency
     /// (`0..7`) and `incremental` round-robin fairness.
     enable_extensible_priorities: bool = true,
+    /// Process-wide cap on concurrent active HTTP/2 streams across all connections
+    /// served by this `Server` (`0` = unlimited). Excess streams are refused with
+    /// `RST_STREAM(REFUSED_STREAM)` while preserving connection health.
+    max_global_streams: u32 = 0,
+    /// Active keepalive probe interval (ms): when `> 0`, an idle connection with
+    /// no inbound frames for `keepalive_time_ms` emits a `PING` frame without
+    /// cancelling the pending read (`0` = disabled).
+    keepalive_time_ms: u64 = 0,
+    /// Max wait (ms) for a `PING(ACK)` (or any inbound frame) after a keepalive
+    /// `PING` before closing the dead connection (`0` defaults to `min(keepalive_time_ms, 20_000)`).
+    keepalive_timeout_ms: u64 = 0,
 };
 
 /// Effective inbound/advertised MAX_FRAME_SIZE, clamped to the RFC 7540 §6.5.2
@@ -178,6 +195,30 @@ pub const Server = struct {
     /// Futex word bumped on `requestStop()`, connection write abort, or leader
     /// handoff so `N - 1` idle connections sleep with zero periodic wakeups.
     stop_wake: std.atomic.Value(u32) = .init(0),
+    /// Live count of active HTTP/2 streams across all connections on this `Server`.
+    global_active_streams: std.atomic.Value(u32) = .init(0),
+
+    /// Returns the live count of active in-flight HTTP/2 streams across all connections.
+    pub fn activeStreams(self: *const Server) u32 {
+        return self.global_active_streams.load(.acquire);
+    }
+
+    fn tryAcquireGlobalStream(self: *Server) bool {
+        const cap = self.config.max_global_streams;
+        if (cap == 0) {
+            _ = self.global_active_streams.fetchAdd(1, .acq_rel);
+            return true;
+        }
+        var cur = self.global_active_streams.load(.monotonic);
+        while (true) {
+            if (cur >= cap) return false;
+            cur = self.global_active_streams.cmpxchgWeak(cur, cur + 1, .acq_rel, .monotonic) orelse return true;
+        }
+    }
+
+    fn releaseGlobalStream(self: *Server) void {
+        _ = self.global_active_streams.fetchSub(1, .acq_rel);
+    }
 
     /// Requests graceful shutdown: marks `stop = true` and wakes all idle
     /// connections immediately so they send GOAWAY(NO_ERROR) and drain in-flight
@@ -192,415 +233,8 @@ pub const Server = struct {
 
 pub const runTimed = proto2.runTimed;
 
-const HtsUpdate = struct { min: u32, last: u32 };
-
-/// Serializes all frame writes to the shared transport, with optional write
-/// deadlines, connection-stateful HPACK encoding, and a non-blocking control-frame
-/// piggyback queue so `readLoop` never stalls behind a worker flushing DATA to a slow peer.
-const ConnWriter = struct {
-    io: Io,
-    w: *Io.Writer,
-    gpa: ?std.mem.Allocator = null,
-    write_timeout_ms: u64 = 0,
-    conn: ?*Connection = null,
-    mu: Io.Mutex = .init,
-    /// Poisoned on any write/flush failure or timeout so concurrent writers
-    /// never emit misaligned frames after a partial frame landed on the wire.
-    broken: bool = false,
-    /// Outbound connection-stateful HPACK encoder & reusable scratch buffer,
-    /// mutated strictly under `mu` in exact on-wire `HEADERS` emission order.
-    enc: hpack.EncoderContext = .{},
-    hpack_buf: std.ArrayList(u8) = .empty,
-
-    /// High-priority control-frame queue (`PING ACK`, `SETTINGS ACK`,
-    /// `WINDOW_UPDATE`, `RST_STREAM`, `GOAWAY`). Lock order: `mu -> ctrl_mu`
-    /// (or `ctrl_mu` standalone when `mu.tryLock()` fails).
-    ctrl_mu: Io.Mutex = .init,
-    ctrl_buf: std.ArrayList(u8) = .empty,
-    ctrl_drain: std.ArrayList(u8) = .empty,
-    ctrl_hts_min: ?u32 = null,
-    ctrl_hts_last: ?u32 = null,
-    ctrl_broken: bool = false,
-
-    fn deinit(self: *ConnWriter) void {
-        if (self.gpa) |gpa| {
-            self.ctrl_buf.deinit(gpa);
-            self.ctrl_drain.deinit(gpa);
-            self.hpack_buf.deinit(gpa);
-            self.enc.deinit(gpa);
-        }
-    }
-
-    fn lock(self: *ConnWriter) void {
-        self.mu.lockUncancelable(self.io);
-    }
-    fn unlock(self: *ConnWriter) void {
-        self.mu.unlock(self.io);
-    }
-
-    fn markBrokenLocked(self: *ConnWriter) void {
-        self.broken = true;
-        self.ctrl_mu.lockUncancelable(self.io);
-        self.ctrl_broken = true;
-        self.ctrl_buf.clearRetainingCapacity();
-        self.ctrl_hts_min = null;
-        self.ctrl_hts_last = null;
-        self.ctrl_mu.unlock(self.io);
-        if (self.conn) |conn_ptr| conn_ptr.noteWriteFailure();
-    }
-
-    /// Marks the control queue broken on an OOM while `ctrl_mu` is held
-    /// (without `mu`), wakes blocked stream workers/readers, and syncs
-    /// `self.broken = true` if `mu` is already free (otherwise the active `mu`
-    /// holder observes `ctrl_broken` in `drainCtrlToBufferLocked` / `finishAndUnlock`).
-    fn failCtrlAllocAndUnlock(self: *ConnWriter) void {
-        self.ctrl_broken = true;
-        self.ctrl_buf.clearRetainingCapacity();
-        self.ctrl_hts_min = null;
-        self.ctrl_hts_last = null;
-        self.ctrl_mu.unlock(self.io);
-        if (self.conn) |conn_ptr| conn_ptr.noteWriteFailure();
-        if (self.mu.tryLock()) {
-            self.broken = true;
-            self.unlock();
-        }
-    }
-
-    /// Writes one frame; assumes `mu` is held. Uses `writeVecAll` to submit the
-    /// 9-byte header and payload together without splitting `drain` calls.
-    fn frameLocked(self: *ConnWriter, ftype: FrameType, flags: u8, sid: u31, payload: []const u8) !void {
-        var hdr: [9]u8 = undefined;
-        putHeader(&hdr, payload.len, ftype, flags, sid);
-        if (payload.len > 0) {
-            var vecs = [_][]const u8{ &hdr, payload };
-            try self.w.writeVecAll(&vecs);
-        } else {
-            try self.w.writeAll(&hdr);
-        }
-    }
-
-    /// Writes `data` as one or more DATA frames (each `<= max_frame`) without
-    /// flushing. Caller holds `mu`.
-    fn writeDataFramesLocked(self: *ConnWriter, sid: u31, data: []const u8, end_stream: bool, max_frame: usize) !void {
-        std.debug.assert(max_frame > 0);
-        if (data.len == 0) {
-            if (end_stream) try self.frameLocked(.data, flag_end_stream, sid, "");
-            return;
-        }
-        var off: usize = 0;
-        while (off < data.len) {
-            const chunk_len = @min(data.len - off, max_frame);
-            const is_last = off + chunk_len == data.len;
-            const flags: u8 = if (end_stream and is_last) flag_end_stream else 0;
-            try self.frameLocked(.data, flags, sid, data[off .. off + chunk_len]);
-            off += chunk_len;
-        }
-    }
-
-    fn writeHeaderBlockLocked(self: *ConnWriter, sid: u31, end_stream: bool, max_frame: usize, block: []const u8) !void {
-        const es: u8 = if (end_stream) flag_end_stream else 0;
-        if (block.len <= max_frame) {
-            try self.frameLocked(.headers, flag_end_headers | es, sid, block);
-        } else {
-            try self.frameLocked(.headers, es, sid, block[0..max_frame]);
-            var off: usize = max_frame;
-            while (off < block.len) {
-                const end = @min(off + max_frame, block.len);
-                const last = end == block.len;
-                try self.frameLocked(.continuation, if (last) flag_end_headers else 0, sid, block[off..end]);
-                off = end;
-            }
-        }
-    }
-
-    /// Moves any queued control frames into `self.w` without flushing yet.
-    /// Caller holds `mu`.
-    fn drainCtrlToBufferLocked(self: *ConnWriter) !void {
-        while (true) {
-            self.ctrl_mu.lockUncancelable(self.io);
-            if (self.ctrl_broken) {
-                self.ctrl_mu.unlock(self.io);
-                return error.WriteFailed;
-            }
-            if (self.ctrl_buf.items.len == 0) {
-                self.ctrl_mu.unlock(self.io);
-                return;
-            }
-            std.mem.swap(std.ArrayList(u8), &self.ctrl_buf, &self.ctrl_drain);
-            if (self.ctrl_hts_last) |last_hts| {
-                self.enc.notePeerHeaderTableSize(self.ctrl_hts_min orelse last_hts, last_hts);
-                self.ctrl_hts_min = null;
-                self.ctrl_hts_last = null;
-            }
-            self.ctrl_mu.unlock(self.io);
-            defer self.ctrl_drain.clearRetainingCapacity();
-            try self.w.writeAll(self.ctrl_drain.items);
-        }
-    }
-
-    fn writeAndFlushCtrlSliceThunk(w: *Io.Writer, bytes: []const u8) anyerror!void {
-        if (bytes.len > 0) try w.writeAll(bytes);
-        try w.flush();
-    }
-
-    /// Drains any control frames that arrived while `mu` was held, flushes
-    /// them under `write_timeout_ms`, and releases `mu` while holding `ctrl_mu`
-    /// (hand-over-hand unlock) so an enqueuer whose `tryLock()` fails is
-    /// guaranteed its queued bytes will be flushed before `mu` goes idle.
-    fn finishAndUnlock(self: *ConnWriter, write_err: ?anyerror) !void {
-        if (write_err) |err| {
-            self.markBrokenLocked();
-            self.unlock();
-            return err;
-        }
-        while (true) {
-            self.ctrl_mu.lockUncancelable(self.io);
-            if (self.ctrl_broken) {
-                self.ctrl_mu.unlock(self.io);
-                self.markBrokenLocked();
-                self.unlock();
-                return error.WriteFailed;
-            }
-            if (self.ctrl_buf.items.len == 0) {
-                self.unlock();
-                self.ctrl_mu.unlock(self.io);
-                return;
-            }
-            std.mem.swap(std.ArrayList(u8), &self.ctrl_buf, &self.ctrl_drain);
-            if (self.ctrl_hts_last) |last_hts| {
-                self.enc.notePeerHeaderTableSize(self.ctrl_hts_min orelse last_hts, last_hts);
-                self.ctrl_hts_min = null;
-                self.ctrl_hts_last = null;
-            }
-            self.ctrl_mu.unlock(self.io);
-            const err_opt: ?anyerror = if (runTimed(self.io, self.write_timeout_ms, writeAndFlushCtrlSliceThunk, .{ self.w, self.ctrl_drain.items })) |_|
-                null
-            else |e|
-                e;
-            self.ctrl_drain.clearRetainingCapacity();
-            if (err_opt) |err| {
-                self.markBrokenLocked();
-                self.unlock();
-                return err;
-            }
-        }
-    }
-
-    fn writeSingleFrameThunk(self: *ConnWriter, ftype: FrameType, flags: u8, sid: u31, payload: []const u8) anyerror!void {
-        try self.drainCtrlToBufferLocked();
-        try self.frameLocked(ftype, flags, sid, payload);
-        try self.drainCtrlToBufferLocked();
-        try self.w.flush();
-    }
-
-    /// Non-blocking control-frame emission when `mu` is contended and `gpa` is
-    /// available; synchronous write + flush when `mu` is free.
-    fn writeControlFrame(self: *ConnWriter, ftype: FrameType, flags: u8, sid: u31, payload: []const u8, hts_update: ?HtsUpdate) !void {
-        if (self.mu.tryLock()) {
-            if (self.broken) {
-                self.unlock();
-                return error.WriteFailed;
-            }
-            const err_opt: ?anyerror = if (runTimed(self.io, self.write_timeout_ms, writeSingleFrameThunk, .{ self, ftype, flags, sid, payload })) |_|
-                null
-            else |e|
-                e;
-            if (err_opt == null) {
-                if (hts_update) |u| self.enc.notePeerHeaderTableSize(u.min, u.last);
-            }
-            return self.finishAndUnlock(err_opt);
-        }
-        if (self.gpa) |gpa| {
-            self.ctrl_mu.lockUncancelable(self.io);
-            if (self.ctrl_broken) {
-                self.ctrl_mu.unlock(self.io);
-                return error.WriteFailed;
-            }
-            var hdr: [9]u8 = undefined;
-            putHeader(&hdr, payload.len, ftype, flags, sid);
-            self.ctrl_buf.ensureUnusedCapacity(gpa, 9 + payload.len) catch |err| {
-                self.failCtrlAllocAndUnlock();
-                return err;
-            };
-            self.ctrl_buf.appendSliceAssumeCapacity(&hdr);
-            if (payload.len > 0) self.ctrl_buf.appendSliceAssumeCapacity(payload);
-            if (hts_update) |u| {
-                self.ctrl_hts_min = if (self.ctrl_hts_min) |prev| @min(prev, u.min) else u.min;
-                self.ctrl_hts_last = u.last;
-            }
-            self.ctrl_mu.unlock(self.io);
-
-            // Re-check `tryLock()` in case the prior holder unlocked right
-            // before our `ctrl_mu` critical section; otherwise the active
-            // holder will drain `ctrl_buf` in `finishAndUnlock`.
-            if (self.mu.tryLock()) {
-                if (self.broken) {
-                    self.unlock();
-                    return error.WriteFailed;
-                }
-                return self.finishAndUnlock(null);
-            }
-            return;
-        }
-        self.lock();
-        if (self.broken) {
-            self.unlock();
-            return error.WriteFailed;
-        }
-        const err_opt: ?anyerror = if (runTimed(self.io, self.write_timeout_ms, writeSingleFrameThunk, .{ self, ftype, flags, sid, payload })) |_|
-            null
-        else |e|
-            e;
-        if (err_opt == null) {
-            if (hts_update) |u| self.enc.notePeerHeaderTableSize(u.min, u.last);
-        }
-        return self.finishAndUnlock(err_opt);
-    }
-
-    fn ackSettings(self: *ConnWriter, hts_update: ?HtsUpdate) !void {
-        return self.writeControlFrame(.settings, flag_ack, 0, "", hts_update);
-    }
-
-    /// Writes one self-contained control frame (non-blocking piggyback when contended).
-    fn frame(self: *ConnWriter, ftype: FrameType, flags: u8, sid: u31, payload: []const u8) !void {
-        return self.writeControlFrame(ftype, flags, sid, payload, null);
-    }
-
-    fn writeWindowUpdatesThunk(self: *ConnWriter, sid: u31, stream_incr: i64, conn_incr: i64) anyerror!void {
-        try self.drainCtrlToBufferLocked();
-        if (stream_incr > 0) {
-            var wu: [4]u8 = undefined;
-            std.mem.writeInt(u32, &wu, @intCast(stream_incr & 0x7fff_ffff), .big);
-            try self.frameLocked(.window_update, 0, sid, &wu);
-        }
-        if (conn_incr > 0) {
-            var wu: [4]u8 = undefined;
-            std.mem.writeInt(u32, &wu, @intCast(conn_incr & 0x7fff_ffff), .big);
-            try self.frameLocked(.window_update, 0, 0, &wu);
-        }
-        try self.drainCtrlToBufferLocked();
-        try self.w.flush();
-    }
-
-    /// Coalesces stream + connection `WINDOW_UPDATE` frames, piggybacking onto
-    /// `ctrl_buf` without blocking if a DATA batch currently holds `mu`.
-    fn writeWindowUpdates(self: *ConnWriter, sid: u31, stream_incr: i64, conn_incr: i64) void {
-        if (stream_incr <= 0 and conn_incr <= 0) return;
-        if (self.mu.tryLock()) {
-            if (self.broken) {
-                self.unlock();
-                return;
-            }
-            const err_opt: ?anyerror = if (runTimed(self.io, self.write_timeout_ms, writeWindowUpdatesThunk, .{ self, sid, stream_incr, conn_incr })) |_|
-                null
-            else |e|
-                e;
-            self.finishAndUnlock(err_opt) catch {};
-            return;
-        }
-        if (self.gpa) |gpa| {
-            self.ctrl_mu.lockUncancelable(self.io);
-            if (self.ctrl_broken) {
-                self.ctrl_mu.unlock(self.io);
-                return;
-            }
-            const count: usize = @as(usize, if (stream_incr > 0) 13 else 0) + @as(usize, if (conn_incr > 0) 13 else 0);
-            self.ctrl_buf.ensureUnusedCapacity(gpa, count) catch {
-                // Local flow-control ledgers were already credited; tear down
-                // rather than silently stranding the peer's send window.
-                self.failCtrlAllocAndUnlock();
-                return;
-            };
-            if (stream_incr > 0) {
-                var hdr: [9]u8 = undefined;
-                var wu: [4]u8 = undefined;
-                putHeader(&hdr, 4, .window_update, 0, sid);
-                std.mem.writeInt(u32, &wu, @intCast(stream_incr & 0x7fff_ffff), .big);
-                self.ctrl_buf.appendSliceAssumeCapacity(&hdr);
-                self.ctrl_buf.appendSliceAssumeCapacity(&wu);
-            }
-            if (conn_incr > 0) {
-                var hdr: [9]u8 = undefined;
-                var wu: [4]u8 = undefined;
-                putHeader(&hdr, 4, .window_update, 0, 0);
-                std.mem.writeInt(u32, &wu, @intCast(conn_incr & 0x7fff_ffff), .big);
-                self.ctrl_buf.appendSliceAssumeCapacity(&hdr);
-                self.ctrl_buf.appendSliceAssumeCapacity(&wu);
-            }
-            self.ctrl_mu.unlock(self.io);
-            if (self.mu.tryLock()) {
-                if (self.broken) {
-                    self.unlock();
-                    return;
-                }
-                self.finishAndUnlock(null) catch {};
-            }
-            return;
-        }
-        self.lock();
-        if (self.broken) {
-            self.unlock();
-            return;
-        }
-        const err_opt: ?anyerror = if (runTimed(self.io, self.write_timeout_ms, writeWindowUpdatesThunk, .{ self, sid, stream_incr, conn_incr })) |_|
-            null
-        else |e|
-            e;
-        self.finishAndUnlock(err_opt) catch {};
-    }
-
-    fn writeStreamDataBatchThunk(self: *ConnWriter, sid: u31, data: []const u8, end_stream: bool, max_frame: usize) anyerror!void {
-        try self.drainCtrlToBufferLocked();
-        try self.writeDataFramesLocked(sid, data, end_stream, max_frame);
-        try self.drainCtrlToBufferLocked();
-        try self.w.flush();
-    }
-
-    /// Writes a bounded batch of stream DATA frames (splitting at `max_frame`)
-    /// under a single `mu` lock and single `flush()`, re-checking `st.reset` /
-    /// `closing` after draining queued control frames so no DATA follows RST_STREAM.
-    fn writeDataBatchForStream(self: *ConnWriter, st: *H2Stream, data: []const u8, end_stream: bool, max_frame: usize) !void {
-        self.lock();
-        if (self.broken) {
-            self.unlock();
-            return error.WriteFailed;
-        }
-        // Drain any pending control frames first in case a RST_STREAM was queued.
-        self.drainCtrlToBufferLocked() catch |err| {
-            return self.finishAndUnlock(err);
-        };
-        if (st.reset.load(.acquire) or st.conn.closing.load(.acquire)) {
-            try self.finishAndUnlock(null);
-            return error.StreamReset;
-        }
-        const err_opt: ?anyerror = if (runTimed(self.io, self.write_timeout_ms, writeStreamDataBatchThunk, .{ self, st.id, data, end_stream, max_frame })) |_|
-            null
-        else |e|
-            e;
-        try self.finishAndUnlock(err_opt);
-    }
-
-    /// Writes one stream frame while re-checking `st.reset`/`closing` under `mu`.
-    fn frameForStream(self: *ConnWriter, st: *H2Stream, ftype: FrameType, flags: u8, payload: []const u8) !void {
-        self.lock();
-        if (self.broken) {
-            self.unlock();
-            return error.WriteFailed;
-        }
-        self.drainCtrlToBufferLocked() catch |err| {
-            return self.finishAndUnlock(err);
-        };
-        if (st.reset.load(.acquire) or st.conn.closing.load(.acquire)) {
-            try self.finishAndUnlock(null);
-            return error.StreamReset;
-        }
-        const err_opt: ?anyerror = if (runTimed(self.io, self.write_timeout_ms, writeSingleFrameThunk, .{ self, ftype, flags, st.id, payload })) |_|
-            null
-        else |e|
-            e;
-        try self.finishAndUnlock(err_opt);
-    }
-};
+const HtsUpdate = frame_writer.HtsUpdate;
+const ConnWriter = frame_writer.FrameWriter;
 
 /// Per-connection anti-flood adapter backed by `proto.FloodGuard` (11-slot
 /// sliding time windows for control frames and stream resets/refusals, plus
@@ -659,6 +293,12 @@ const H2Stream = struct {
     /// Whether the request has a body (no END_STREAM on HEADERS). Set on the
     /// reader thread before the worker is spawned; read once by the worker.
     has_body: bool = false,
+    /// Atomic mirror of `rx_eof` so outbound `END_STREAM` writers can release
+    /// the RFC 9113 §5.1.2 concurrency slot before `w.flush()` wakes the peer.
+    rx_eof_atomic: std.atomic.Value(bool) = .init(false),
+    slot_counted: bool = false,
+    global_counted: bool = false,
+    slot_released: std.atomic.Value(bool) = .init(false),
 
     /// Request-body channel. The worker is spawned as soon as HEADERS decode;
     /// the reader thread appends request DATA here as it arrives and the worker
@@ -751,7 +391,7 @@ const H2Stream = struct {
                 return error.StreamReset;
             }
             if (self.rx_buf.len > 0) {
-                const n = self.rx_buf.read(buf);
+                const n = self.rx_buf.readWithShrink(buf, conn.gpa, proto2.rx_ring_retain_cap);
                 // Credit the stream flow-control window for consumed bytes.
                 const d = if (n > 0) self.creditStreamLocked(@intCast(n)) else 0;
                 self.rx_mu.unlock(conn.io);
@@ -786,46 +426,59 @@ const H2Stream = struct {
         return self.sendBodyImpl(data, false);
     }
 
+    fn sendBodyVec(self: *H2Stream, slices: []const []const u8) !void {
+        return self.sendBodyVecImpl(slices, false);
+    }
+
     /// Sends `data` as flow-controlled DATA frames. When `end_stream` is true,
     /// sets `END_STREAM` on the final DATA frame directly (or sends a 0-byte
     /// DATA(END_STREAM) if `data.len == 0`).
     fn sendBodyImpl(self: *H2Stream, data: []const u8, end_stream: bool) !void {
-        if (data.len == 0) {
+        const one = [_][]const u8{data};
+        return self.sendBodyVecImpl(&one, end_stream);
+    }
+
+    fn sendBodyVecImpl(self: *H2Stream, slices: []const []const u8, end_stream: bool) !void {
+        var total_len: usize = 0;
+        for (slices) |s| total_len += s.len;
+        if (total_len == 0) {
             if (end_stream) try self.endStream();
             return;
         }
         const conn = self.conn;
         const prio_enabled = conn.srv.config.enable_extensible_priorities;
         var off: usize = 0;
+        var s_idx: usize = 0;
+        var s_off: usize = 0;
         var rotate_on_reentry = false;
-        while (off < data.len) {
+        while (off < total_len) {
             const max_frame: usize = conn.peer.max_frame_size.load(.acquire);
             const batch_cap: i64 = @intCast(@max(max_write_batch, max_frame));
             var stayed_in_sched = false;
             conn.send_mu.lockUncancelable(conn.io);
             if (rotate_on_reentry) {
                 rotate_on_reentry = false;
-                conn.schedRotateTailLocked(self);
-                conn.wakeNextScheduledLocked();
+                conn.sched.rotateTail(self);
+                conn.sched.wakeNext(conn.io, conn.send_window);
             }
             const n = blk: {
                 var waiting = false;
                 defer if (waiting) conn.notePeerWaitEnd();
                 while (true) {
                     if (self.timed_out.load(.acquire)) {
-                        conn.schedLeaveAndWakeLocked(self);
+                        conn.sched.leaveAndWake(conn.io, self, conn.send_window);
                         conn.send_mu.unlock(conn.io);
                         return error.DeadlineExceeded;
                     }
                     if (self.reset.load(.acquire) or conn.closing.load(.acquire)) {
-                        conn.schedLeaveAndWakeLocked(self);
+                        conn.sched.leaveAndWake(conn.io, self, conn.send_window);
                         conn.send_mu.unlock(conn.io);
                         return error.StreamReset;
                     }
                     if (self.send_window <= 0) {
                         // Step out of `sched` while stream-window-gated so lower-urgency
                         // ready streams never suffer head-of-line blocking on `conn.send_window`.
-                        conn.schedLeaveAndWakeLocked(self);
+                        conn.sched.leaveAndWake(conn.io, self, conn.send_window);
                         if (!waiting) {
                             conn.notePeerWaitBegin();
                             waiting = true;
@@ -833,11 +486,11 @@ const H2Stream = struct {
                         self.send_cond.waitUncancelable(conn.io, &conn.send_mu);
                         continue;
                     }
-                    const remaining = data.len - off;
+                    const remaining = total_len - off;
                     // Single-stream fast path: when no other stream is queued in `sched`
-                    // and this chunk finishes `data` within the available send window,
+                    // and this chunk finishes `total_len` within the available send window,
                     // claim credit directly with zero linked-list mutations.
-                    if (!prio_enabled or (!self.in_sched and conn.sched_count == 0 and conn.send_window > 0 and remaining <= @as(usize, @intCast(@min(@min(self.send_window, conn.send_window), batch_cap))))) {
+                    if (!prio_enabled or (!self.in_sched and conn.sched.count == 0 and conn.send_window > 0 and remaining <= @as(usize, @intCast(@min(@min(self.send_window, conn.send_window), batch_cap))))) {
                         if (conn.send_window <= 0) {
                             if (!waiting) {
                                 conn.notePeerWaitBegin();
@@ -855,7 +508,7 @@ const H2Stream = struct {
                         break :blk @as(usize, @intCast(want));
                     }
 
-                    conn.schedPushTailLocked(self);
+                    conn.sched.pushTail(self);
                     if (conn.send_window <= 0) {
                         if (!waiting) {
                             conn.notePeerWaitBegin();
@@ -866,10 +519,8 @@ const H2Stream = struct {
                         conn.send_cond.waitUncancelable(conn.io, &conn.send_mu);
                         continue;
                     }
-                    if (conn.schedTopLocked()) |top| {
+                    if (conn.sched.top()) |top| {
                         if (top != self) {
-                            // Local priority wait: `top` has higher urgency (or earlier turn),
-                            // so release `notePeerWait` if previously set and park on `self.send_cond`.
                             if (waiting) {
                                 conn.notePeerWaitEnd();
                                 waiting = false;
@@ -879,25 +530,25 @@ const H2Stream = struct {
                         }
                     }
 
-                    // Keep `self` at `sched_heads[u]` across `writeDataBatchForStream`
+                    // Keep `self` at `sched.heads[u]` across `writeDataVecBatchForStream`
                     // so lower-priority or next-turn peers cannot barge `cw.mu` ahead
                     // of this frame on the wire; rotate/leave once the write completes.
-                    const quantum: i64 = if (conn.sched_count > 1) @intCast(max_frame) else batch_cap;
+                    const quantum: i64 = if (conn.sched.count > 1) @intCast(max_frame) else batch_cap;
                     const avail = @min(self.send_window, conn.send_window);
                     const want: i64 = @min(@as(i64, @intCast(remaining)), @min(avail, quantum));
                     self.send_window -= want;
                     conn.send_window -= want;
                     const got: usize = @intCast(want);
                     stayed_in_sched = true;
-                    if (off + got < data.len and self.priority.incremental) {
+                    if (off + got < total_len and self.priority.incremental) {
                         rotate_on_reentry = true;
                     }
                     break :blk got;
                 }
             };
             conn.send_mu.unlock(conn.io);
-            const is_last = off + n == data.len;
-            conn.cw.writeDataBatchForStream(self, data[off .. off + n], end_stream and is_last, max_frame) catch |err| {
+            const is_last = off + n == total_len;
+            conn.writeDataVecBatchForStream(self, slices, &s_idx, &s_off, n, end_stream and is_last, max_frame) catch |err| {
                 conn.send_mu.lockUncancelable(conn.io);
                 if (err == error.StreamReset) {
                     // Batch was not written on the wire; return both stream and connection send credit.
@@ -905,21 +556,21 @@ const H2Stream = struct {
                     conn.send_window += @as(i64, @intCast(n));
                     conn.send_cond.broadcast(conn.io);
                 }
-                conn.schedLeaveAndWakeLocked(self);
+                conn.sched.leaveAndWake(conn.io, self, conn.send_window);
                 conn.send_mu.unlock(conn.io);
                 return err;
             };
             off += n;
             if (is_last and stayed_in_sched) {
                 conn.send_mu.lockUncancelable(conn.io);
-                conn.schedLeaveAndWakeLocked(self);
+                conn.sched.leaveAndWake(conn.io, self, conn.send_window);
                 conn.send_mu.unlock(conn.io);
             }
         }
     }
 
     fn endStream(self: *H2Stream) !void {
-        try self.conn.cw.frameForStream(self, .data, flag_end_stream, "");
+        try self.conn.frameForStream(self, .data, flag_end_stream, "");
     }
 };
 
@@ -998,6 +649,8 @@ const H2Sink = struct {
     const vtable: types.Sink.Vtable = .{
         .sendHead = sendHead,
         .writeBody = writeBody,
+        .writeBodyVec = writeBodyVec,
+        .flush = flushSink,
         .finish = finish,
         .sendComplete = sendComplete,
         .sendInformational = sendInformational,
@@ -1025,6 +678,19 @@ const H2Sink = struct {
     fn writeBody(ctx: *anyopaque, _: *types.Response, bytes: []const u8) anyerror!void {
         const self: *H2Sink = @ptrCast(@alignCast(ctx));
         try self.stream.sendBody(bytes);
+    }
+
+    fn writeBodyVec(ctx: *anyopaque, _: *types.Response, slices: []const []const u8) anyerror!void {
+        const self: *H2Sink = @ptrCast(@alignCast(ctx));
+        try self.stream.sendBodyVec(slices);
+    }
+
+    fn flushSink(ctx: *anyopaque, _: *types.Response) anyerror!void {
+        const self: *H2Sink = @ptrCast(@alignCast(ctx));
+        const st = self.stream;
+        if (st.timed_out.load(.acquire)) return error.DeadlineExceeded;
+        if (st.reset.load(.acquire) or st.conn.closing.load(.acquire)) return error.StreamReset;
+        try st.conn.cw.flush(true);
     }
 
     /// Coalesced fast path for known-length / empty responses (#41): encodes
@@ -1058,7 +724,7 @@ const H2Sink = struct {
         }
         const avail = @min(st.send_window, conn.send_window);
         if (avail > 0 and conn.canSendImmediateLocked(st)) {
-            const cap: i64 = if (conn.sched_count > 0) @intCast(max_frame) else batch_cap;
+            const cap: i64 = if (conn.sched.count > 0) @intCast(max_frame) else batch_cap;
             const want: i64 = @min(@as(i64, @intCast(body.len)), @min(avail, cap));
             st.send_window -= want;
             conn.send_window -= want;
@@ -1069,12 +735,12 @@ const H2Sink = struct {
         if (first_n > 0) {
             const fits_all = first_n == body.len;
             conn.encodeAndWriteResponse(st, res.status_code, res.extra.items, res.content_length, body[0..first_n], fits_all) catch |err| {
-                if (err == error.StreamReset) {
+                if (err == error.StreamReset or err == error.InvalidHeader) {
                     conn.send_mu.lockUncancelable(conn.io);
                     st.send_window += @as(i64, @intCast(first_n));
                     conn.send_window += @as(i64, @intCast(first_n));
                     conn.send_cond.broadcast(conn.io);
-                    conn.wakeNextScheduledLocked();
+                    conn.sched.wakeNext(conn.io, conn.send_window);
                     conn.send_mu.unlock(conn.io);
                 }
                 return err;
@@ -1131,6 +797,13 @@ const PendingPriority = struct {
     prio: StreamPriority = .{},
 };
 
+const FallbackThread = struct {
+    thread: std.Thread = undefined,
+    exited: std.atomic.Value(bool) = .init(false),
+};
+
+const stream_pool_cap: usize = 16;
+
 const Connection = struct {
     srv: *Server,
     gpa: std.mem.Allocator,
@@ -1146,17 +819,21 @@ const Connection = struct {
     send_mu: Io.Mutex = .init,
     send_cond: Io.Condition = .init,
     send_window: i64 = default_window,
-    sched_heads: [8]?*H2Stream = @splat(null),
-    sched_tails: [8]?*H2Stream = @splat(null),
-    sched_count: u32 = 0,
+    sched: priority_sched.PriorityScheduler(H2Stream) = .{},
     /// Bounded cache of `PRIORITY_UPDATE` signals received for not-yet-opened
     /// client streams (RFC 9218 §7.1). Reader-thread-only.
     pending_priorities: [32]PendingPriority = @splat(.{}),
     pending_prio_pos: usize = 0,
 
-    // Stream registry.
+    // Stream registry & warm per-connection `H2Stream` + `Arena` pool (guarded by `streams_mu`).
     streams_mu: Io.Mutex = .init,
     streams: std.AutoHashMapUnmanaged(u31, *H2Stream) = .empty,
+    /// Live RFC 9113 §5.1.2 open / half-closed stream count (`< max_concurrent_streams`).
+    /// Decremented atomically as soon as both directions reach `END_STREAM` (or reset),
+    /// before `w.flush()` delivers `END_STREAM` to the peer.
+    active_stream_slots: std.atomic.Value(u32) = .init(0),
+    stream_pool: [stream_pool_cap]?*H2Stream = @splat(null),
+    stream_pool_len: usize = 0,
     /// Highest client-initiated stream ID seen on inbound HEADERS (including
     /// refused streams), used to distinguish idle vs closed stream IDs.
     highest_stream_id: u31 = 0,
@@ -1170,10 +847,7 @@ const Connection = struct {
     streams_reset: u32 = 0,
     // One-shot fixed-size ring (256 slots, 2x the default max_concurrent_streams)
     // of stream IDs whose response completed cleanly (END_STREAM sent) while the
-    // client's send half was still open (!rx_eof). A single trailing RST_STREAM
-    // from the client closing that half-closed stream is normal HTTP/2 cleanup
-    // rather than a rapid-reset attack. Entries evicted past the 256-stream
-    // backlog fall back to normal reset counting. Guarded by streams_mu.
+    // client's send half was still open (!rx_eof). Guarded by streams_mu.
     early_closed: [256]u31 = @splat(0),
     early_closed_pos: usize = 0,
 
@@ -1181,11 +855,14 @@ const Connection = struct {
     workers_mu: Io.Mutex = .init,
     workers_cond: Io.Condition = .init,
     active_workers: u32 = 0,
+    /// Fallback OS threads spawned when `Io.Group.concurrent` reports
+    /// `error.ConcurrencyUnavailable`; joined before `Connection.deinit()` so
+    /// no detached OS thread can ever touch `conn` after `serveConn` returns.
+    /// Guarded by `workers_mu`.
+    fallback_threads: std.ArrayList(*FallbackThread) = .empty,
     /// Count of workers currently blocked on peer frames (rx DATA or send WINDOW_UPDATE).
     peer_waiters: u32 = 0,
-    /// Monotonic timestamp (ns, `.awake`) when `peer_waiters` rose from 0 to >0;
-    /// cleared when `peer_waiters` returns to 0 so streams making real progress
-    /// reset the window while housekeeping frames (PING, SETTINGS) do not.
+    /// Monotonic timestamp (ns, `.awake`) when `peer_waiters` rose from 0 to >0.
     peer_wait_since_ns: ?i96 = null,
     /// Monotonic timestamp (ns, `.awake`) when graceful drain started (`enterDraining`).
     drain_started_ns: ?i96 = null,
@@ -1197,6 +874,11 @@ const Connection = struct {
     conn_recv_window: i64 = 65535,
     conn_recv_pending: i64 = 0,
 
+    /// Active server keepalive timestamps (awake clock ns clamped to `i64`).
+    last_rx_ns: std.atomic.Value(i64) = .init(0),
+    ka_ping_sent_ns: std.atomic.Value(i64) = .init(0),
+    ka_ping_outstanding: std.atomic.Value(bool) = .init(false),
+
     /// Set on graceful shutdown (peer GOAWAY(NO_ERROR) or Server.stop). Reader-
     /// thread-only: new streams are refused while in-flight workers finish.
     draining: bool = false,
@@ -1206,13 +888,108 @@ const Connection = struct {
     /// Control-frame and empty-DATA flood accounting (reader-thread-only, #36).
     flood: FloodGuard = .{},
 
-    fn deinit(self: *Connection) void {
-        // Workers have all exited (drainWorkers ran) and removed their streams.
-        if (self.cw.gpa == null) {
-            self.cw.hpack_buf.deinit(self.gpa);
-            self.cw.enc.deinit(self.gpa);
+    fn bindWriter(self: *Connection) void {
+        self.cw.on_broken_ctx = self;
+        self.cw.on_broken_fn = onWriterBroken;
+    }
+
+    fn onWriterBroken(ctx: *anyopaque) void {
+        const self: *Connection = @ptrCast(@alignCast(ctx));
+        self.noteWriteFailure();
+    }
+
+    fn joinAllFallbackThreads(self: *Connection) void {
+        while (true) {
+            self.workers_mu.lockUncancelable(self.io);
+            const ft_opt: ?*FallbackThread = if (self.fallback_threads.items.len > 0)
+                self.fallback_threads.pop()
+            else
+                null;
+            self.workers_mu.unlock(self.io);
+            const ft = ft_opt orelse break;
+            ft.thread.join();
+            self.gpa.destroy(ft);
         }
-        self.cw.deinit();
+    }
+
+    fn releaseStreamSlot(self: *Connection, st: *H2Stream) void {
+        if (!st.slot_counted) return;
+        if (!st.slot_released.swap(true, .acq_rel)) {
+            _ = self.active_stream_slots.fetchSub(1, .acq_rel);
+            if (st.global_counted) {
+                self.srv.releaseGlobalStream();
+            }
+        }
+    }
+
+    fn acquireStream(self: *Connection, sid: u31, global_counted: bool) ?*H2Stream {
+        var pooled: ?*H2Stream = null;
+        self.streams_mu.lockUncancelable(self.io);
+        if (self.stream_pool_len > 0) {
+            self.stream_pool_len -= 1;
+            pooled = self.stream_pool[self.stream_pool_len];
+            self.stream_pool[self.stream_pool_len] = null;
+        }
+        self.streams_mu.unlock(self.io);
+
+        const st = pooled orelse (self.gpa.create(H2Stream) catch return null);
+        const saved_arena = if (pooled != null) st.arena_state else std.heap.ArenaAllocator.init(self.gpa);
+        const saved_rx = if (pooled != null) st.rx_buf else RxRing{};
+        st.* = .{
+            .conn = self,
+            .id = sid,
+            .arena_state = saved_arena,
+            .req = undefined,
+            .send_window = self.peer.initial_window_size,
+            .recv_window = @intCast(clampInitialWindow(self.srv.config.initial_window_size)),
+            .rx_buf = saved_rx,
+            .slot_counted = true,
+            .global_counted = global_counted,
+        };
+        return st;
+    }
+
+    fn recycleStream(self: *Connection, st: *H2Stream) void {
+        self.releaseStreamSlot(st);
+        st.slot_counted = false;
+        st.global_counted = false;
+        if (st.rx_trailers.len > 0) {
+            hpack.freeHeaders(self.gpa, st.rx_trailers);
+            st.rx_trailers = &.{};
+        }
+        st.rx_buf.head = 0;
+        st.rx_buf.len = 0;
+        if (st.rx_buf.buf.len > proto2.rx_ring_retain_cap) {
+            st.rx_buf.deinit(self.gpa);
+        }
+        if (!self.closing.load(.acquire)) {
+            _ = st.arena_state.reset(.{ .retain_with_limit = 8 * 1024 });
+            self.streams_mu.lockUncancelable(self.io);
+            if (self.stream_pool_len < stream_pool_cap) {
+                self.stream_pool[self.stream_pool_len] = st;
+                self.stream_pool_len += 1;
+                self.streams_mu.unlock(self.io);
+                return;
+            }
+            self.streams_mu.unlock(self.io);
+        }
+        st.rx_buf.deinit(self.gpa);
+        st.arena_state.deinit();
+        self.gpa.destroy(st);
+    }
+
+    fn deinit(self: *Connection) void {
+        self.joinAllFallbackThreads();
+        self.fallback_threads.deinit(self.gpa);
+        for (self.stream_pool[0..self.stream_pool_len]) |st_opt| {
+            if (st_opt) |st| {
+                st.rx_buf.deinit(self.gpa);
+                st.arena_state.deinit();
+                self.gpa.destroy(st);
+            }
+        }
+        self.stream_pool_len = 0;
+        self.cw.deinitWithAllocator(self.gpa);
         self.rx_scratch.deinit(self.gpa);
         self.streams.deinit(self.gpa);
         self.decoder.deinit();
@@ -1287,7 +1064,7 @@ const Connection = struct {
         plen += 6;
         putSetting(p[plen..][0..6], set_max_concurrent_streams, cfg.max_concurrent_streams);
         plen += 6;
-        putSetting(p[plen..][0..6], set_header_table_size, our_header_table_size);
+        putSetting(p[plen..][0..6], set_header_table_size, cfg.max_decoder_table_size);
         plen += 6;
         putSetting(p[plen..][0..6], set_max_frame_size, effectiveMaxFrameSize(cfg));
         plen += 6;
@@ -1319,74 +1096,81 @@ const Connection = struct {
         return self.cw.finishAndUnlock(err_opt);
     }
 
-    fn schedPushTailLocked(self: *Connection, st: *H2Stream) void {
-        if (st.in_sched) return;
-        const u: usize = st.priority.urgency;
-        st.sched_bucket = st.priority.urgency;
-        st.sched_prev = self.sched_tails[u];
-        st.sched_next = null;
-        if (self.sched_tails[u]) |tail| {
-            tail.sched_next = st;
-        } else {
-            self.sched_heads[u] = st;
-        }
-        self.sched_tails[u] = st;
-        st.in_sched = true;
-        self.sched_count += 1;
-    }
-
-    fn schedRemoveLocked(self: *Connection, st: *H2Stream) void {
-        if (!st.in_sched) return;
-        const u: usize = st.sched_bucket;
-        if (st.sched_prev) |prev| {
-            prev.sched_next = st.sched_next;
-        } else {
-            self.sched_heads[u] = st.sched_next;
-        }
-        if (st.sched_next) |next| {
-            next.sched_prev = st.sched_prev;
-        } else {
-            self.sched_tails[u] = st.sched_prev;
-        }
-        st.sched_prev = null;
-        st.sched_next = null;
-        st.in_sched = false;
-        self.sched_count -= 1;
-    }
-
-    fn schedRotateTailLocked(self: *Connection, st: *H2Stream) void {
-        if (!st.in_sched) return;
-        const u: usize = st.sched_bucket;
-        if (self.sched_tails[u] == st) return;
-        self.schedRemoveLocked(st);
-        self.schedPushTailLocked(st);
-    }
-
-    fn schedTopLocked(self: *const Connection) ?*H2Stream {
-        if (self.sched_count == 0) return null;
-        for (self.sched_heads) |head_opt| {
-            if (head_opt) |h| return h;
-        }
-        return null;
-    }
-
-    fn wakeNextScheduledLocked(self: *Connection) void {
-        if (self.send_window <= 0) return;
-        if (self.schedTopLocked()) |top| {
-            top.send_cond.broadcast(self.io);
-        }
-    }
-
-    fn schedLeaveAndWakeLocked(self: *Connection, st: *H2Stream) void {
-        if (!st.in_sched) return;
-        self.schedRemoveLocked(st);
-        self.wakeNextScheduledLocked();
-    }
-
     fn canSendImmediateLocked(self: *const Connection, st: *const H2Stream) bool {
-        if (!self.srv.config.enable_extensible_priorities or self.sched_count == 0) return true;
-        const top = self.schedTopLocked() orelse return true;
-        return st.priority.urgency < top.priority.urgency;
+        return self.sched.canSendImmediate(st, self.srv.config.enable_extensible_priorities);
+    }
+
+    fn writeStreamDataVecBatchThunk(
+        cw: *ConnWriter,
+        sid: u31,
+        slices: []const []const u8,
+        start_idx: *usize,
+        start_off: *usize,
+        byte_count: usize,
+        end_stream: bool,
+        max_frame: usize,
+    ) anyerror!void {
+        try cw.drainCtrlToBufferLocked();
+        try cw.writeDataVecWindowLocked(sid, slices, start_idx, start_off, byte_count, end_stream, max_frame);
+        try cw.drainCtrlToBufferLocked();
+        try cw.w.flush();
+    }
+
+    fn writeDataVecBatchForStream(
+        self: *Connection,
+        st: *H2Stream,
+        slices: []const []const u8,
+        start_idx: *usize,
+        start_off: *usize,
+        byte_count: usize,
+        end_stream: bool,
+        max_frame: usize,
+    ) !void {
+        self.cw.lock();
+        if (self.cw.broken) {
+            self.cw.unlock();
+            return error.WriteFailed;
+        }
+        self.cw.drainCtrlToBufferLocked() catch |err| {
+            return self.cw.finishAndUnlock(err);
+        };
+        if (st.reset.load(.acquire) or self.closing.load(.acquire)) {
+            try self.cw.finishAndUnlock(null);
+            return error.StreamReset;
+        }
+        if (end_stream) {
+            st.response_finished.store(true, .release);
+            if (st.rx_eof_atomic.load(.acquire)) self.releaseStreamSlot(st);
+        }
+        const err_opt: ?anyerror = if (runTimed(self.io, self.cw.write_timeout_ms, writeStreamDataVecBatchThunk, .{ &self.cw, st.id, slices, start_idx, start_off, byte_count, end_stream, max_frame })) |_|
+            null
+        else |e|
+            e;
+        try self.cw.finishAndUnlock(err_opt);
+    }
+
+    fn frameForStream(self: *Connection, st: *H2Stream, ftype: FrameType, flags: u8, payload: []const u8) !void {
+        self.cw.lock();
+        if (self.cw.broken) {
+            self.cw.unlock();
+            return error.WriteFailed;
+        }
+        self.cw.drainCtrlToBufferLocked() catch |err| {
+            return self.cw.finishAndUnlock(err);
+        };
+        if (st.reset.load(.acquire) or self.closing.load(.acquire)) {
+            try self.cw.finishAndUnlock(null);
+            return error.StreamReset;
+        }
+        if (flags & flag_end_stream != 0) {
+            st.response_finished.store(true, .release);
+            if (st.rx_eof_atomic.load(.acquire)) self.releaseStreamSlot(st);
+        }
+        const err_opt: ?anyerror = if (runTimed(self.io, self.cw.write_timeout_ms, ConnWriter.writeSingleFrameThunk, .{ &self.cw, ftype, flags, st.id, payload })) |_|
+            null
+        else |e|
+            e;
+        try self.cw.finishAndUnlock(err_opt);
     }
 
     fn putPendingPriority(self: *Connection, sid: u31, prio: StreamPriority) void {
@@ -1485,8 +1269,16 @@ const Connection = struct {
         }
         self.cw.hpack_buf.clearRetainingCapacity();
         self.cw.enc.encodeResponse(alloc, &self.cw.hpack_buf, status_code, headers, auto_cl) catch |err| {
+            if (err == error.InvalidHeader) {
+                try self.cw.finishAndUnlock(null);
+                return err;
+            }
             return self.cw.finishAndUnlock(err);
         };
+        if (end_stream) {
+            st.response_finished.store(true, .release);
+            if (st.rx_eof_atomic.load(.acquire)) self.releaseStreamSlot(st);
+        }
         const err_opt: ?anyerror = if (runTimed(self.io, self.cw.write_timeout_ms, writeHeadersAndDataThunk, .{ &self.cw, sid, max, self.cw.hpack_buf.items, data, end_stream })) |_|
             null
         else |e|
@@ -1516,8 +1308,14 @@ const Connection = struct {
         }
         self.cw.hpack_buf.clearRetainingCapacity();
         self.cw.enc.encodeTrailers(alloc, &self.cw.hpack_buf, trailers) catch |err| {
+            if (err == error.InvalidHeader) {
+                try self.cw.finishAndUnlock(null);
+                return err;
+            }
             return self.cw.finishAndUnlock(err);
         };
+        st.response_finished.store(true, .release);
+        if (st.rx_eof_atomic.load(.acquire)) self.releaseStreamSlot(st);
         const err_opt: ?anyerror = if (runTimed(self.io, self.cw.write_timeout_ms, writeHeadersAndDataThunk, .{ &self.cw, sid, max, self.cw.hpack_buf.items, "", true })) |_|
             null
         else |e|
@@ -1555,8 +1353,10 @@ const Connection = struct {
         while (self.active_workers > 0) self.workers_cond.waitUncancelable(self.io, &self.workers_mu);
         self.workers_mu.unlock(self.io);
         self.closing.store(true, .release);
-        // All tasks have exited (counter hit 0); await releases the group's own resources and returns immediately.
+        // All tasks have exited (counter hit 0); await releases the group's own resources and returns immediately,
+        // and joinAllFallbackThreads ensures no fallback OS thread still holds stack references to `self`.
         self.worker_group.await(self.io) catch {};
+        self.joinAllFallbackThreads();
     }
 };
 
@@ -1603,25 +1403,74 @@ fn forwardStopLeaderIfVacant(srv: *Server) void {
     }
 }
 
+const keepalive_ping_payload: [8]u8 = .{ 'z', 'h', '2', '-', 'k', 'a', 0, 1 };
+
+inline fn clampAwakeNs64(ns: i96) i64 {
+    return @intCast(std.math.clamp(ns, 0, std.math.maxInt(i64)));
+}
+
 fn idleWaitThunk(conn: *Connection, idle_timeout_ms: u64) IdleWait {
     const srv = conn.srv;
+    const cfg = srv.config;
+    const start_ns = Io.Timestamp.now(srv.io, .awake).nanoseconds;
     const deadline_ns: ?i96 = if (idle_timeout_ms > 0)
-        Io.Timestamp.now(srv.io, .awake).nanoseconds + @as(i96, idle_timeout_ms) * std.time.ns_per_ms
+        start_ns + @as(i96, idle_timeout_ms) * std.time.ns_per_ms
     else
         null;
-    const timeout: Io.Timeout = if (deadline_ns) |dl| .{
-        .deadline = .{ .raw = .{ .nanoseconds = dl }, .clock = .awake },
-    } else .none;
+
+    const ka_time_ns: ?i96 = if (cfg.keepalive_time_ms > 0)
+        @as(i96, cfg.keepalive_time_ms) * std.time.ns_per_ms
+    else
+        null;
+    const ka_to_ms: u64 = if (cfg.keepalive_timeout_ms > 0)
+        cfg.keepalive_timeout_ms
+    else if (cfg.keepalive_time_ms > 0)
+        @min(cfg.keepalive_time_ms, 20_000)
+    else
+        20_000;
+    const ka_timeout_ns: i96 = @as(i96, ka_to_ms) * std.time.ns_per_ms;
 
     while (true) {
         if (broadcastIfStopped(srv)) return .stopped;
         if (conn.closing.load(.acquire)) return .aborted;
+
+        const now0 = Io.Timestamp.now(srv.io, .awake).nanoseconds;
         if (deadline_ns) |dl| {
-            if (Io.Timestamp.now(srv.io, .awake).nanoseconds >= dl) {
+            if (now0 >= dl) {
                 forwardStopLeaderIfVacant(srv);
                 return .timeout;
             }
         }
+
+        var next_ka_ns: ?i96 = null;
+        if (ka_time_ns) |kt| {
+            if (conn.ka_ping_outstanding.load(.acquire)) {
+                const ping_dl = @as(i96, conn.ka_ping_sent_ns.load(.acquire)) + ka_timeout_ns;
+                if (now0 >= ping_dl) {
+                    forwardStopLeaderIfVacant(srv);
+                    return .timeout;
+                }
+                next_ka_ns = ping_dl;
+            } else {
+                const probe_dl = @as(i96, conn.last_rx_ns.load(.acquire)) + kt;
+                if (now0 >= probe_dl) {
+                    conn.ka_ping_sent_ns.store(clampAwakeNs64(now0), .release);
+                    conn.ka_ping_outstanding.store(true, .release);
+                    conn.cw.frame(.ping, 0, 0, &keepalive_ping_payload) catch {
+                        forwardStopLeaderIfVacant(srv);
+                        return .aborted;
+                    };
+                    next_ka_ns = now0 + ka_timeout_ns;
+                } else {
+                    next_ka_ns = probe_dl;
+                }
+            }
+        }
+
+        const earliest_dl: ?i96 = if (deadline_ns) |dl|
+            (if (next_ka_ns) |ka| @min(dl, ka) else dl)
+        else
+            next_ka_ns;
 
         // Sample `stop_wake` BEFORE attempting to claim the single-poller token
         // so a leader stepping down right after `cmpxchgStrong` fails cannot miss us.
@@ -1636,9 +1485,9 @@ fn idleWaitThunk(conn: *Connection, idle_timeout_ms: u64) IdleWait {
                 if (broadcastIfStopped(srv)) return .stopped;
                 if (conn.closing.load(.acquire)) return .aborted;
                 var wait_ns: i96 = stop_poll_ns;
-                if (deadline_ns) |dl| {
+                if (earliest_dl) |dl| {
                     const now = Io.Timestamp.now(srv.io, .awake).nanoseconds;
-                    if (now >= dl) return .timeout;
+                    if (now >= dl) break; // re-evaluate idle timeout or keepalive probe in outer loop
                     wait_ns = @min(wait_ns, dl - now);
                 }
                 srv.stop_event.waitTimeout(srv.io, .{
@@ -1650,11 +1499,15 @@ fn idleWaitThunk(conn: *Connection, idle_timeout_ms: u64) IdleWait {
                 srv.requestStop();
                 return .stopped;
             }
+            continue;
         }
 
         // Follower path (`N - 1` idle connections): zero 200ms polling!
         if (broadcastIfStopped(srv)) return .stopped;
         if (conn.closing.load(.acquire)) return .aborted;
+        const timeout: Io.Timeout = if (earliest_dl) |dl| .{
+            .deadline = .{ .raw = .{ .nanoseconds = dl }, .clock = .awake },
+        } else .none;
         srv.io.futexWaitTimeout(u32, &srv.stop_wake.raw, wake_seq, timeout) catch |err| switch (err) {
             error.Canceled => {
                 forwardStopLeaderIfVacant(srv);
@@ -1902,8 +1755,13 @@ pub fn serveConn(srv: *Server, r: *Io.Reader, w: *Io.Writer, client_ip: ?[]const
         return;
     }
 
-    var dec = hpack.Decoder.init(srv.gpa, our_header_table_size);
+    var dec = hpack.Decoder.init(srv.gpa, srv.config.max_decoder_table_size);
     dec.max_list_size = srv.config.max_header_list_size;
+
+    const init_rx_ns: i64 = if (srv.config.keepalive_time_ms > 0)
+        clampAwakeNs64(Io.Timestamp.now(srv.io, .awake).nanoseconds)
+    else
+        0;
 
     var conn: Connection = .{
         .srv = srv,
@@ -1919,8 +1777,9 @@ pub fn serveConn(srv: *Server, r: *Io.Reader, w: *Io.Writer, client_ip: ?[]const
         .decoder = dec,
         .client_ip = client_ip,
         .scheme = scheme,
+        .last_rx_ns = .init(init_rx_ns),
     };
-    conn.cw.conn = &conn;
+    conn.bindWriter();
     defer conn.deinit();
 
     conn.sendOurSettings() catch return;
@@ -1965,6 +1824,10 @@ fn readLoop(conn: *Connection, r: *Io.Reader) bool {
         const payload = conn.borrowScratch(fh.length) catch return false;
         if (payload.len > 0) {
             readSliceTimed(conn, r, payload, conn.srv.config.head_timeout_ms) catch return false;
+        }
+        if (conn.srv.config.keepalive_time_ms > 0) {
+            conn.last_rx_ns.store(clampAwakeNs64(Io.Timestamp.now(conn.io, .awake).nanoseconds), .release);
+            conn.ka_ping_outstanding.store(false, .release);
         }
 
         if (validateInboundFrame(fh, payload)) |code| {
@@ -2214,7 +2077,7 @@ fn handleWindowUpdate(conn: *Connection, fh: ParsedHeader, payload: []const u8) 
                     conn.send_window += incr;
                     if (conn.send_window > 0) {
                         conn.send_cond.broadcast(conn.io);
-                        conn.wakeNextScheduledLocked();
+                        conn.sched.wakeNext(conn.io, conn.send_window);
                     }
                 }
             } else if (conn.streams.get(fh.sid)) |st| {
@@ -2279,12 +2142,7 @@ fn handlePriorityUpdate(conn: *Connection, payload: []const u8) bool {
     conn.streams_mu.lockUncancelable(conn.io);
     if (conn.streams.get(prio_sid)) |st| {
         conn.send_mu.lockUncancelable(conn.io);
-        st.priority = new_prio;
-        if (st.in_sched and st.sched_bucket != new_prio.urgency) {
-            conn.schedRemoveLocked(st);
-            conn.schedPushTailLocked(st);
-            conn.wakeNextScheduledLocked();
-        }
+        conn.sched.reprioritize(conn.io, st, new_prio, conn.send_window);
         conn.send_mu.unlock(conn.io);
         conn.streams_mu.unlock(conn.io);
         return true;
@@ -2487,7 +2345,11 @@ fn handleData(conn: *Connection, fh: ParsedHeader, payload: []const u8) bool {
         rstStreamCode(conn, fh.sid, .internal_error);
         return true;
     }
-    if (end_stream) s.rx_eof = true;
+    if (end_stream) {
+        s.rx_eof = true;
+        s.rx_eof_atomic.store(true, .release);
+        if (s.response_finished.load(.acquire)) conn.releaseStreamSlot(s);
+    }
     // Padding/framing overhead is "consumed" on arrival: credit it immediately.
     const overhead: i64 = fc_len - @as(i64, @intCast(data.len));
     const d = if (overhead > 0) s.creditStreamLocked(overhead) else 0;
@@ -2527,6 +2389,7 @@ fn resetStream(conn: *Connection, sid: u31) bool {
         }
         st.rx_cond.broadcast(conn.io);
         st.rx_mu.unlock(conn.io);
+        conn.releaseStreamSlot(st);
         conn.wakeStreamSender(st);
     } else {
         // Consume one-shot exemption for a stream whose response already
@@ -2703,12 +2566,10 @@ fn handleHeaders(conn: *Connection, r: *Io.Reader, fh: ParsedHeader, first: []co
         return refuseStream(conn, fh.sid, hdr_block, .refused_stream);
     }
 
-    // Concurrency cap: also rate-limit overloaded REFUSED_STREAM bursts so a
-    // peer pinning `max_concurrent_streams` slots cannot flood `HEADERS` unboundedly.
-    conn.streams_mu.lockUncancelable(conn.io);
-    const count = conn.streams.count();
-    conn.streams_mu.unlock(conn.io);
-    if (count >= conn.srv.config.max_concurrent_streams) {
+    // Concurrency cap (per-connection and server-wide): rate-limit overloaded
+    // REFUSED_STREAM bursts so a peer pinning concurrency slots cannot flood HEADERS.
+    const count = conn.active_stream_slots.load(.acquire);
+    if (count >= conn.srv.config.max_concurrent_streams or !conn.srv.tryAcquireGlobalStream()) {
         const now_ns = Io.Timestamp.now(conn.io, .awake).nanoseconds;
         if (conn.flood.recordReset(now_ns, conn.srv.config)) {
             sendGoaway(conn, .enhance_your_calm);
@@ -2716,32 +2577,25 @@ fn handleHeaders(conn: *Connection, r: *Io.Reader, fh: ParsedHeader, first: []co
         }
         return refuseStream(conn, fh.sid, hdr_block, .refused_stream);
     }
+    _ = conn.active_stream_slots.fetchAdd(1, .acq_rel);
 
-    // Build the stream (owns its request arena). Decode happens on this (reader)
-    // thread so the HPACK decoder stays single-threaded.
+    // Build or reuse a pooled stream (owns its warm request arena). Decode happens
+    // on this (reader) thread so the HPACK decoder stays single-threaded.
     const pending_prio = conn.takePendingPriority(fh.sid);
-    const st = gpa.create(H2Stream) catch return refuseStream(conn, fh.sid, hdr_block, .internal_error);
-    st.* = .{
-        .conn = conn,
-        .id = fh.sid,
-        .arena_state = std.heap.ArenaAllocator.init(gpa),
-        .req = undefined,
-        .send_window = conn.peer.initial_window_size,
-        .recv_window = @intCast(clampInitialWindow(conn.srv.config.initial_window_size)),
+    const st = conn.acquireStream(fh.sid, true) orelse {
+        _ = conn.active_stream_slots.fetchSub(1, .acq_rel);
+        conn.srv.releaseGlobalStream();
+        return refuseStream(conn, fh.sid, hdr_block, .internal_error);
     };
     const arena = st.arena();
     const decoded = conn.decoder.decode(arena, hdr_block) catch |err| {
-        st.arena_state.deinit();
-        gpa.destroy(st);
+        conn.recycleStream(st);
         sendGoaway(conn, hpackErrorToCode(err));
         return error.ProtocolError;
     };
     conn.last_stream_id = fh.sid;
     st.req = buildRequestEx(arena, decoded, conn.srv.config.enable_connect_protocol) catch |err| {
-        st.arena_state.deinit();
-        gpa.destroy(st);
-        // Either way the stream gets a reset: without one the peer waits for a
-        // response that will never come.
+        conn.recycleStream(st);
         rstStreamCode(conn, fh.sid, if (err == error.BadRequest) .protocol_error else .internal_error);
         return;
     };
@@ -2751,13 +2605,13 @@ fn handleHeaders(conn: *Connection, r: *Io.Reader, fh: ParsedHeader, first: []co
     if (fh.flags & flag_end_stream != 0) {
         if (st.req.content_length) |cl| {
             if (cl != 0) {
-                st.arena_state.deinit();
-                gpa.destroy(st);
+                conn.recycleStream(st);
                 rstStreamCode(conn, fh.sid, .protocol_error);
                 return;
             }
         }
         st.rx_eof = true;
+        st.rx_eof_atomic.store(true, .release);
     } else {
         st.has_body = true;
     }
@@ -2765,8 +2619,7 @@ fn handleHeaders(conn: *Connection, r: *Io.Reader, fh: ParsedHeader, first: []co
     conn.streams_mu.lockUncancelable(conn.io);
     conn.streams.put(gpa, fh.sid, st) catch {
         conn.streams_mu.unlock(conn.io);
-        st.arena_state.deinit();
-        gpa.destroy(st);
+        conn.recycleStream(st);
         rstStreamCode(conn, fh.sid, .internal_error);
         return;
     };
@@ -2896,6 +2749,8 @@ fn handleTrailingHeaders(conn: *Connection, fh: ParsedHeader, block: []const u8)
     s.rx_trailers = saved_trailers;
     saved_trailers = &.{};
     s.rx_eof = true;
+    s.rx_eof_atomic.store(true, .release);
+    if (s.response_finished.load(.acquire)) conn.releaseStreamSlot(s);
     s.rx_cond.broadcast(conn.io);
     s.rx_mu.unlock(conn.io);
     conn.streams_mu.unlock(conn.io);
@@ -2907,20 +2762,71 @@ fn handleTrailingHeaders(conn: *Connection, fh: ParsedHeader, block: []const u8)
 /// (tasks decrement on exit); returns false only if both paths fail. f's return type
 /// must coerce to Io.Cancelable!void (void satisfies); args is f's ArgsTuple, matching
 /// the parameter expectations of Io.Group.concurrent / std.Thread.spawn.
+fn reapExitedFallbackThreads(conn: *Connection) void {
+    while (true) {
+        var reaped: ?*FallbackThread = null;
+        conn.workers_mu.lockUncancelable(conn.io);
+        for (conn.fallback_threads.items, 0..) |ft, i| {
+            if (ft.exited.load(.acquire)) {
+                reaped = conn.fallback_threads.swapRemove(i);
+                break;
+            }
+        }
+        conn.workers_mu.unlock(conn.io);
+        const ft = reaped orelse break;
+        ft.thread.join();
+        conn.gpa.destroy(ft);
+    }
+}
+
+fn spawnFallbackThread(conn: *Connection, comptime f: anytype, args: std.meta.ArgsTuple(@TypeOf(f))) bool {
+    reapExitedFallbackThreads(conn);
+    const ft = conn.gpa.create(FallbackThread) catch {
+        conn.workers_mu.lockUncancelable(conn.io);
+        conn.active_workers -= 1;
+        conn.workers_cond.broadcast(conn.io);
+        conn.workers_mu.unlock(conn.io);
+        return false;
+    };
+    ft.* = .{};
+
+    const Runner = struct {
+        fn run(ft_ptr: *FallbackThread, call_args: std.meta.ArgsTuple(@TypeOf(f))) void {
+            const res = @call(.auto, f, call_args);
+            if (@typeInfo(@TypeOf(res)) == .error_union) {
+                res catch {};
+            }
+            ft_ptr.exited.store(true, .release);
+        }
+    };
+
+    conn.workers_mu.lockUncancelable(conn.io);
+    conn.fallback_threads.ensureUnusedCapacity(conn.gpa, 1) catch {
+        conn.active_workers -= 1;
+        conn.workers_cond.broadcast(conn.io);
+        conn.workers_mu.unlock(conn.io);
+        conn.gpa.destroy(ft);
+        return false;
+    };
+    const t = std.Thread.spawn(.{}, Runner.run, .{ ft, args }) catch {
+        conn.active_workers -= 1;
+        conn.workers_cond.broadcast(conn.io);
+        conn.workers_mu.unlock(conn.io);
+        conn.gpa.destroy(ft);
+        return false;
+    };
+    ft.thread = t;
+    conn.fallback_threads.appendAssumeCapacity(ft);
+    conn.workers_mu.unlock(conn.io);
+    return true;
+}
+
 fn spawnTask(conn: *Connection, comptime f: anytype, args: std.meta.ArgsTuple(@TypeOf(f))) bool {
     conn.workers_mu.lockUncancelable(conn.io);
     conn.active_workers += 1;
     conn.workers_mu.unlock(conn.io);
     conn.worker_group.concurrent(conn.io, f, args) catch |err| switch (err) {
-        error.ConcurrencyUnavailable => {
-            const t = std.Thread.spawn(.{}, f, args) catch {
-                conn.workers_mu.lockUncancelable(conn.io);
-                conn.active_workers -= 1;
-                conn.workers_mu.unlock(conn.io);
-                return false;
-            };
-            t.detach();
-        },
+        error.ConcurrencyUnavailable => return spawnFallbackThread(conn, f, args),
     };
     return true;
 }
@@ -2933,9 +2839,7 @@ fn spawnWorker(conn: *Connection, st: *H2Stream) void {
     // explicit RST the peer waits for a response that will never come.
     rstStreamCode(conn, st.id, .refused_stream);
     removeStream(conn, st.id);
-    st.rx_buf.deinit(conn.gpa);
-    st.arena_state.deinit();
-    conn.gpa.destroy(st);
+    conn.recycleStream(st);
 }
 
 fn buildRequest(arena: std.mem.Allocator, decoded: []const hpack.Header) !types.Request {
@@ -3123,6 +3027,8 @@ fn buildRequestEx(arena: std.mem.Allocator, decoded: []const hpack.Header, allow
 
     return .{
         .method = method,
+        .scheme = scheme,
+        .authority = authority,
         .target = path,
         .minor_version = 0,
         .headers = try hdrs.toOwnedSlice(arena),
@@ -3157,12 +3063,9 @@ fn runStream(st: *H2Stream) void {
             if (dc > 0) sendWindowUpdate(conn, 0, dc);
         }
         conn.send_mu.lockUncancelable(conn.io);
-        conn.schedLeaveAndWakeLocked(st);
+        conn.sched.leaveAndWake(conn.io, st, conn.send_window);
         conn.send_mu.unlock(conn.io);
-        if (st.rx_trailers.len > 0) hpack.freeHeaders(conn.gpa, st.rx_trailers);
-        st.rx_buf.deinit(conn.gpa);
-        st.arena_state.deinit();
-        conn.gpa.destroy(st);
+        conn.recycleStream(st);
         conn.workers_mu.lockUncancelable(conn.io);
         conn.active_workers -= 1;
         conn.workers_cond.broadcast(conn.io);
@@ -7126,7 +7029,13 @@ test "server SETTINGS clamps initial_window_size, advertises MAX_HEADER_LIST_SIZ
                         self.conn.send_mu.unlock(testing.io);
                     }
                 }
-                return data[0].len;
+                w.end = 0;
+                var total: usize = 0;
+                if (data.len > 0) {
+                    for (data[0 .. data.len - 1]) |s| total += s.len;
+                    total += data[data.len - 1].len;
+                }
+                return total;
             }
         };
         var lcw: LockCheckWriter = .{
@@ -7451,8 +7360,14 @@ test "Server.requestStop wakes idle connections immediately with GOAWAY(NO_ERROR
 test "H2Sink.sendComplete restores both stream and connection send windows on pre-wire StreamReset" {
     const NoopWriter = struct {
         writer: Io.Writer,
-        fn drain(_: *Io.Writer, data: []const []const u8, _: usize) Io.Writer.Error!usize {
-            return data[0].len;
+        fn drain(w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
+            w.end = 0;
+            var total: usize = 0;
+            if (data.len > 0) {
+                for (data[0 .. data.len - 1]) |s| total += s.len;
+                total += data[data.len - 1].len * splat;
+            }
+            return total;
         }
     };
     var nw: NoopWriter = .{ .writer = .{ .buffer = &.{}, .vtable = &.{ .drain = NoopWriter.drain } } };
@@ -7778,7 +7693,7 @@ test "server batches multi-frame sendBody and sendComplete into bounded 64 KiB f
             .decoder = hpack.Decoder.init(testing.allocator, our_header_table_size),
             .send_window = 256 * 1024,
         };
-        conn.cw.conn = &conn;
+        conn.bindWriter();
         defer conn.deinit();
 
         var st: H2Stream = .{
@@ -7837,7 +7752,7 @@ test "server batches multi-frame sendBody and sendComplete into bounded 64 KiB f
             .decoder = hpack.Decoder.init(testing.allocator, our_header_table_size),
             .send_window = 256 * 1024,
         };
-        conn.cw.conn = &conn;
+        conn.bindWriter();
         defer conn.deinit();
 
         var st: H2Stream = .{
@@ -7942,7 +7857,7 @@ test "ConnWriter piggybacks control frames without blocking when cw.mu is conten
             .cw = .{ .io = testing.io, .w = &ss.writer, .gpa = testing.allocator, .write_timeout_ms = 50 },
             .decoder = hpack.Decoder.init(testing.allocator, our_header_table_size),
         };
-        conn.cw.conn = &conn;
+        conn.bindWriter();
         defer conn.deinit();
 
         const t0 = Io.Timestamp.now(testing.io, .awake).nanoseconds;
@@ -8056,8 +7971,14 @@ test "idle follower broadcasts bare srv.stop.store(true) when woken by single-wa
 test "ConnWriter.writeWindowUpdates marks connection broken on ctrl_buf OOM instead of dropping credit (#49)" {
     const NoopSink = struct {
         writer: Io.Writer,
-        fn drain(_: *Io.Writer, data: []const []const u8, _: usize) Io.Writer.Error!usize {
-            return data[0].len;
+        fn drain(w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
+            w.end = 0;
+            var total: usize = 0;
+            if (data.len > 0) {
+                for (data[0 .. data.len - 1]) |s| total += s.len;
+                total += data[data.len - 1].len * splat;
+            }
+            return total;
         }
     };
     var ns: NoopSink = .{ .writer = .{ .buffer = &.{}, .vtable = &.{ .drain = NoopSink.drain } } };
@@ -8069,7 +7990,7 @@ test "ConnWriter.writeWindowUpdates marks connection broken on ctrl_buf OOM inst
         .cw = .{ .io = testing.io, .w = &ns.writer, .gpa = testing.failing_allocator },
         .decoder = hpack.Decoder.init(testing.allocator, our_header_table_size),
     };
-    conn.cw.conn = &conn;
+    conn.bindWriter();
     defer conn.deinit();
 
     const Holder = struct {
@@ -8133,7 +8054,7 @@ test "server stateful HPACK EncoderContext compresses repeated headers and skips
             },
             .decoder = hpack.Decoder.init(testing.allocator, our_header_table_size),
         };
-        conn.cw.conn = &conn;
+        conn.bindWriter();
         defer conn.deinit();
 
         var st: H2Stream = .{
@@ -8316,7 +8237,7 @@ test "server per-stream send_cond wakes target stream and RST unblocks conn-wind
             .send_window = 0, // connection send window exhausted
             .highest_stream_id = 7,
         };
-        conn.cw.conn = &conn;
+        conn.bindWriter();
         defer conn.deinit();
 
         var st5: H2Stream = .{
@@ -8872,7 +8793,7 @@ test "PR 51 review regressions: early_closed HEADERS one-shot, draining HEADERS 
             .decoder = hpack.Decoder.init(testing.allocator, our_header_table_size),
             .highest_stream_id = 1,
         };
-        conn.cw.conn = &conn;
+        conn.bindWriter();
         defer conn.deinit();
 
         var st1: H2Stream = .{
@@ -8908,5 +8829,297 @@ test "PR 51 review regressions: early_closed HEADERS one-shot, draining HEADERS 
         var set0: [6]u8 = undefined;
         putSetting(&set0, set_no_rfc7540_priorities, 0);
         try testing.expect(!handleSettings(&conn, .{ .length = 6, .ftype = .settings, .flags = 0, .sid = 0 }, &set0));
+    }
+}
+
+test "Phase 4 server: fallback thread join safety under 50-stream stress, stream_pool reuse, corking, and writeVec" {
+    // 1. 50-stream stress under `concurrent_limit = .nothing` (every worker + watchdog
+    // uses `spawnFallbackThread` and is joined before `Connection` stack frame exits).
+    {
+        const FallbackHandler = struct {
+            fn handle(ctx: *types.Context) anyerror!void {
+                ctx.setDeadlineIn(500);
+                try ctx.res.setCork(true);
+                try ctx.res.header("x-scheme", ctx.req.scheme);
+                try ctx.res.header("x-auth", ctx.req.authority);
+                const parts = [_][]const u8{ "ok:", ctx.req.path() };
+                try ctx.res.writeVec(&parts);
+                try ctx.res.finish();
+            }
+        };
+
+        var no_conc: Io.Threaded = .init(testing.allocator, .{
+            .concurrent_limit = .nothing,
+            .environ = .empty,
+        });
+        defer no_conc.deinit();
+
+        const fds = try newSocketPair();
+        errdefer _ = c.close(fds[1]);
+        var srv: Server = .{
+            .io = no_conc.io(),
+            .gpa = testing.allocator,
+            .handler = FallbackHandler.handle,
+            .config = .{ .head_timeout_ms = 0, .write_timeout_ms = 0, .idle_timeout_ms = 0 },
+        };
+        const th = try std.Thread.spawn(.{}, serveRawH2OnFd, .{ &srv, fds[0] });
+
+        var closed_peer = false;
+        defer {
+            if (!closed_peer) _ = c.close(fds[1]);
+            th.join();
+        }
+
+        var rbuf: [8192]u8 = undefined;
+        var wbuf: [8192]u8 = undefined;
+        var reader = peerStream(fds[1]).reader(testing.io, &rbuf);
+        var writer = peerStream(fds[1]).writer(testing.io, &wbuf);
+        try rawHandshake(&reader.interface, &writer.interface);
+
+        var enc = hpack.EncoderContext.initWithMaxSize(4096);
+        defer enc.deinit(testing.allocator);
+        var hbuf: std.ArrayList(u8) = .empty;
+        defer hbuf.deinit(testing.allocator);
+
+        var sid: u31 = 1;
+        for (0..50) |i| {
+            var pbuf: [24]u8 = undefined;
+            const path = std.fmt.bufPrint(&pbuf, "/fb/{d}", .{i}) catch unreachable;
+            hbuf.clearRetainingCapacity();
+            try enc.encodeRequest(testing.allocator, &hbuf, "GET", "https", path, "edge.test:8443", &.{});
+            try writeFrame(&writer.interface, .headers, flag_end_headers | flag_end_stream, sid, hbuf.items);
+            while (true) {
+                var f = try readFrameAlloc(testing.allocator, &reader.interface);
+                const done = f.header.sid == sid and (f.header.flags & flag_end_stream != 0);
+                f.deinit(testing.allocator);
+                if (done) break;
+            }
+            sid += 2;
+        }
+        try testing.expectEqual(@as(u32, 0), srv.activeStreams());
+        _ = c.close(fds[1]);
+        closed_peer = true;
+    }
+
+    // 2. Scatter-gather `writeVec` across frame boundaries + `req.getAll` + `req.scheme`/`req.authority`.
+    {
+        const VecHandler = struct {
+            fn handle(ctx: *types.Context) anyerror!void {
+                ctx.res.status(200);
+                try ctx.res.header("x-req-scheme", ctx.req.scheme);
+                try ctx.res.header("x-req-auth", ctx.req.authority);
+                var count: usize = 0;
+                var it = ctx.req.getAll("accept");
+                while (it.next()) |_| count += 1;
+                var cbuf: [8]u8 = undefined;
+                try ctx.res.header("x-accept-count", std.fmt.bufPrint(&cbuf, "{d}", .{count}) catch "0");
+                try ctx.res.flushHead();
+
+                const part_a: [10_000]u8 = @splat('a');
+                const part_b: [10_000]u8 = @splat('b');
+                const part_c = "tail";
+                const vecs = [_][]const u8{ &part_a, "", &part_b, part_c };
+                try ctx.res.writeVec(&vecs);
+                try ctx.res.flush();
+                try ctx.res.finish();
+            }
+        };
+
+        const fds = try newSocketPair();
+        errdefer _ = c.close(fds[1]);
+        var srv: Server = .{ .io = testing.io, .gpa = testing.allocator, .handler = VecHandler.handle };
+        const th = try std.Thread.spawn(.{}, serveRawH2OnFd, .{ &srv, fds[0] });
+        defer th.join();
+        defer _ = c.close(fds[1]);
+
+        var rbuf: [16384]u8 = undefined;
+        var wbuf: [8192]u8 = undefined;
+        var reader = peerStream(fds[1]).reader(testing.io, &rbuf);
+        var writer = peerStream(fds[1]).writer(testing.io, &wbuf);
+        try rawHandshake(&reader.interface, &writer.interface);
+
+        var enc = hpack.EncoderContext.initWithMaxSize(4096);
+        defer enc.deinit(testing.allocator);
+        var dec = hpack.Decoder.init(testing.allocator, our_header_table_size);
+        defer dec.deinit();
+        var hbuf: std.ArrayList(u8) = .empty;
+        defer hbuf.deinit(testing.allocator);
+        try enc.encodeRequest(testing.allocator, &hbuf, "GET", "https", "/vec", "cdn.example.org:443", &.{
+            .{ .name = "accept", .value = "text/html" },
+            .{ .name = "accept", .value = "application/xhtml+xml" },
+        });
+        try writeFrame(&writer.interface, .headers, flag_end_headers | flag_end_stream, 1, hbuf.items);
+
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        var body_acc: std.ArrayList(u8) = .empty;
+        defer body_acc.deinit(testing.allocator);
+        while (true) {
+            var f = try readFrameAlloc(testing.allocator, &reader.interface);
+            defer f.deinit(testing.allocator);
+            if (f.header.ftype == .headers and f.header.sid == 1) {
+                const hs = try dec.decode(arena_state.allocator(), f.payload);
+                try testing.expectEqualStrings("https", findHeaderValue(hs, "x-req-scheme").?);
+                try testing.expectEqualStrings("cdn.example.org:443", findHeaderValue(hs, "x-req-auth").?);
+                try testing.expectEqualStrings("2", findHeaderValue(hs, "x-accept-count").?);
+            } else if (f.header.ftype == .data and f.header.sid == 1) {
+                try body_acc.appendSlice(testing.allocator, f.payload);
+                if (f.header.flags & flag_end_stream != 0) break;
+            }
+        }
+        try testing.expectEqual(@as(usize, 20_004), body_acc.items.len);
+        try testing.expectEqual(@as(u8, 'a'), body_acc.items[0]);
+        try testing.expectEqual(@as(u8, 'b'), body_acc.items[10_000]);
+        try testing.expectEqualStrings("tail", body_acc.items[20_000..20_004]);
+    }
+}
+
+test "Phase 4 server: max_global_streams cap across connections, max_decoder_table_size, and active keepalive PING" {
+    // 1. `max_global_streams = 2` enforces global limit across two separate connections
+    // and `max_decoder_table_size = 0` advertises `SETTINGS_HEADER_TABLE_SIZE = 0`.
+    {
+        const HoldGate = struct {
+            var active_in_handler = std.atomic.Value(u32).init(0);
+            var release = std.atomic.Value(bool).init(false);
+            fn handle(ctx: *types.Context) anyerror!void {
+                if (std.mem.eql(u8, ctx.req.path(), "/hold")) {
+                    _ = active_in_handler.fetchAdd(1, .acq_rel);
+                    while (!release.load(.acquire)) {
+                        Io.sleep(testing.io, .{ .nanoseconds = 2 * std.time.ns_per_ms }, .awake) catch {};
+                    }
+                }
+                try ctx.res.send(200, "text/plain", "ok");
+            }
+        };
+        HoldGate.active_in_handler.store(0, .release);
+        HoldGate.release.store(false, .release);
+
+        const fds_a = try newSocketPair();
+        errdefer _ = c.close(fds_a[1]);
+        const fds_b = try newSocketPair();
+        errdefer _ = c.close(fds_b[1]);
+
+        var srv: Server = .{
+            .io = testing.io,
+            .gpa = testing.allocator,
+            .handler = HoldGate.handle,
+            .config = .{
+                .max_global_streams = 2,
+                .max_decoder_table_size = 0,
+            },
+        };
+        const th_a = try std.Thread.spawn(.{}, serveRawH2OnFd, .{ &srv, fds_a[0] });
+        const th_b = try std.Thread.spawn(.{}, serveRawH2OnFd, .{ &srv, fds_b[0] });
+        defer {
+            HoldGate.release.store(true, .release);
+            _ = c.close(fds_a[1]);
+            _ = c.close(fds_b[1]);
+            th_a.join();
+            th_b.join();
+        }
+
+        var rbuf_a: [4096]u8 = undefined;
+        var wbuf_a: [4096]u8 = undefined;
+        var ra = peerStream(fds_a[1]).reader(testing.io, &rbuf_a);
+        var wa = peerStream(fds_a[1]).writer(testing.io, &wbuf_a);
+
+        try wa.interface.writeAll(preface);
+        try wa.interface.flush();
+        var sa = try readFrameOfType(testing.allocator, &ra.interface, .settings);
+        var saw_hts_zero = false;
+        var si: usize = 0;
+        while (si + 6 <= sa.payload.len) : (si += 6) {
+            const id = std.mem.readInt(u16, sa.payload[si..][0..2], .big);
+            const val = std.mem.readInt(u32, sa.payload[si + 2 ..][0..4], .big);
+            if (id == set_header_table_size and val == 0) saw_hts_zero = true;
+        }
+        sa.deinit(testing.allocator);
+        try testing.expect(saw_hts_zero);
+        try writeFrame(&wa.interface, .settings, 0, 0, "");
+        try writeFrame(&wa.interface, .settings, flag_ack, 0, "");
+
+        var rbuf_b: [4096]u8 = undefined;
+        var wbuf_b: [4096]u8 = undefined;
+        var rb = peerStream(fds_b[1]).reader(testing.io, &rbuf_b);
+        var wb = peerStream(fds_b[1]).writer(testing.io, &wbuf_b);
+        try rawHandshake(&rb.interface, &wb.interface);
+
+        var hbuf: std.ArrayList(u8) = .empty;
+        defer hbuf.deinit(testing.allocator);
+        try hpack.Encoder.encodeRequest(testing.allocator, &hbuf, "GET", "https", "/hold", "a.test", &.{});
+        try writeFrame(&wa.interface, .headers, flag_end_headers | flag_end_stream, 1, hbuf.items);
+        try writeFrame(&wa.interface, .headers, flag_end_headers | flag_end_stream, 3, hbuf.items);
+        while (HoldGate.active_in_handler.load(.acquire) < 2) {
+            Io.sleep(testing.io, .{ .nanoseconds = 1 * std.time.ns_per_ms }, .awake) catch {};
+        }
+        try testing.expectEqual(@as(u32, 2), srv.activeStreams());
+
+        // Connection B attempts to open sid=1 while global cap (2) is full -> REFUSED_STREAM!
+        hbuf.clearRetainingCapacity();
+        try hpack.Encoder.encodeRequest(testing.allocator, &hbuf, "GET", "https", "/fast", "b.test", &.{});
+        try writeFrame(&wb.interface, .headers, flag_end_headers | flag_end_stream, 1, hbuf.items);
+        var rst = try readFrameOfType(testing.allocator, &rb.interface, .rst_stream);
+        try testing.expectEqual(@as(u31, 1), rst.header.sid);
+        try testing.expectEqual(@backingInt(ErrorCode.refused_stream), std.mem.readInt(u32, rst.payload[0..4], .big));
+        rst.deinit(testing.allocator);
+
+        // Release connection A's 2 streams; connection B can now open sid=3 cleanly!
+        HoldGate.release.store(true, .release);
+        var done_a: usize = 0;
+        while (done_a < 2) {
+            var f = try readFrameAlloc(testing.allocator, &ra.interface);
+            if ((f.header.sid == 1 or f.header.sid == 3) and (f.header.flags & flag_end_stream != 0)) done_a += 1;
+            f.deinit(testing.allocator);
+        }
+        while (srv.activeStreams() != 0) {
+            Io.sleep(testing.io, .{ .nanoseconds = 1 * std.time.ns_per_ms }, .awake) catch {};
+        }
+
+        try writeFrame(&wb.interface, .headers, flag_end_headers | flag_end_stream, 3, hbuf.items);
+        while (true) {
+            var f = try readFrameAlloc(testing.allocator, &rb.interface);
+            const es = f.header.sid == 3 and (f.header.flags & flag_end_stream != 0);
+            f.deinit(testing.allocator);
+            if (es) break;
+        }
+    }
+
+    // 2. Server active keepalive PING (`keepalive_time_ms = 40, keepalive_timeout_ms = 40, idle_timeout_ms = 0`):
+    //    emits PING when idle, stays open when ACKed, and closes dead silent peers promptly.
+    {
+        const fds = try newSocketPair();
+        errdefer _ = c.close(fds[1]);
+        var srv: Server = .{
+            .io = testing.io,
+            .gpa = testing.allocator,
+            .handler = h2TestHandler,
+            .config = .{
+                .idle_timeout_ms = 0,
+                .keepalive_time_ms = 40,
+                .keepalive_timeout_ms = 40,
+            },
+        };
+        const th = try std.Thread.spawn(.{}, serveRawH2OnFd, .{ &srv, fds[0] });
+        defer _ = c.close(fds[1]);
+
+        var rbuf: [4096]u8 = undefined;
+        var wbuf: [4096]u8 = undefined;
+        var reader = peerStream(fds[1]).reader(testing.io, &rbuf);
+        var writer = peerStream(fds[1]).writer(testing.io, &wbuf);
+        try rawHandshake(&reader.interface, &writer.interface);
+
+        // Wait for the server's active keepalive PING and ACK it -> connection stays healthy!
+        var ping1 = try readFrameOfType(testing.allocator, &reader.interface, .ping);
+        try testing.expectEqual(@as(u8, 0), ping1.header.flags & flag_ack);
+        try writeFrame(&writer.interface, .ping, flag_ack, 0, ping1.payload);
+        ping1.deinit(testing.allocator);
+
+        // Next keepalive PING arrives: do NOT reply -> server closes dead connection within ~80ms!
+        const t0 = Io.Timestamp.now(testing.io, .awake).nanoseconds;
+        var ping2 = try readFrameOfType(testing.allocator, &reader.interface, .ping);
+        ping2.deinit(testing.allocator);
+        th.join();
+        const elapsed_ms = @divFloor(Io.Timestamp.now(testing.io, .awake).nanoseconds - t0, std.time.ns_per_ms);
+        try testing.expect(elapsed_ms < 1_000);
     }
 }

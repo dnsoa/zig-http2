@@ -16,6 +16,7 @@
 
 const std = @import("std");
 const types = @import("types.zig");
+const proto = @import("proto.zig");
 const hp = @import("hpack_codec.zig");
 
 pub const Header = types.Header;
@@ -57,6 +58,9 @@ pub const Error = error{
     /// Decoded header list exceeded `Decoder.max_list_size` — an HPACK
     /// decompression bomb (RFC 7540 §6.5.2 SETTINGS_MAX_HEADER_LIST_SIZE).
     HeaderListTooLarge,
+    /// Outbound header name or value violated RFC 9113 / RFC 9110 syntax
+    /// (e.g. CRLF, NUL, leading/trailing whitespace, or injected `:pseudo`).
+    InvalidHeader,
     /// From the codec's integer coder; unreachable in practice (our buffers are
     /// sized for 64-bit values) but part of its return type, so we admit it.
     BufferTooSmall,
@@ -372,6 +376,14 @@ pub const EncoderContext = struct {
         headers: []const Header,
         auto_content_length: ?u64,
     ) Error!void {
+        // Pre-validate all application headers BEFORE mutating `self.dyn` or
+        // flushing pending table-size updates so an invalid header never
+        // desynchronizes the connection's HPACK state.
+        for (headers) |h| {
+            if (!proto.isValidOutboundHeaderName(h.name) or !proto.isValidFieldValue(h.value)) {
+                return Error.InvalidHeader;
+            }
+        }
         try self.flushPendingTableSizeUpdates(gpa, out);
 
         var sbuf: [5]u8 = undefined;
@@ -419,6 +431,17 @@ pub const EncoderContext = struct {
         protocol: ?[]const u8,
         headers: []const Header,
     ) Error!void {
+        if (!proto.isValidToken(method) or !proto.isValidFieldValue(scheme) or
+            !proto.isValidFieldValue(path) or !proto.isValidFieldValue(authority))
+        {
+            return Error.InvalidHeader;
+        }
+        if (protocol) |pr| if (!proto.isValidToken(pr)) return Error.InvalidHeader;
+        for (headers) |h| {
+            if (!proto.isValidOutboundHeaderName(h.name) or !proto.isValidFieldValue(h.value)) {
+                return Error.InvalidHeader;
+            }
+        }
         try self.flushPendingTableSizeUpdates(gpa, out);
 
         try self.emitFieldLower(gpa, out, ":method", method);
@@ -445,6 +468,11 @@ pub const EncoderContext = struct {
         out: *std.ArrayList(u8),
         headers: []const Header,
     ) Error!void {
+        for (headers) |h| {
+            if (!proto.isValidOutboundHeaderName(h.name) or !proto.isValidFieldValue(h.value)) {
+                return Error.InvalidHeader;
+            }
+        }
         try self.flushPendingTableSizeUpdates(gpa, out);
         for (headers) |h| {
             try self.emitField(gpa, out, h.name, h.value);

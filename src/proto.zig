@@ -59,6 +59,10 @@ pub const default_window: i64 = 65535;
 /// Inbound `WINDOW_UPDATE` increments smaller than this threshold are counted
 /// against `FloodGuard` to mitigate 1-byte silly-window amplification attacks.
 pub const small_window_update_threshold: i64 = 1024;
+/// Default capacity ceiling retained in `RxRing` once fully drained (`len == 0`);
+/// larger transient burst buffers are freed back to `gpa` so idle long-lived
+/// streams (e.g. WebSocket over H2) do not pin megabytes of empty memory.
+pub const rx_ring_retain_cap: usize = 16 * 1024;
 
 /// Clamps a configured connection-level receive window to the RFC 9113 range
 /// `[65535, 2^31-1]` (a connection window starts at 65535 and can only grow).
@@ -180,6 +184,18 @@ pub const RxRing = struct {
         }
         return n;
     }
+
+    /// Reads up to `dst.len` bytes and, if the ring becomes completely empty
+    /// (`len == 0`) with a backing capacity above `retain_cap`, releases `buf`
+    /// back to `gpa` so transient bursts do not stay pinned on idle streams.
+    pub fn readWithShrink(self: *RxRing, dst: []u8, gpa: std.mem.Allocator, retain_cap: usize) usize {
+        const n = self.read(dst);
+        if (self.len == 0 and self.buf.len > retain_cap) {
+            gpa.free(self.buf);
+            self.buf = &.{};
+        }
+        return n;
+    }
 };
 
 pub const ParsedHeader = struct { length: u32, ftype: FrameType, flags: u8, sid: u31 };
@@ -264,6 +280,18 @@ pub fn isValidFieldName(name: []const u8) bool {
     if (name.len == 0) return false;
     for (name) |ch| {
         if (std.ascii.isUpper(ch) or !isTokenChar(ch)) return false;
+    }
+    return true;
+}
+
+/// Validates an application-supplied outbound header field name before HPACK
+/// encoding: must be a non-empty `tchar` sequence (uppercase ASCII is permitted
+/// since our encoders fold names to lowercase; rejects `:pseudo`, whitespace,
+/// delimiters, and CTLs).
+pub fn isValidOutboundHeaderName(name: []const u8) bool {
+    if (name.len == 0) return false;
+    for (name) |ch| {
+        if (!isTokenChar(ch)) return false;
     }
     return true;
 }
@@ -742,4 +770,28 @@ test "RFC 9218 Priority parser, formatter, PRIORITY_UPDATE validator, and Slidin
     try testing.expect(sw.record(t0, 3, 1_000)); // 4th in 1s exceeds limit=3
     const t_after: i96 = t0 + 2 * std.time.ns_per_s;
     try testing.expect(!sw.record(t_after, 3, 1_000)); // aged out
+
+    // Outbound header name validator allows mixed-case tchar, rejects pseudo/delims/CTLs.
+    try testing.expect(isValidOutboundHeaderName("X-Cache-Status"));
+    try testing.expect(!isValidOutboundHeaderName(""));
+    try testing.expect(!isValidOutboundHeaderName(":status"));
+    try testing.expect(!isValidOutboundHeaderName("bad\r\nname"));
+
+    // RxRing.readWithShrink retains <= retain_cap and frees oversized burst buffers on empty.
+    var ring: RxRing = .{};
+    defer ring.deinit(testing.allocator);
+    const small_msg = "hello";
+    try ring.appendSlice(testing.allocator, small_msg);
+    var out_small: [16]u8 = undefined;
+    try testing.expectEqual(@as(usize, 5), ring.readWithShrink(&out_small, testing.allocator, rx_ring_retain_cap));
+    try testing.expect(ring.buf.len > 0 and ring.buf.len <= rx_ring_retain_cap);
+
+    const burst: [64 * 1024]u8 = @splat('B');
+    try ring.appendSlice(testing.allocator, &burst);
+    try testing.expect(ring.buf.len >= 64 * 1024);
+    var drain_buf: [32 * 1024]u8 = undefined;
+    try testing.expectEqual(@as(usize, 32 * 1024), ring.readWithShrink(&drain_buf, testing.allocator, rx_ring_retain_cap));
+    try testing.expect(ring.buf.len >= 64 * 1024); // still non-empty -> retained
+    try testing.expectEqual(@as(usize, 32 * 1024), ring.readWithShrink(&drain_buf, testing.allocator, rx_ring_retain_cap));
+    try testing.expectEqual(@as(usize, 0), ring.buf.len); // drained -> shrunk back to 0!
 }

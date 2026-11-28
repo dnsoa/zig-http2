@@ -35,6 +35,8 @@ pub const proto = @import("proto.zig");
 pub const hpack = @import("hpack.zig");
 const server_mod = @import("server.zig");
 const client_mod = @import("client.zig");
+const frame_writer = @import("frame_writer.zig");
+const priority_sched = @import("priority_sched.zig");
 
 // Top-level convenience re-exports.
 pub const Header = types.Header;
@@ -63,6 +65,8 @@ test {
     _ = types;
     _ = proto;
     _ = hpack;
+    _ = frame_writer;
+    _ = priority_sched;
     _ = server_mod;
     _ = client_mod;
 }
@@ -694,4 +698,131 @@ test "Phase 3 end-to-end: 103 Early Hints, bidirectional Trailers, Extended CONN
         }
         try testing.expectEqualStrings("ws-echo:bye-ws", rx[0..n2]);
     }
+}
+
+test "Phase 4 end-to-end: Response corking, scatter-gather writeVec & sendVec, Request pseudo-fields, and graceful Client.startDrain" {
+    const std = @import("std");
+    const testing = std.testing;
+
+    const EdgeApp = struct {
+        fn serve(srv: *Server, fd: std.posix.fd_t) void {
+            defer _ = std.c.close(fd);
+            const s: std.Io.net.Stream = .{ .socket = .{
+                .handle = fd,
+                .address = std.Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable,
+            } };
+            var rbuf: [16384]u8 = undefined;
+            var wbuf: [16384]u8 = undefined;
+            var sr = s.reader(srv.io, &rbuf);
+            var sw = s.writer(srv.io, &wbuf);
+            serveConn(srv, &sr.interface, &sw.interface, "192.0.2.55", "https");
+        }
+
+        fn handle(ctx: *Context) anyerror!void {
+            try ctx.res.setCork(true);
+            ctx.res.status(200);
+            try ctx.res.header("x-scheme-auth", ctx.req.authority);
+            var tag_it = ctx.req.getAll("x-cache-tag");
+            var tags_joined: std.ArrayList(u8) = .empty;
+            while (tag_it.next()) |tv| {
+                if (tags_joined.items.len > 0) try tags_joined.append(ctx.arena, ',');
+                try tags_joined.appendSlice(ctx.arena, tv);
+            }
+            try ctx.res.header("x-tags", tags_joined.items);
+
+            var req_body: std.ArrayList(u8) = .empty;
+            if (ctx.body_reader) |br| {
+                var tmp: [256]u8 = undefined;
+                while (true) {
+                    const n = try br.read(&tmp);
+                    if (n == 0) break;
+                    try req_body.appendSlice(ctx.arena, tmp[0..n]);
+                }
+            }
+            const vecs = [_][]const u8{ ctx.req.scheme, "://", ctx.req.authority, ctx.req.path(), "|", req_body.items };
+            try ctx.res.writeVec(&vecs);
+            try ctx.res.finish();
+        }
+    };
+
+    var fds: [2]c_int = undefined;
+    if (std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds) != 0) return error.SocketPairFailed;
+    errdefer _ = std.c.close(fds[1]);
+
+    var srv: Server = .{
+        .io = testing.io,
+        .gpa = testing.allocator,
+        .handler = EdgeApp.handle,
+        .config = .{
+            .max_global_streams = 64,
+            .keepalive_time_ms = 5_000,
+            .keepalive_timeout_ms = 2_000,
+        },
+    };
+    const th = try std.Thread.spawn(.{}, EdgeApp.serve, .{ &srv, fds[0] });
+    defer th.join();
+    defer _ = std.c.close(fds[1]);
+
+    const peer: std.Io.net.Stream = .{ .socket = .{
+        .handle = fds[1],
+        .address = std.Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable,
+    } };
+    var rbuf: [16384]u8 = undefined;
+    var wbuf: [16384]u8 = undefined;
+    var sr = peer.reader(testing.io, &rbuf);
+    var sw = peer.writer(testing.io, &wbuf);
+
+    var client: Client = undefined;
+    try client.init(testing.io, testing.allocator, &sr.interface, &sw.interface);
+    defer client.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+
+    // Run 30 streams exercising warm `stream_pool` reuse on Server + single-slab `QueuedHeaders` on Client.
+    for (0..30) |i| {
+        _ = arena_state.reset(.retain_capacity);
+        var pbuf: [32]u8 = undefined;
+        const req_path = std.fmt.bufPrint(&pbuf, "/v4/{d}", .{i}) catch unreachable;
+        const st = try client.openStream(.{
+            .method = "POST",
+            .scheme = "https",
+            .authority = "edge.cdn.example:443",
+            .path = req_path,
+            .headers = &.{
+                .{ .name = "x-cache-tag", .value = "hero" },
+                .{ .name = "x-cache-tag", .value = "v4" },
+            },
+        }, false);
+        defer st.close();
+
+        if (i == 29) {
+            // Drain client connection while final stream is still open!
+            try client.startDrain();
+            try testing.expect(!client.canOpenStream());
+        }
+
+        const req_chunks = [_][]const u8{ "vec-", "payload" };
+        try st.sendVec(&req_chunks, true);
+
+        const ev = try st.readEvent(arena_state.allocator());
+        try testing.expect(ev == .headers);
+        var saw_tags = false;
+        for (ev.headers.headers) |h| {
+            if (std.mem.eql(u8, h.name, "x-tags") and std.mem.eql(u8, h.value, "hero,v4")) saw_tags = true;
+        }
+        try testing.expect(saw_tags);
+
+        var out: [128]u8 = undefined;
+        var out_n: usize = 0;
+        while (true) {
+            const n = try st.readBody(out[out_n..]);
+            if (n == 0) break;
+            out_n += n;
+        }
+        var exp_buf: [128]u8 = undefined;
+        const exp = std.fmt.bufPrint(&exp_buf, "https://edge.cdn.example:443{s}|vec-payload", .{req_path}) catch unreachable;
+        try testing.expectEqualStrings(exp, out[0..out_n]);
+    }
+    try testing.expectError(error.GoingAway, client.openStream(.{ .path = "/after-drain" }, true));
 }
