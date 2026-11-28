@@ -33,6 +33,12 @@ pub const RequestHead = struct {
     scheme: []const u8 = "https",
     path: []const u8,
     authority: []const u8 = "",
+    /// Optional RFC 8441 Extended `CONNECT` `:protocol` pseudo-header
+    /// (e.g. `"websocket"`). Requires `method = "CONNECT"` and peer support.
+    protocol: ?[]const u8 = null,
+    /// Optional RFC 9218 `Priority` header parameters (`u=0..7`, `i`).
+    /// Ignored when `headers` already carries an explicit `priority` field.
+    priority: ?p2.StreamPriority = null,
     headers: []const Header = &.{},
 };
 
@@ -100,6 +106,20 @@ pub const Config = struct {
     /// capping per-connection memory even if the server advertises a massive
     /// `SETTINGS_HEADER_TABLE_SIZE`. Set to 0 to disable dynamic-table encoding.
     max_encoder_table_size: u32 = p2.our_header_table_size,
+    /// `SETTINGS_MAX_HEADER_LIST_SIZE` advertised and enforced inbound on
+    /// decoded response/trailer header lists. Set to `0` to disable the cap
+    /// and omit `SETTINGS_MAX_HEADER_LIST_SIZE`.
+    max_header_list_size: u32 = @intCast(hpack.default_max_header_list_size),
+    /// Max non-ACK `PING`, post-preface non-ACK `SETTINGS`, `PRIORITY`,
+    /// `PRIORITY_UPDATE`, and tiny (`< 1024 B`) `WINDOW_UPDATE` frames allowed
+    /// from the origin within `control_frame_window_ms` before tearing down
+    /// with `GOAWAY(ENHANCE_YOUR_CALM)`. `0` disables.
+    max_control_frames_per_window: u32 = 500,
+    /// Sliding window duration (ms) for `max_control_frames_per_window` (`0` = lifetime cap).
+    control_frame_window_ms: u64 = 10_000,
+    /// Max consecutive empty non-`END_STREAM` `DATA` frames allowed from the
+    /// origin before tearing down with `GOAWAY(ENHANCE_YOUR_CALM)`. `0` disables.
+    max_empty_data_frames: u32 = 32,
 };
 
 const ClientConfig = Config;
@@ -166,6 +186,7 @@ pub const Stream = struct {
     local_closed: std.atomic.Value(bool) = .init(false),
 
     is_head_request: bool = false,
+    is_connect_request: bool = false,
     resp_phase: RespPhase = .expect_headers,
     resp_content_length: ?u64 = null,
     rx_body_bytes: u64 = 0,
@@ -270,6 +291,36 @@ pub const Stream = struct {
         if (end_stream) {
             c.noteEnd(self, true, false); // local half-closed
         }
+    }
+
+    /// Terminates the request body with trailing `HEADERS(END_STREAM)` (HTTP/2
+    /// request trailers, RFC 9113 §8.1). Rejects pseudo-headers, connection-specific
+    /// headers, and `te`.
+    pub fn sendTrailers(self: *Stream, trailers: []const Header) !void {
+        const c = self.client;
+        if (!c.tryBeginOp()) return error.ConnectionClosed;
+        defer c.endOp();
+        if (self.local_closed.load(.acquire)) return error.StreamClosed;
+        for (trailers) |h| {
+            if (h.name.len == 0 or h.name[0] == ':') return error.InvalidTrailer;
+            for (h.name) |ch| {
+                if (!p2.isTokenChar(ch)) return error.InvalidTrailer;
+            }
+            if (!p2.isValidFieldValue(h.value) or
+                p2.isConnectionSpecificHeader(h.name) or
+                std.ascii.eqlIgnoreCase(h.name, "te"))
+            {
+                return error.InvalidTrailer;
+            }
+        }
+        try c.writeTrailersForStream(self, trailers);
+        c.noteEnd(self, true, false);
+    }
+
+    /// Emits an RFC 9218 `PRIORITY_UPDATE` frame on stream `0` dynamically
+    /// updating this stream's urgency (`0..7`) and `incremental` flag.
+    pub fn setPriority(self: *Stream, prio: p2.StreamPriority) !void {
+        return self.client.sendPriorityUpdate(self.id, prio);
     }
 
     /// Reads the next event on this stream, blocking until one is available.
@@ -593,6 +644,10 @@ pub const Client = struct {
     peer_initial_window: std.atomic.Value(u32) = .init(@intCast(p2.default_window)),
     /// Peer's most recent SETTINGS_HEADER_TABLE_SIZE (reader-thread-only).
     peer_header_table_size: u32 = p2.our_header_table_size,
+    /// True once the peer has advertised `SETTINGS_ENABLE_CONNECT_PROTOCOL = 1` (RFC 8441).
+    peer_enable_connect_protocol: std.atomic.Value(bool) = .init(false),
+    /// True once the peer has advertised `SETTINGS_NO_RFC7540_PRIORITIES = 1` (RFC 9218).
+    peer_no_rfc7540_priorities: std.atomic.Value(bool) = .init(false),
 
     write_mu: Io.Mutex = .init,
     /// Active outbound write timeout (ms); 0 = unbounded (default for whitebox
@@ -642,11 +697,15 @@ pub const Client = struct {
     op_state: std.atomic.Value(u32) = .init(0),
 
     // Outbound-stream admission (peer SETTINGS_MAX_CONCURRENT_STREAMS). openStream
-    // blocks here until a slot frees. Both fields are guarded by admit_mu.
+    // blocks here until a slot frees. Both fields are guarded by admit_mu; atomic
+    // snapshots mirror them for lock-free origin connection-pool routing.
     admit_mu: Io.Mutex = .init,
     admit_cond: Io.Condition = .init,
     peer_max_streams: u32 = std.math.maxInt(u32), // "unlimited" until advertised
     active_streams: u32 = 0,
+    peer_max_streams_snap: std.atomic.Value(u32) = .init(std.math.maxInt(u32)),
+    active_streams_snap: std.atomic.Value(u32) = .init(0),
+    ids_exhausted: std.atomic.Value(bool) = .init(false),
 
     keepalive_time_ms: std.atomic.Value(u64) = .init(0),
     keepalive_timeout_ms: std.atomic.Value(u64) = .init(0),
@@ -659,6 +718,8 @@ pub const Client = struct {
     reader_group_started: std.atomic.Value(bool) = .init(false),
     /// Reusable inbound frame payload scratch buffer (reader-thread-only, #41).
     rx_scratch: std.ArrayList(u8) = .empty,
+    /// Shared anti-flood guard against hostile/compromised custom origins (reader-thread-only).
+    flood: p2.FloodGuard = .{},
     /// Event-driven wakeup for the keepalive/teardown watcher on `deinit()`,
     /// `kill()`, and `setKeepalive()` without 50 ms polling or live-read cancellation (#40).
     wake_mu: Io.Mutex = .init,
@@ -687,7 +748,7 @@ pub const Client = struct {
         return p2.clampMaxFrameSize(self.cfg.max_frame_size);
     }
 
-    fn initHandshakeThunk(self: *Client, settings: *const [24]u8, cwnd: i64) anyerror!void {
+    fn initHandshakeThunk(self: *Client, settings: []const u8, cwnd: i64) anyerror!void {
         try self.w.writeAll(p2.preface);
         try self.writeFrameLocked(.settings, 0, 0, settings);
         if (cwnd > p2.default_window) {
@@ -703,12 +764,14 @@ pub const Client = struct {
         const cwnd = p2.clampConnWindow(cfg.connection_window_size);
         const iw = p2.clampInitialWindow(cfg.initial_window_size);
         const mfs = p2.clampMaxFrameSize(cfg.max_frame_size);
+        var dec = hpack.Decoder.init(gpa, p2.our_header_table_size);
+        dec.max_list_size = cfg.max_header_list_size;
         self.* = .{
             .io = io,
             .gpa = gpa,
             .r = r,
             .w = w,
-            .dec = hpack.Decoder.init(gpa, p2.our_header_table_size),
+            .dec = dec,
             .enc = hpack.EncoderContext.initWithMaxSize(cfg.max_encoder_table_size),
             .cfg = cfg,
             .write_timeout_ms = cfg.write_timeout_ms,
@@ -721,14 +784,18 @@ pub const Client = struct {
             self.write_mu.lockUncancelable(self.io);
             defer self.write_mu.unlock(self.io);
             // Advertise ENABLE_PUSH=0, MAX_FRAME_SIZE, INITIAL_WINDOW_SIZE,
-            // and MAX_HEADER_LIST_SIZE, plus stream-0 WINDOW_UPDATE if > 65535,
-            // coalesced into a single flush.
+            // and MAX_HEADER_LIST_SIZE (when > 0), plus stream-0 WINDOW_UPDATE
+            // if > 65535, coalesced into a single flush.
             var settings: [24]u8 = undefined;
+            var slen: usize = 18;
             p2.putSetting(settings[0..6], p2.set_enable_push, 0);
             p2.putSetting(settings[6..12], p2.set_max_frame_size, mfs);
             p2.putSetting(settings[12..18], p2.set_initial_window_size, iw);
-            p2.putSetting(settings[18..24], p2.set_max_header_list_size, @intCast(self.dec.max_list_size));
-            p2.runTimed(self.io, self.write_timeout_ms, initHandshakeThunk, .{ self, &settings, cwnd }) catch |err| {
+            if (self.dec.max_list_size > 0) {
+                p2.putSetting(settings[18..24], p2.set_max_header_list_size, @intCast(@min(self.dec.max_list_size, std.math.maxInt(u32))));
+                slen = 24;
+            }
+            p2.runTimed(self.io, self.write_timeout_ms, initHandshakeThunk, .{ self, settings[0..slen], cwnd }) catch |err| {
                 self.write_broken = true;
                 return err;
             };
@@ -778,6 +845,55 @@ pub const Client = struct {
             .last_stream_id = @intCast((s >> 32) & 0x7fff_ffff),
             .code = @truncate(s),
         };
+    }
+
+    /// Lock-free snapshot of currently active outbound streams on this connection.
+    pub fn activeStreams(self: *const Client) u32 {
+        return self.active_streams_snap.load(.acquire);
+    }
+
+    /// Lock-free snapshot of the peer's `SETTINGS_MAX_CONCURRENT_STREAMS` limit.
+    pub fn peerMaxStreams(self: *const Client) u32 {
+        return self.peer_max_streams_snap.load(.acquire);
+    }
+
+    /// Lock-free count of concurrency slots immediately available for `tryOpenStream`.
+    /// Returns `0` once the connection is dead, sealed, draining after `GOAWAY`,
+    /// out of client stream IDs, or at `peerMaxStreams()`.
+    pub fn availableStreams(self: *const Client) u32 {
+        if (self.isSealed() or self.dead.load(.acquire) or self.hasGoaway() or self.ids_exhausted.load(.acquire)) {
+            return 0;
+        }
+        return self.peer_max_streams_snap.load(.acquire) -| self.active_streams_snap.load(.acquire);
+    }
+
+    /// Lock-free health & capacity check for CDN origin connection-pool routers.
+    pub fn canOpenStream(self: *const Client) bool {
+        return self.availableStreams() > 0;
+    }
+
+    /// Returns `true` once the server has advertised `SETTINGS_ENABLE_CONNECT_PROTOCOL = 1` (RFC 8441).
+    pub fn peerSupportsExtendedConnect(self: *const Client) bool {
+        return self.peer_enable_connect_protocol.load(.acquire);
+    }
+
+    /// Returns `true` once the server has advertised `SETTINGS_NO_RFC7540_PRIORITIES = 1` (RFC 9218).
+    pub fn peerDisablesRfc7540Priorities(self: *const Client) bool {
+        return self.peer_no_rfc7540_priorities.load(.acquire);
+    }
+
+    /// Emits an RFC 9218 `PRIORITY_UPDATE` frame on stream `0` for `sid` (`> 0` odd client ID).
+    pub fn sendPriorityUpdate(self: *Client, sid: u31, prio: p2.StreamPriority) !void {
+        if (sid == 0 or sid % 2 == 0) return error.InvalidStreamId;
+        if (!self.tryBeginOp()) return error.ConnectionClosed;
+        defer self.endOp();
+        if (self.dead.load(.acquire)) return error.ConnectionClosed;
+        var payload: [20]u8 = undefined;
+        std.mem.writeInt(u32, payload[0..4], @as(u32, sid), .big);
+        var fbuf: [16]u8 = undefined;
+        const fv = p2.formatPriorityField(prio, &fbuf);
+        @memcpy(payload[4 .. 4 + fv.len], fv);
+        try self.writeFrame(.priority_update, 0, 0, payload[0 .. 4 + fv.len]);
     }
 
     /// Releases the client: stops the reader thread, waits for in-flight
@@ -853,6 +969,7 @@ pub const Client = struct {
         if (!s.admit_released and s.adm_local_end and s.adm_remote_end) {
             s.admit_released = true;
             self.active_streams -= 1;
+            self.active_streams_snap.store(self.active_streams, .release);
             self.admit_cond.broadcast(self.io);
         }
         self.admit_mu.unlock(self.io);
@@ -865,6 +982,7 @@ pub const Client = struct {
         if (!s.admit_released) {
             s.admit_released = true;
             self.active_streams -= 1;
+            self.active_streams_snap.store(self.active_streams, .release);
             self.admit_cond.broadcast(self.io);
         }
         self.admit_mu.unlock(self.io);
@@ -1131,6 +1249,44 @@ pub const Client = struct {
         try self.finishWriteAndUnlock(err_opt, true);
     }
 
+    fn writeStreamTrailersThunk(self: *Client, sid: u31, max: usize, block: []const u8) anyerror!void {
+        try self.drainCtrlToBufferLocked();
+        try self.writeHeaderBlockLocked(sid, true, max, block);
+        try self.drainCtrlToBufferLocked();
+        try self.w.flush();
+    }
+
+    fn writeTrailersForStream(self: *Client, st: *Stream, trailers: []const Header) !void {
+        self.write_mu.lockUncancelable(self.io);
+        if (self.dead.load(.acquire) or self.write_broken) {
+            self.write_mu.unlock(self.io);
+            return error.ConnectionClosed;
+        }
+        self.drainCtrlToBufferLocked() catch |err| {
+            return self.finishWriteAndUnlock(err, true);
+        };
+        if (st.aborted.load(.acquire)) {
+            try self.finishWriteAndUnlock(null, true);
+            return error.StreamReset;
+        }
+        if (st.local_closed.load(.acquire)) {
+            try self.finishWriteAndUnlock(null, true);
+            return error.StreamClosed;
+        }
+        self.hpack_buf.clearRetainingCapacity();
+        self.enc.encodeTrailers(self.gpa, &self.hpack_buf, trailers) catch |err| {
+            self.finishWriteAndUnlock(err, true) catch {};
+            return if (err == error.OutOfMemory) error.OutOfMemory else error.ConnectionClosed;
+        };
+        const max: usize = self.peer_max_frame.load(.acquire);
+        const err_opt: ?anyerror = if (p2.runTimed(self.io, self.write_timeout_ms, writeStreamTrailersThunk, .{ self, st.id, max, self.hpack_buf.items })) |_|
+            null
+        else |e|
+            e;
+        if (err_opt == null) st.local_closed.store(true, .release);
+        try self.finishWriteAndUnlock(err_opt, true);
+    }
+
     /// Returns true if `sid` is in the idle state (never initiated: even push
     /// stream id with ENABLE_PUSH=0, or odd id not yet allocated by openStream).
     fn isIdleStream(self: *Client, sid: u31) bool {
@@ -1173,11 +1329,19 @@ pub const Client = struct {
         // Upper bound on non-indexed HPACK encoding: 20 bytes of integer prefix
         // overhead per field + raw octets + up to 20 bytes for table-size updates.
         var total: usize = 20;
-        total +|= head.method.len +| head.scheme.len +| head.path.len +| head.authority.len +| 80;
+        total +|= head.method.len +| head.scheme.len +| head.path.len +| head.authority.len +| 120;
+        if (head.protocol) |pr| total +|= pr.len +| 20;
         for (head.headers) |h| {
             total +|= h.name.len +| h.value.len +| 20;
         }
         return total;
+    }
+
+    fn hasExplicitHeader(headers: []const Header, name: []const u8) bool {
+        for (headers) |h| {
+            if (std.ascii.eqlIgnoreCase(h.name, name)) return true;
+        }
+        return false;
     }
 
     /// Opens a new stream, sending the request HEADERS. Returns a handle for
@@ -1186,7 +1350,14 @@ pub const Client = struct {
     /// known-body POSTs), prefer `openStreamWithBody` to coalesce HEADERS +
     /// initial DATA (+ END_STREAM) into a single flush.
     pub fn openStream(self: *Client, head: RequestHead, end_stream: bool) !*Stream {
-        return self.openStreamWithBody(head, "", end_stream);
+        return self.openStreamWithBodyImpl(head, "", end_stream, false);
+    }
+
+    /// Non-blocking variant of `openStream` for CDN origin connection pools:
+    /// returns `error.ConcurrencyLimitReached` immediately instead of waiting
+    /// when `activeStreams() >= peerMaxStreams()`.
+    pub fn tryOpenStream(self: *Client, head: RequestHead, end_stream: bool) !*Stream {
+        return self.openStreamWithBodyImpl(head, "", end_stream, true);
     }
 
     /// Opens a new stream and coalesces request HEADERS + initial DATA (+
@@ -1197,9 +1368,38 @@ pub const Client = struct {
     /// `self.hpack_buf` so HPACK dynamic-table mutations strictly match wire order
     /// with zero per-stream `ArenaAllocator` overhead.
     pub fn openStreamWithBody(self: *Client, head: RequestHead, body: []const u8, end_stream: bool) !*Stream {
+        return self.openStreamWithBodyImpl(head, body, end_stream, false);
+    }
+
+    /// Non-blocking variant of `openStreamWithBody`: returns
+    /// `error.ConcurrencyLimitReached` immediately if the peer's concurrency
+    /// cap is full so callers can spill over to another pooled connection.
+    pub fn tryOpenStreamWithBody(self: *Client, head: RequestHead, body: []const u8, end_stream: bool) !*Stream {
+        return self.openStreamWithBodyImpl(head, body, end_stream, true);
+    }
+
+    fn openStreamWithBodyImpl(self: *Client, head: RequestHead, body: []const u8, end_stream: bool, non_blocking: bool) !*Stream {
         if (!self.tryBeginOp()) return error.ConnectionClosed;
         defer self.endOp();
         if (self.dead.load(.acquire)) return error.ConnectionClosed;
+
+        if (head.protocol) |proto_tok| {
+            if (!std.mem.eql(u8, head.method, "CONNECT") or
+                !p2.isValidToken(proto_tok) or
+                !p2.isValidScheme(head.scheme) or
+                head.path.len == 0 or
+                head.authority.len == 0)
+            {
+                return error.InvalidConnectRequest;
+            }
+            if (!self.peerSupportsExtendedConnect()) return error.ExtendedConnectUnsupported;
+        }
+
+        var prio_buf: [16]u8 = undefined;
+        const emit_prio: ?[]const u8 = if (head.priority) |pr|
+            (if (!hasExplicitHeader(head.headers, "priority")) p2.formatPriorityField(pr, &prio_buf) else null)
+        else
+            null;
 
         // Pre-validate huge header sets (`> ~256 KiB` worst case) using stateless
         // encoding BEFORE acquiring slots or mutating `self.enc.dyn`.
@@ -1207,12 +1407,16 @@ pub const Client = struct {
         defer huge_stateless.deinit(self.gpa);
         const use_stateless = estimateMaxEncodedBytes(head) > max_header_block - 64;
         if (use_stateless) {
-            try hpack.Encoder.encodeRequest(self.gpa, &huge_stateless, head.method, head.scheme, head.path, head.authority, head.headers);
+            try hpack.Encoder.encodeRequestEx(self.gpa, &huge_stateless, head.method, head.scheme, head.path, head.authority, head.protocol, head.headers);
+            if (emit_prio) |ps| {
+                try hpack.Encoder.encodeTrailers(self.gpa, &huge_stateless, &.{.{ .name = "priority", .value = ps }});
+            }
             if (huge_stateless.items.len > max_header_block - 20) return error.HeadersTooLarge;
         }
 
         // Admission: block until a concurrency slot is free (peer
-        // MAX_CONCURRENT_STREAMS), or bail if the connection is closing.
+        // MAX_CONCURRENT_STREAMS), return immediately when `non_blocking`,
+        // or bail if the connection is closing.
         self.admit_mu.lockUncancelable(self.io);
         while (true) {
             if (self.dead.load(.acquire)) {
@@ -1224,9 +1428,14 @@ pub const Client = struct {
                 return error.GoingAway;
             }
             if (self.active_streams < self.peer_max_streams) break;
+            if (non_blocking) {
+                self.admit_mu.unlock(self.io);
+                return error.ConcurrencyLimitReached;
+            }
             self.admit_cond.waitUncancelable(self.io, &self.admit_mu);
         }
         self.active_streams += 1;
+        self.active_streams_snap.store(self.active_streams, .release);
         self.admit_mu.unlock(self.io);
 
         self.write_mu.lockUncancelable(self.io);
@@ -1245,6 +1454,7 @@ pub const Client = struct {
 
         const sid = self.next_id;
         const next_sid = std.math.add(u31, sid, 2) catch {
+            self.ids_exhausted.store(true, .release);
             self.write_mu.unlock(self.io);
             self.admitCancel();
             return error.StreamIdsExhausted;
@@ -1262,6 +1472,7 @@ pub const Client = struct {
             .recv_window = p2.clampInitialWindow(self.cfg.initial_window_size),
             .local_closed = .init(false),
             .is_head_request = std.mem.eql(u8, head.method, "HEAD"),
+            .is_connect_request = std.mem.eql(u8, head.method, "CONNECT"),
         };
         const max: usize = self.peer_max_frame.load(.acquire);
         const batch_cap: usize = @max(max_write_batch, max);
@@ -1289,6 +1500,10 @@ pub const Client = struct {
             return error.OutOfMemory;
         };
         self.next_id = next_sid;
+        if (next_sid == std.math.maxInt(u31)) {
+            // `next_sid` (`0x7fff_ffff`) is the final valid odd stream ID; once it
+            // is allocated on the next open, `ids_exhausted` will flip.
+        }
         {
             self.send_mu.lockUncancelable(self.io);
             defer self.send_mu.unlock(self.io);
@@ -1322,7 +1537,13 @@ pub const Client = struct {
                 self.enc.pending_target_size = null;
             }
             break :blk @as(anyerror!void, self.hpack_buf.appendSlice(self.gpa, huge_stateless.items));
-        } else self.enc.encodeRequest(self.gpa, &self.hpack_buf, head.method, head.scheme, head.path, head.authority, head.headers);
+        } else blk: {
+            self.enc.encodeRequestEx(self.gpa, &self.hpack_buf, head.method, head.scheme, head.path, head.authority, head.protocol, head.headers) catch |e| break :blk @as(anyerror!void, e);
+            if (emit_prio) |ps| {
+                self.enc.encodeTrailers(self.gpa, &self.hpack_buf, &.{.{ .name = "priority", .value = ps }}) catch |e| break :blk @as(anyerror!void, e);
+            }
+            break :blk @as(anyerror!void, {});
+        };
 
         if (enc_res) |_| {} else |enc_err| {
             self.finishWriteAndUnlock(enc_err, true) catch {};
@@ -1367,6 +1588,7 @@ pub const Client = struct {
     fn admitCancel(self: *Client) void {
         self.admit_mu.lockUncancelable(self.io);
         self.active_streams -= 1;
+        self.active_streams_snap.store(self.active_streams, .release);
         self.admit_cond.broadcast(self.io);
         self.admit_mu.unlock(self.io);
     }
@@ -1447,6 +1669,7 @@ pub const Client = struct {
             }
             // RFC 9113 §3.4: the server connection preface MUST be a non-ACK
             // SETTINGS frame as the first frame sent on the connection.
+            const is_initial_settings = !peer_settings_seen;
             if (!peer_settings_seen) {
                 if (fh.ftype != .settings or (fh.flags & p2.flag_ack != 0)) {
                     self.sendGoaway(.protocol_error);
@@ -1455,7 +1678,7 @@ pub const Client = struct {
                 }
                 peer_settings_seen = true;
             }
-            self.handle(fh, payload) catch {
+            self.handleEx(fh, payload, is_initial_settings) catch {
                 self.kill();
                 return;
             };
@@ -1506,13 +1729,42 @@ pub const Client = struct {
         self.wakeAllStreamsAndSenders();
     }
 
+    fn recordControlFlood(self: *Client) bool {
+        const now_ns = Io.Timestamp.now(self.io, .awake).nanoseconds;
+        return self.flood.recordControl(now_ns, self.cfg.max_control_frames_per_window, self.cfg.control_frame_window_ms);
+    }
+
+    fn recordEmptyDataFlood(self: *Client) bool {
+        const now_ns = Io.Timestamp.now(self.io, .awake).nanoseconds;
+        return self.flood.recordEmptyData(
+            now_ns,
+            self.cfg.max_empty_data_frames,
+            self.cfg.max_control_frames_per_window,
+            self.cfg.control_frame_window_ms,
+        );
+    }
+
     fn handle(self: *Client, fh: p2.ParsedHeader, payload: []const u8) !void {
+        return self.handleEx(fh, payload, false);
+    }
+
+    fn handleEx(self: *Client, fh: p2.ParsedHeader, payload: []const u8, is_initial_settings: bool) !void {
         switch (fh.ftype) {
             .settings => if (fh.flags & p2.flag_ack == 0) {
+                if (!is_initial_settings and self.recordControlFlood()) {
+                    self.sendGoaway(.enhance_your_calm);
+                    return error.ProtocolError;
+                }
                 const hts_update = try self.applyPeerSettings(payload);
                 try self.ackPeerSettings(hts_update);
             },
-            .ping => if (fh.flags & p2.flag_ack == 0) try self.writeFrame(.ping, p2.flag_ack, 0, payload),
+            .ping => if (fh.flags & p2.flag_ack == 0) {
+                if (self.recordControlFlood()) {
+                    self.sendGoaway(.enhance_your_calm);
+                    return error.ProtocolError;
+                }
+                try self.writeFrame(.ping, p2.flag_ack, 0, payload);
+            },
             .window_update => try self.handleWindowUpdate(fh.sid, payload),
             .goaway => {
                 if (payload.len < 8) {
@@ -1596,8 +1848,14 @@ pub const Client = struct {
                     break :blk cont_block.items;
                 };
                 const hs = self.dec.decode(self.gpa, hdr_block) catch |err| {
-                    // RFC 9113 §4.3: HPACK decode failure is a connection COMPRESSION_ERROR.
-                    self.sendGoaway(if (err == error.OutOfMemory) .internal_error else .compression_error);
+                    // RFC 9113 §4.3: HPACK decode failure is connection-fatal; map
+                    // `HeaderListTooLarge` to `ENHANCE_YOUR_CALM`.
+                    const code: p2.ErrorCode = switch (err) {
+                        error.OutOfMemory => .internal_error,
+                        error.HeaderListTooLarge => .enhance_your_calm,
+                        else => .compression_error,
+                    };
+                    self.sendGoaway(code);
                     return err;
                 };
                 try self.deliver(fh.sid, true, hs, &[_]u8{}, fh.flags & p2.flag_end_stream != 0, 0);
@@ -1627,7 +1885,16 @@ pub const Client = struct {
                         return error.FlowControlError;
                     }
                 }
-                try self.deliver(fh.sid, false, &[_]hpack.Header{}, body, fh.flags & p2.flag_end_stream != 0, fc_cost);
+                const end_stream = fh.flags & p2.flag_end_stream != 0;
+                try self.deliver(fh.sid, false, &[_]hpack.Header{}, body, end_stream, fc_cost);
+                if (body.len == 0 and !end_stream) {
+                    if (self.recordEmptyDataFlood()) {
+                        self.sendGoaway(.enhance_your_calm);
+                        return error.ProtocolError;
+                    }
+                } else {
+                    self.flood.resetEmptyData();
+                }
             },
             .push_promise => {
                 // We advertised ENABLE_PUSH=0, so a push is a protocol
@@ -1647,7 +1914,13 @@ pub const Client = struct {
                 self.kill();
                 return error.ProtocolError;
             },
-            else => {}, // priority
+            .priority, .priority_update => {
+                if (self.recordControlFlood()) {
+                    self.sendGoaway(.enhance_your_calm);
+                    return error.ProtocolError;
+                }
+            },
+            else => {},
         }
     }
 
@@ -1982,6 +2255,12 @@ pub const Client = struct {
             self.writeFrame(.rst_stream, 0, sid, &p) catch {};
             return;
         }
+        if (incr < p2.small_window_update_threshold) {
+            if (self.recordControlFlood()) {
+                self.sendGoaway(.enhance_your_calm);
+                return error.ProtocolError;
+            }
+        }
         var conn_overflow = false;
         var overflow_sid: ?u31 = null;
         {
@@ -2073,6 +2352,7 @@ pub const Client = struct {
                 p2.set_max_concurrent_streams => {
                     self.admit_mu.lockUncancelable(self.io);
                     self.peer_max_streams = val;
+                    self.peer_max_streams_snap.store(val, .release);
                     self.admit_cond.broadcast(self.io); // a raised limit wakes waiters
                     self.admit_mu.unlock(self.io);
                 },
@@ -2083,6 +2363,22 @@ pub const Client = struct {
                         self.sendGoaway(.protocol_error);
                         return error.ProtocolError;
                     }
+                },
+                p2.set_enable_connect_protocol => {
+                    // RFC 8441 §3: must be 0 or 1, and MUST NOT transition from 1 back to 0.
+                    if (val > 1 or (val == 0 and self.peer_enable_connect_protocol.load(.acquire))) {
+                        self.sendGoaway(.protocol_error);
+                        return error.ProtocolError;
+                    }
+                    self.peer_enable_connect_protocol.store(val == 1, .release);
+                },
+                p2.set_no_rfc7540_priorities => {
+                    // RFC 9218 §5.1: must be 0 or 1, and MUST NOT transition from 1 back to 0.
+                    if (val > 1 or (val == 0 and self.peer_no_rfc7540_priorities.load(.acquire))) {
+                        self.sendGoaway(.protocol_error);
+                        return error.ProtocolError;
+                    }
+                    self.peer_no_rfc7540_priorities.store(val == 1, .release);
                 },
                 else => {},
             }
@@ -2408,9 +2704,13 @@ fn validateStreamHeaders(s: *Stream, hs: []const Header, end_stream: bool) bool 
                 if (end_stream) return false; // 1xx informational cannot end the stream
                 return true;
             }
-            // RFC 9113 §8.1.1: 204, 304, and responses to HEAD MAY carry a
+            // RFC 9113 §8.1.1 / RFC 9110 §8.6: 2xx responses to `CONNECT` MUST NOT
+            // carry `Content-Length`; 204, 304, and responses to HEAD MAY carry a
             // non-zero content-length header even though no DATA payload follows.
-            if (s.is_head_request or status == 204 or status == 304) {
+            if (s.is_connect_request and status >= 200 and status < 300) {
+                if (cl != null) return false;
+                s.resp_content_length = null;
+            } else if (s.is_head_request or status == 204 or status == 304) {
                 s.resp_content_length = 0;
             } else {
                 if (end_stream and cl != null and cl.? != 0) return false;
@@ -7116,4 +7416,190 @@ test "client lock-free op_state drains concurrent operations cleanly on deinit" 
     t1.join();
     t2.join();
     try testing.expect(client.isSealed());
+}
+
+test "client FloodGuard cuts off hostile origin floods and tryOpenStream enables non-blocking pool spillover" {
+    const io = testing.io;
+    // 1. Origin PING / 1-byte WINDOW_UPDATE / empty DATA flood triggers GOAWAY(ENHANCE_YOUR_CALM).
+    {
+        const addr = try net.IpAddress.parse("127.0.0.1", 0);
+        var srv = try addr.listen(io, .{ .mode = .stream, .reuse_address = true });
+        defer srv.deinit(io);
+        const port = srv.socket.address.ip4.port;
+        const caddr = try net.IpAddress.parse("127.0.0.1", port);
+        const cstream = try caddr.connect(io, .{ .mode = .stream });
+        defer cstream.close(io);
+        var accepted = try srv.accept(io);
+        defer accepted.close(io);
+
+        var crbuf: [4096]u8 = undefined;
+        var cwbuf: [4096]u8 = undefined;
+        var csr = cstream.reader(io, &crbuf);
+        var csw = cstream.writer(io, &cwbuf);
+        var client: Client = undefined;
+        try client.initWithConfig(io, testing.allocator, &csr.interface, &csw.interface, .{
+            .max_control_frames_per_window = 5,
+            .control_frame_window_ms = 10_000,
+            .max_header_list_size = 512,
+        });
+        defer client.deinit();
+
+        var arbuf: [4096]u8 = undefined;
+        var awbuf: [4096]u8 = undefined;
+        var asr = accepted.reader(io, &arbuf);
+        var asw = accepted.writer(io, &awbuf);
+        try ctHandshake(&asr.interface, &asw.interface);
+
+        // Send 6 tiny (1-byte) WINDOW_UPDATE(0) frames -> 6th trips GOAWAY(ENHANCE_YOUR_CALM).
+        var wu1: [4]u8 = undefined;
+        std.mem.writeInt(u32, &wu1, 1, .big);
+        for (0..6) |_| ctWrite(&asw.interface, .window_update, 0, 0, &wu1) catch break;
+
+        while (true) {
+            var f = try ctRead(testing.allocator, &asr.interface);
+            defer f.deinit(testing.allocator);
+            if (f.hdr.ftype == .goaway) {
+                const code = std.mem.readInt(u32, f.payload[4..8], .big);
+                try testing.expectEqual(@backingInt(p2.ErrorCode.enhance_your_calm), code);
+                break;
+            }
+        }
+    }
+
+    // 2. Non-blocking `tryOpenStream`, lock-free pool capacity introspection, and
+    // RFC 8441 `SETTINGS_ENABLE_CONNECT_PROTOCOL` downgrade rejection (1 -> 0).
+    {
+        const addr = try net.IpAddress.parse("127.0.0.1", 0);
+        var srv = try addr.listen(io, .{ .mode = .stream, .reuse_address = true });
+        defer srv.deinit(io);
+        const port = srv.socket.address.ip4.port;
+        const caddr = try net.IpAddress.parse("127.0.0.1", port);
+        const cstream = try caddr.connect(io, .{ .mode = .stream });
+        defer cstream.close(io);
+        var accepted = try srv.accept(io);
+        defer accepted.close(io);
+
+        var crbuf: [4096]u8 = undefined;
+        var cwbuf: [4096]u8 = undefined;
+        var csr = cstream.reader(io, &crbuf);
+        var csw = cstream.writer(io, &cwbuf);
+        var client: Client = undefined;
+        try client.init(io, testing.allocator, &csr.interface, &csw.interface);
+        defer client.deinit();
+
+        var arbuf: [4096]u8 = undefined;
+        var awbuf: [4096]u8 = undefined;
+        var asr = accepted.reader(io, &arbuf);
+        var asw = accepted.writer(io, &awbuf);
+
+        var pf: [p2.preface.len]u8 = undefined;
+        try asr.interface.readSliceAll(&pf);
+        var cs = try ctRead(testing.allocator, &asr.interface);
+        cs.deinit(testing.allocator);
+
+        // Server advertises MAX_CONCURRENT_STREAMS=2, ENABLE_CONNECT_PROTOCOL=1, NO_RFC7540_PRIORITIES=1.
+        var srv_st: [18]u8 = undefined;
+        p2.putSetting(srv_st[0..6], p2.set_max_concurrent_streams, 2);
+        p2.putSetting(srv_st[6..12], p2.set_enable_connect_protocol, 1);
+        p2.putSetting(srv_st[12..18], p2.set_no_rfc7540_priorities, 1);
+        try ctWrite(&asw.interface, .settings, 0, 0, &srv_st);
+        try ctWrite(&asw.interface, .settings, p2.flag_ack, 0, "");
+
+        while (true) {
+            var f = try ctRead(testing.allocator, &asr.interface);
+            const ack = f.hdr.ftype == .settings and (f.hdr.flags & p2.flag_ack != 0);
+            f.deinit(testing.allocator);
+            if (ack) break;
+        }
+
+        try testing.expect(client.peerSupportsExtendedConnect());
+        try testing.expect(client.peerDisablesRfc7540Priorities());
+        try testing.expectEqual(@as(u32, 2), client.peerMaxStreams());
+        try testing.expectEqual(@as(u32, 2), client.availableStreams());
+        try testing.expect(client.canOpenStream());
+
+        const s1 = try client.tryOpenStream(.{ .path = "/1" }, true);
+        defer s1.close();
+        try testing.expectEqual(@as(u32, 1), client.activeStreams());
+        try testing.expectEqual(@as(u32, 1), client.availableStreams());
+
+        const s2 = try client.tryOpenStream(.{ .path = "/2" }, true);
+        defer s2.close();
+        try testing.expectEqual(@as(u32, 0), client.availableStreams());
+        try testing.expect(!client.canOpenStream());
+
+        // 3rd stream fails immediately with `error.ConcurrencyLimitReached` instead of blocking!
+        try testing.expectError(error.ConcurrencyLimitReached, client.tryOpenStream(.{ .path = "/3" }, true));
+
+        // Illegal RFC 8441 §3 downgrade `SETTINGS_ENABLE_CONNECT_PROTOCOL = 0` -> PROTOCOL_ERROR.
+        var bad_st: [6]u8 = undefined;
+        p2.putSetting(&bad_st, p2.set_enable_connect_protocol, 0);
+        try ctWrite(&asw.interface, .settings, 0, 0, &bad_st);
+        while (true) {
+            var f = try ctRead(testing.allocator, &asr.interface);
+            defer f.deinit(testing.allocator);
+            if (f.hdr.ftype == .goaway) {
+                const code = std.mem.readInt(u32, f.payload[4..8], .big);
+                try testing.expectEqual(@backingInt(p2.ErrorCode.protocol_error), code);
+                break;
+            }
+        }
+        try testing.expectEqual(@as(u32, 0), client.availableStreams());
+    }
+
+    // 3. [P3] Illegal RFC 9218 §5.1 downgrade `SETTINGS_NO_RFC7540_PRIORITIES = 0` after `1` -> PROTOCOL_ERROR.
+    {
+        const addr = try net.IpAddress.parse("127.0.0.1", 0);
+        var srv = try addr.listen(io, .{ .mode = .stream, .reuse_address = true });
+        defer srv.deinit(io);
+        const port = srv.socket.address.ip4.port;
+        const caddr = try net.IpAddress.parse("127.0.0.1", port);
+        const cstream = try caddr.connect(io, .{ .mode = .stream });
+        defer cstream.close(io);
+        var accepted = try srv.accept(io);
+        defer accepted.close(io);
+
+        var crbuf: [4096]u8 = undefined;
+        var cwbuf: [4096]u8 = undefined;
+        var csr = cstream.reader(io, &crbuf);
+        var csw = cstream.writer(io, &cwbuf);
+        var client: Client = undefined;
+        try client.init(io, testing.allocator, &csr.interface, &csw.interface);
+        defer client.deinit();
+
+        var arbuf: [4096]u8 = undefined;
+        var awbuf: [4096]u8 = undefined;
+        var asr = accepted.reader(io, &arbuf);
+        var asw = accepted.writer(io, &awbuf);
+
+        var pf: [p2.preface.len]u8 = undefined;
+        try asr.interface.readSliceAll(&pf);
+        var cs = try ctRead(testing.allocator, &asr.interface);
+        cs.deinit(testing.allocator);
+
+        var st_on: [6]u8 = undefined;
+        p2.putSetting(&st_on, p2.set_no_rfc7540_priorities, 1);
+        try ctWrite(&asw.interface, .settings, 0, 0, &st_on);
+        try ctWrite(&asw.interface, .settings, p2.flag_ack, 0, "");
+        while (true) {
+            var f = try ctRead(testing.allocator, &asr.interface);
+            const ack = f.hdr.ftype == .settings and (f.hdr.flags & p2.flag_ack != 0);
+            f.deinit(testing.allocator);
+            if (ack) break;
+        }
+        try testing.expect(client.peerDisablesRfc7540Priorities());
+
+        var st_off: [6]u8 = undefined;
+        p2.putSetting(&st_off, p2.set_no_rfc7540_priorities, 0);
+        try ctWrite(&asw.interface, .settings, 0, 0, &st_off);
+        while (true) {
+            var f = try ctRead(testing.allocator, &asr.interface);
+            defer f.deinit(testing.allocator);
+            if (f.hdr.ftype == .goaway) {
+                const code = std.mem.readInt(u32, f.payload[4..8], .big);
+                try testing.expectEqual(@backingInt(p2.ErrorCode.protocol_error), code);
+                break;
+            }
+        }
+    }
 }

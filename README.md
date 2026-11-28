@@ -5,11 +5,11 @@ A dependency-free, transport-agnostic HTTP/2 (RFC 9113) and HPACK (RFC 7541) ser
 ## Features
 
 - **Transport-agnostic**: Runs over any `*std.Io.Reader` / `*std.Io.Writer` pair (TLS-wrapped sockets, TCP, Unix sockets, in-memory pipes).
-- **Server & Client**: Full multiplexed HTTP/2 framing, stream & connection flow control with `O(1)` per-stream wakeup conditions, bounded 64 KiB multi-frame write batching + vectored writes, lock-free client op tracking, trailers, zero-allocation streaming request/response bodies (`ctx.body_reader`, `stream.readBody` / `stream.bodyReader()`), and bidirectional streaming (gRPC & CDN origin-ready).
-- **HPACK (RFC 7541)**: Separate decoder/encoder direction split with connection-stateful outbound dynamic-table compression (`max_encoder_table_size = 4096` cap, CDN-aware selective indexing), zero-allocation contiguous circular dynamic byte pool, zero-copy `.rodata` static-table borrowing, Huffman shorter-of-two encoding, Never-Indexed marking for sensitive headers (`authorization`, `cookie`, `set-cookie`, `proxy-authorization`), and decompression-bomb limits (`SETTINGS_MAX_HEADER_LIST_SIZE`).
+- **Server & Client**: Full multiplexed HTTP/2 framing, stream & connection flow control with `O(1)` per-stream wakeup conditions, bounded 64 KiB multi-frame write batching + vectored writes, lock-free client op tracking & non-blocking origin-pool admission (`tryOpenStream*`, `availableStreams`, `canOpenStream`), bidirectional request/response trailers (`ctx.trailers()`, `stream.sendTrailers`), `103 Early Hints` / `1xx` informational responses (`res.sendEarlyHints`), RFC 8441 Extended `CONNECT` (`:protocol` WebSocket over HTTP/2), RFC 9218 Extensible Priorities (`Priority` header, `PRIORITY_UPDATE` frame, 8-bucket `O(1)` scheduler), and zero-allocation streaming request/response bodies (`ctx.body_reader`, `stream.readBody` / `stream.bodyReader()`).
+- **HPACK (RFC 7541)**: Separate decoder/encoder direction split with connection-stateful outbound dynamic-table compression (`max_encoder_table_size = 4096` cap, CDN-aware selective indexing), zero-allocation contiguous circular dynamic byte pool, zero-copy `.rodata` static-table borrowing, Huffman shorter-of-two encoding, Never-Indexed marking for sensitive headers (`authorization`, `cookie`, `set-cookie`, `proxy-authorization`), and configurable decompression-bomb limits (`max_header_list_size` / `SETTINGS_MAX_HEADER_LIST_SIZE`).
 - **Hardened & RFC 9113 compliant**:
   - Strict header/pseudo-header/content-length validation and `cookie` joining.
-  - Protections against Rapid Reset (CVE-2023-44487), CONTINUATION floods (CVE-2024-27316), control-frame / empty-DATA floods (CVE-2019-9512 / 9515 / 9518), and 1-byte `WINDOW_UPDATE` silly-window amplification.
+  - Shared 11-slot sliding-window anti-flood protection on **both Server and Client** against Rapid Reset (CVE-2023-44487) & `REFUSED_STREAM` overload floods (`max_stream_resets_per_window`), CONTINUATION floods (CVE-2024-27316), control-frame / empty-DATA floods (CVE-2019-9512 / 9515 / 9518), and 1-byte `WINDOW_UPDATE` silly-window amplification.
   - Non-blocking high-priority control-frame piggybacking (`PING`/`SETTINGS` ACKs, `WINDOW_UPDATE`, `RST_STREAM`) and configurable outbound `write_timeout_ms` (anti-slow-read / TCP zero-window DoS).
   - Bounded circular request & response body buffers (`O(initial_window_size)`).
   - Per-RPC deadlines (`ctx.setDeadline` / `ctx.setDeadlineIn`), O(1) leader-elected graceful shutdown (`Server.requestStop()` + `drain_timeout_ms`), and `std.Io` task-driven client reader with keepalive PINGs.
@@ -51,6 +51,12 @@ var srv: h2.Server = .{
     .io = io,
     .gpa = gpa,
     .handler = handler,
+    .config = .{
+        .max_frame_size = 64 * 1024,
+        .max_header_list_size = 64 * 1024,
+        .enable_connect_protocol = true, // RFC 8441 WebSocket over H2
+        .enable_extensible_priorities = true, // RFC 9218 u=0..7, i scheduler
+    },
 };
 
 // Call per accepted connection (e.g. after TLS ALPN negotiates "h2"):
@@ -77,10 +83,13 @@ try client.initWithConfig(io, gpa, &reader, &writer, .{
 });
 defer client.deinit();
 
-const stream = try client.openStreamWithBody(.{
+// Use `tryOpenStreamWithBody` in multi-connection origin pools for non-blocking
+// spillover (`error.ConcurrencyLimitReached` when `canOpenStream()` is false):
+const stream = try client.tryOpenStreamWithBody(.{
     .method = "POST",
     .path = "/echo",
     .authority = "example.com",
+    .priority = .{ .urgency = 1, .incremental = true },
 }, "hello over h2", true);
 defer stream.close();
 

@@ -7,8 +7,10 @@
 //! concern. Trailers are supported for gRPC (`grpc-status`/`grpc-message`).
 
 const std = @import("std");
+const proto = @import("proto.zig");
 
 pub const Header = struct { name: []const u8, value: []const u8 };
+pub const StreamPriority = proto.StreamPriority;
 
 pub const Request = struct {
     method: []const u8,
@@ -19,9 +21,23 @@ pub const Request = struct {
     headers: []const Header,
     content_length: ?u64,
     keep_alive: bool,
+    /// RFC 8441 Extended `CONNECT` `:protocol` pseudo-header (e.g. `"websocket"`),
+    /// or `null` for standard HTTP requests.
+    protocol: ?[]const u8 = null,
+    /// RFC 9218 Extensible Priority parameters parsed from the `priority` header.
+    priority: StreamPriority = .{},
+    /// Validated request trailers populated once the request body reaches EOF.
+    trailers: []const Header = &.{},
 
     pub fn get(self: *const Request, name: []const u8) ?[]const u8 {
         for (self.headers) |h| {
+            if (std.ascii.eqlIgnoreCase(h.name, name)) return h.value;
+        }
+        return null;
+    }
+
+    pub fn getTrailer(self: *const Request, name: []const u8) ?[]const u8 {
+        for (self.trailers) |h| {
             if (std.ascii.eqlIgnoreCase(h.name, name)) return h.value;
         }
         return null;
@@ -53,6 +69,9 @@ pub const Sink = struct {
         /// (may be empty), and END_STREAM together in as few flushes as possible.
         /// Falls back to `sendHead` + `writeBody` + `finish` when null.
         sendComplete: ?*const fn (ctx: *anyopaque, res: *Response, body: []const u8) anyerror!void = null,
+        /// Optional `1xx` informational HEADERS emission (e.g. `103 Early Hints`,
+        /// `100 Continue`) before the final response head is sent.
+        sendInformational: ?*const fn (ctx: *anyopaque, status_code: u16, headers: []const Header) anyerror!void = null,
     };
 };
 
@@ -106,6 +125,45 @@ pub const Response = struct {
         if (self.head_sent) return;
         try self.sink.vtable.sendHead(self.sink.ctx, self);
         self.head_sent = true;
+    }
+
+    /// Explicitly flushes the final response HEADERS (without `END_STREAM`)
+    /// before any body bytes are written — e.g. to complete an RFC 8441 Extended
+    /// `CONNECT` (`200`) handshake before waiting on full-duplex client frames.
+    pub fn flushHead(self: *Response) !void {
+        if (self.finished) return error.ResponseFinished;
+        try self.ensureHead();
+    }
+
+    /// Emits an HTTP `1xx` informational response block (`100..199`, excluding
+    /// `101` which RFC 9113 §8.3.2 forbids in HTTP/2) immediately without
+    /// marking the final response head as sent.
+    pub fn sendInformational(self: *Response, status_code: u16, headers: []const Header) !void {
+        if (self.head_sent or self.finished) return error.HeadAlreadySent;
+        if (status_code < 100 or status_code > 199 or status_code == 101) {
+            return error.InvalidInformationalStatus;
+        }
+        for (headers) |h| {
+            if (h.name.len == 0 or h.name[0] == ':') return error.InvalidInformationalHeader;
+            for (h.name) |ch| {
+                if (!proto.isTokenChar(ch)) return error.InvalidInformationalHeader;
+            }
+            if (!proto.isValidFieldValue(h.value)) return error.InvalidInformationalHeader;
+            if (proto.isConnectionSpecificHeader(h.name) or
+                std.ascii.eqlIgnoreCase(h.name, "te") or
+                std.ascii.eqlIgnoreCase(h.name, "content-length"))
+            {
+                return error.InvalidInformationalHeader;
+            }
+        }
+        if (self.sink.vtable.sendInformational) |send_info| {
+            try send_info(self.sink.ctx, status_code, headers);
+        }
+    }
+
+    /// Convenience helper for RFC 8297 `103 Early Hints` (e.g. `Link: <...>; rel=preload`).
+    pub fn sendEarlyHints(self: *Response, headers: []const Header) !void {
+        return self.sendInformational(103, headers);
     }
 
     /// Writes a body chunk, streaming it to the client immediately.
@@ -199,6 +257,11 @@ pub const Context = struct {
     set_deadline_ctx: ?*anyopaque = null,
     set_deadline_fn: ?*const fn (ctx: *anyopaque, deadline: std.Io.Timestamp) void = null,
 
+    /// Optional driver callback returning received request trailers once
+    /// `END_STREAM` has been observed on the request body.
+    trailers_ctx: ?*anyopaque = null,
+    trailers_fn: ?*const fn (ctx: *anyopaque) []const Header = null,
+
     /// Arms a per-RPC deadline at an absolute timestamp. No-op if unsupported.
     pub fn setDeadline(self: *Context, deadline: std.Io.Timestamp) void {
         if (self.set_deadline_fn) |f| f(self.set_deadline_ctx.?, deadline);
@@ -209,6 +272,13 @@ pub const Context = struct {
     pub fn setDeadlineIn(self: *Context, ns: u64) void {
         const now = std.Io.Timestamp.now(self.io, .awake);
         self.setDeadline(.{ .nanoseconds = now.nanoseconds + @as(i96, ns) });
+    }
+
+    /// Returns validated request trailers received on this stream (empty until
+    /// the peer closes its send half with trailing `HEADERS(END_STREAM)`).
+    pub fn trailers(self: *const Context) []const Header {
+        if (self.trailers_fn) |f| return f(self.trailers_ctx.?);
+        return self.req.trailers;
     }
 };
 
@@ -284,4 +354,56 @@ test "Response.write and Response.send reject writes after finish()" {
     try std.testing.expectEqual(@as(usize, 1), ds.heads);
     try std.testing.expectEqual(@as(usize, 1), ds.writes);
     try std.testing.expectEqual(@as(usize, 1), ds.finishes);
+}
+
+test "Response.sendInformational and sendEarlyHints enforce RFC 9113 / RFC 9110 rules" {
+    const InfoSink = struct {
+        infos: usize = 0,
+        last_code: u16 = 0,
+        heads: usize = 0,
+        fn sendInfo(ctx: *anyopaque, code: u16, _: []const Header) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.infos += 1;
+            self.last_code = code;
+        }
+        fn sendHead(ctx: *anyopaque, _: *Response) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.heads += 1;
+        }
+        fn writeBody(_: *anyopaque, _: *Response, _: []const u8) anyerror!void {}
+        fn finish(_: *anyopaque, _: *Response) anyerror!void {}
+    };
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var is: InfoSink = .{};
+    const vtable: Sink.Vtable = .{
+        .sendHead = InfoSink.sendHead,
+        .writeBody = InfoSink.writeBody,
+        .finish = InfoSink.finish,
+        .sendInformational = InfoSink.sendInfo,
+    };
+    var res: Response = .{
+        .arena = arena_state.allocator(),
+        .sink = .{ .ctx = &is, .vtable = &vtable },
+    };
+    // Invalid codes (101, 99, 200) rejected.
+    try std.testing.expectError(error.InvalidInformationalStatus, res.sendInformational(101, &.{}));
+    try std.testing.expectError(error.InvalidInformationalStatus, res.sendInformational(99, &.{}));
+    try std.testing.expectError(error.InvalidInformationalStatus, res.sendInformational(200, &.{}));
+    // Forbidden headers (pseudo, content-length, connection, te) rejected.
+    try std.testing.expectError(error.InvalidInformationalHeader, res.sendEarlyHints(&.{.{ .name = ":status", .value = "103" }}));
+    try std.testing.expectError(error.InvalidInformationalHeader, res.sendEarlyHints(&.{.{ .name = "content-length", .value = "0" }}));
+    try std.testing.expectError(error.InvalidInformationalHeader, res.sendEarlyHints(&.{.{ .name = "connection", .value = "close" }}));
+
+    // Valid 103 + 100 leave head_sent false; flushHead sends final head and blocks further 1xx.
+    try res.sendEarlyHints(&.{.{ .name = "link", .value = "</app.css>; rel=preload; as=style" }});
+    try res.sendInformational(100, &.{});
+    try std.testing.expectEqual(@as(usize, 2), is.infos);
+    try std.testing.expectEqual(@as(u16, 100), is.last_code);
+    try std.testing.expect(!res.head_sent);
+
+    try res.flushHead();
+    try std.testing.expect(res.head_sent);
+    try std.testing.expectEqual(@as(usize, 1), is.heads);
+    try std.testing.expectError(error.HeadAlreadySent, res.sendEarlyHints(&.{}));
 }

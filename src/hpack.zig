@@ -405,9 +405,24 @@ pub const EncoderContext = struct {
         authority: []const u8,
         headers: []const Header,
     ) Error!void {
+        return self.encodeRequestEx(gpa, out, method, scheme, path, authority, null, headers);
+    }
+
+    pub fn encodeRequestEx(
+        self: *EncoderContext,
+        gpa: std.mem.Allocator,
+        out: *std.ArrayList(u8),
+        method: []const u8,
+        scheme: []const u8,
+        path: []const u8,
+        authority: []const u8,
+        protocol: ?[]const u8,
+        headers: []const Header,
+    ) Error!void {
         try self.flushPendingTableSizeUpdates(gpa, out);
 
         try self.emitFieldLower(gpa, out, ":method", method);
+        if (protocol) |proto_val| try self.emitFieldLower(gpa, out, ":protocol", proto_val);
         try self.emitFieldLower(gpa, out, ":scheme", scheme);
         try self.emitFieldLower(gpa, out, ":path", path);
         if (authority.len > 0) try self.emitFieldLower(gpa, out, ":authority", authority);
@@ -544,7 +559,21 @@ pub const Encoder = struct {
         authority: []const u8,
         headers: []const Header,
     ) Error!void {
+        return encodeRequestEx(arena, out, method, scheme, path, authority, null, headers);
+    }
+
+    pub fn encodeRequestEx(
+        arena: std.mem.Allocator,
+        out: *std.ArrayList(u8),
+        method: []const u8,
+        scheme: []const u8,
+        path: []const u8,
+        authority: []const u8,
+        protocol: ?[]const u8,
+        headers: []const Header,
+    ) Error!void {
         try emitPseudo(arena, out, ":method", method);
+        if (protocol) |proto_val| try emitPseudo(arena, out, ":protocol", proto_val);
         try emitPseudo(arena, out, ":scheme", scheme);
         try emitPseudo(arena, out, ":path", path);
         if (authority.len > 0) try emitPseudo(arena, out, ":authority", authority);
