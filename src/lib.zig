@@ -38,6 +38,7 @@ const client_mod = @import("client.zig");
 
 // Top-level convenience re-exports.
 pub const Header = types.Header;
+pub const StreamPriority = types.StreamPriority;
 pub const Request = types.Request;
 pub const Response = types.Response;
 pub const Sink = types.Sink;
@@ -468,4 +469,229 @@ test "CDN phase 2 end-to-end: stateful HPACK compression, static zero-copy, and 
     for (&workers, 0..) |*w, idx| threads[idx] = try std.Thread.spawn(.{}, Worker.run, .{w});
     for (&threads) |t| t.join();
     for (&workers) |w| try testing.expect(w.ok);
+}
+
+test "Phase 3 end-to-end: 103 Early Hints, bidirectional Trailers, Extended CONNECT WebSocket, and PRIORITY_UPDATE" {
+    const std = @import("std");
+    const testing = std.testing;
+
+    const EdgeHandler = struct {
+        fn serve(srv: *Server, fd: std.posix.fd_t) void {
+            defer _ = std.c.close(fd);
+            const s: std.Io.net.Stream = .{ .socket = .{
+                .handle = fd,
+                .address = std.Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable,
+            } };
+            var rbuf: [16384]u8 = undefined;
+            var wbuf: [16384]u8 = undefined;
+            var sr = s.reader(srv.io, &rbuf);
+            var sw = s.writer(srv.io, &wbuf);
+            serveConn(srv, &sr.interface, &sw.interface, "198.51.100.7", "https");
+        }
+
+        fn handle(ctx: *Context) anyerror!void {
+            // 1. RFC 8441 Extended CONNECT full-duplex WebSocket tunnel.
+            if (ctx.req.protocol) |proto_name| {
+                try testing.expectEqualStrings("CONNECT", ctx.req.method);
+                try testing.expectEqualStrings("websocket", proto_name);
+                ctx.res.status(200);
+                try ctx.res.header("sec-websocket-protocol", "chat.v1");
+                try ctx.res.flushHead();
+
+                const br = ctx.body_reader.?;
+                var frame_buf: [64]u8 = undefined;
+                while (true) {
+                    const n = try br.read(&frame_buf);
+                    if (n == 0) break;
+                    try ctx.res.write("ws-echo:");
+                    try ctx.res.write(frame_buf[0..n]);
+                }
+                return;
+            }
+
+            // 2. 103 Early Hints -> 200 OK response.
+            if (std.mem.eql(u8, ctx.req.path(), "/early-hints")) {
+                try ctx.res.sendEarlyHints(&.{
+                    .{ .name = "link", .value = "</critical.css>; rel=preload; as=style" },
+                    .{ .name = "link", .value = "</app.js>; rel=preload; as=script" },
+                });
+                try ctx.res.send(200, "text/html", "<html>ok</html>");
+                return;
+            }
+
+            // 3. Bidirectional request & response trailers + RFC 9218 Priority inspection.
+            if (std.mem.eql(u8, ctx.req.path(), "/upload-trailers")) {
+                var body_bytes: std.ArrayList(u8) = .empty;
+                if (ctx.body_reader) |br| {
+                    var tmp: [256]u8 = undefined;
+                    while (true) {
+                        const n = try br.read(&tmp);
+                        if (n == 0) break;
+                        try body_bytes.appendSlice(ctx.arena, tmp[0..n]);
+                    }
+                }
+                const req_sum = ctx.req.getTrailer("x-sha256") orelse "none";
+                const ctx_tr = ctx.trailers();
+                try testing.expectEqual(@as(usize, 2), ctx_tr.len);
+                ctx.res.status(200);
+                try ctx.res.header("x-seen-urgency", if (ctx.req.priority.urgency == 1 and ctx.req.priority.incremental) "1-inc" else "other");
+                try ctx.res.write(body_bytes.items);
+                try ctx.res.trailer("x-verified-sha256", req_sum);
+                try ctx.res.trailer("grpc-status", "0");
+                try ctx.res.finish();
+                return;
+            }
+
+            try ctx.res.send(404, "text/plain", "not found");
+        }
+    };
+
+    var fds: [2]c_int = undefined;
+    if (std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds) != 0) return error.SocketPairFailed;
+    errdefer _ = std.c.close(fds[1]);
+
+    var srv: Server = .{
+        .io = testing.io,
+        .gpa = testing.allocator,
+        .handler = EdgeHandler.handle,
+        .config = .{
+            .enable_connect_protocol = true,
+            .enable_extensible_priorities = true,
+            .max_header_list_size = 32 * 1024,
+        },
+    };
+    const th = try std.Thread.spawn(.{}, EdgeHandler.serve, .{ &srv, fds[0] });
+    defer th.join();
+    defer _ = std.c.close(fds[1]);
+
+    const peer: std.Io.net.Stream = .{ .socket = .{
+        .handle = fds[1],
+        .address = std.Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable,
+    } };
+    var rbuf: [16384]u8 = undefined;
+    var wbuf: [16384]u8 = undefined;
+    var sr = peer.reader(testing.io, &rbuf);
+    var sw = peer.writer(testing.io, &wbuf);
+
+    var client: Client = undefined;
+    try client.initWithConfig(testing.io, testing.allocator, &sr.interface, &sw.interface, .{
+        .max_header_list_size = 32 * 1024,
+    });
+    defer client.deinit();
+
+    // Wait briefly until client processes server's initial SETTINGS (enabling Extended CONNECT).
+    while (!client.peerSupportsExtendedConnect()) {
+        std.Io.sleep(testing.io, .{ .nanoseconds = 1 * std.time.ns_per_ms }, .awake) catch {};
+    }
+    try testing.expect(client.peerDisablesRfc7540Priorities());
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Case A: 103 Early Hints followed by 200 OK.
+    {
+        const s = try client.tryOpenStream(.{
+            .method = "GET",
+            .path = "/early-hints",
+            .authority = "edge.example.com",
+        }, true);
+        defer s.close();
+
+        const ev103 = try s.readEvent(arena);
+        try testing.expect(ev103 == .headers and !ev103.headers.end_stream);
+        try testing.expectEqualStrings("103", ev103.headers.headers[0].value);
+
+        const ev200 = try s.readEvent(arena);
+        try testing.expect(ev200 == .headers and !ev200.headers.end_stream);
+        try testing.expectEqualStrings("200", ev200.headers.headers[0].value);
+
+        var html_buf: [64]u8 = undefined;
+        const n = try s.readBody(&html_buf);
+        try testing.expectEqualStrings("<html>ok</html>", html_buf[0..n]);
+        try testing.expectEqual(@as(usize, 0), try s.readBody(&html_buf));
+    }
+
+    // Case B: Bidirectional request + response trailers + RFC 9218 Priority + setPriority.
+    {
+        const s = try client.tryOpenStream(.{
+            .method = "POST",
+            .path = "/upload-trailers",
+            .authority = "edge.example.com",
+            .priority = .{ .urgency = 1, .incremental = true },
+            .headers = &.{.{ .name = "te", .value = "trailers" }},
+        }, false);
+        defer s.close();
+
+        try s.setPriority(.{ .urgency = 0, .incremental = false });
+        try s.send("chunk-1+", false);
+        try s.send("chunk-2", false);
+        try s.sendTrailers(&.{
+            .{ .name = "x-sha256", .value = "deadbeef" },
+            .{ .name = "content-type", .value = "application/octet-stream" }, // static-table name!
+        });
+
+        const ev_hdr = try s.readEvent(arena);
+        try testing.expect(ev_hdr == .headers and !ev_hdr.headers.end_stream);
+        var saw_urgency = false;
+        for (ev_hdr.headers.headers) |h| {
+            if (std.mem.eql(u8, h.name, "x-seen-urgency") and std.mem.eql(u8, h.value, "1-inc")) saw_urgency = true;
+        }
+        try testing.expect(saw_urgency);
+
+        var body_out: [64]u8 = undefined;
+        var total_n: usize = 0;
+        while (true) {
+            const n = try s.readBody(body_out[total_n..]);
+            if (n == 0) break;
+            total_n += n;
+        }
+        try testing.expectEqualStrings("chunk-1+chunk-2", body_out[0..total_n]);
+
+        const ev_tr = try s.readEvent(arena);
+        try testing.expect(ev_tr == .headers and ev_tr.headers.end_stream);
+        var verified = false;
+        for (ev_tr.headers.headers) |h| {
+            if (std.mem.eql(u8, h.name, "x-verified-sha256") and std.mem.eql(u8, h.value, "deadbeef")) verified = true;
+        }
+        try testing.expect(verified);
+    }
+
+    // Case C: RFC 8441 Extended CONNECT (`:protocol = websocket`) full-duplex ping-pong!
+    {
+        const ws = try client.tryOpenStream(.{
+            .method = "CONNECT",
+            .protocol = "websocket",
+            .scheme = "https",
+            .path = "/realtime",
+            .authority = "edge.example.com",
+            .headers = &.{.{ .name = "sec-websocket-protocol", .value = "chat.v1" }},
+        }, false);
+        defer ws.close();
+
+        // Server flushes 200 HEADERS immediately before client sends any DATA!
+        const ev_ws = try ws.readEvent(arena);
+        try testing.expect(ev_ws == .headers and !ev_ws.headers.end_stream);
+        try testing.expectEqualStrings("200", ev_ws.headers.headers[0].value);
+
+        var rx: [64]u8 = undefined;
+        try ws.send("hello-ws", false);
+        const want1 = "ws-echo:hello-ws";
+        var n1: usize = 0;
+        while (n1 < want1.len) {
+            const got = try ws.readBody(rx[n1..]);
+            if (got == 0) break;
+            n1 += got;
+        }
+        try testing.expectEqualStrings(want1, rx[0..n1]);
+
+        try ws.send("bye-ws", true);
+        var n2: usize = 0;
+        while (true) {
+            const got = try ws.readBody(rx[n2..]);
+            if (got == 0) break;
+            n2 += got;
+        }
+        try testing.expectEqualStrings("ws-echo:bye-ws", rx[0..n2]);
+    }
 }
