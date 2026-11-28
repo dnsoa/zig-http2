@@ -550,24 +550,22 @@ fn skipSfMemberValue(s: []const u8, pos: *usize) bool {
 }
 
 /// Parses an RFC 9218 §4 `Priority` Structured Fields Dictionary value (or
-/// `PRIORITY_UPDATE` payload string). Out-of-range `u` values or unknown
-/// dictionary keys/parameters are ignored; top-level SF syntax errors fall
-/// back to `StreamPriority.default` (`u=3, i=false`) per RFC 9218 §4.2.
-pub fn parsePriorityField(s: []const u8) StreamPriority {
-    return parsePriorityFieldIncremental(.{}, s);
+/// `PRIORITY_UPDATE` payload string), returning `null` if `s` violates
+/// Structured Fields dictionary syntax so callers like `PRIORITY_UPDATE`
+/// (RFC 9218 §7.1) can ignore malformed frames without clobbering prior state.
+pub fn tryParsePriorityField(s: []const u8) ?StreamPriority {
+    return tryParsePriorityFieldIncremental(.{}, s);
 }
 
-/// Applies an additional `Priority` header line onto `base` (RFC 9110 §5.3
-/// combined dictionary members). Returns `StreamPriority.default` if `s` has
-/// invalid Structured Fields dictionary syntax.
-pub fn parsePriorityFieldIncremental(base: StreamPriority, s: []const u8) StreamPriority {
+/// Like `tryParsePriorityField`, folding onto `base`; returns `null` on SF syntax error.
+pub fn tryParsePriorityFieldIncremental(base: StreamPriority, s: []const u8) ?StreamPriority {
     var res = base;
     var pos: usize = 0;
     skipOws(s, &pos);
     if (pos == s.len) return res;
 
     while (pos < s.len) {
-        if (!isSfKeyStart(s[pos])) return .default;
+        if (!isSfKeyStart(s[pos])) return null;
         const key_start = pos;
         pos += 1;
         while (pos < s.len and isSfKeyChar(s[pos])) : (pos += 1) {}
@@ -576,7 +574,7 @@ pub fn parsePriorityFieldIncremental(base: StreamPriority, s: []const u8) Stream
         if (pos < s.len and s[pos] == '=') {
             pos += 1;
             const val_start = pos;
-            if (!skipSfMemberValue(s, &pos)) return .default;
+            if (!skipSfMemberValue(s, &pos)) return null;
             if (std.mem.eql(u8, key, "u")) {
                 // Parse strict SF integer (`-?1*15DIGIT`, not decimal) before any `;` parameter.
                 const raw_item_end = std.mem.indexOfScalarPos(u8, s[0..pos], val_start, ';') orelse pos;
@@ -604,7 +602,7 @@ pub fn parsePriorityFieldIncremental(base: StreamPriority, s: []const u8) Stream
                 }
             }
         } else {
-            if (!skipSfParams(s, &pos)) return .default;
+            if (!skipSfParams(s, &pos)) return null;
             if (std.mem.eql(u8, key, "i")) {
                 res.incremental = true;
             }
@@ -612,12 +610,24 @@ pub fn parsePriorityFieldIncremental(base: StreamPriority, s: []const u8) Stream
 
         skipOws(s, &pos);
         if (pos == s.len) break;
-        if (s[pos] != ',') return .default;
+        if (s[pos] != ',') return null;
         pos += 1;
         skipOws(s, &pos);
-        if (pos == s.len) return .default; // trailing comma is invalid in SF
+        if (pos == s.len) return null; // trailing comma is invalid in SF
     }
     return res;
+}
+
+/// Parses an RFC 9218 §4 `Priority` header value; top-level SF syntax errors
+/// fall back to `StreamPriority.default` (`u=3, i=false`) per RFC 9218 §4.2.
+pub fn parsePriorityField(s: []const u8) StreamPriority {
+    return tryParsePriorityField(s) orelse .default;
+}
+
+/// Applies an additional `Priority` header line onto `base` (RFC 9110 §5.3).
+/// Falls back to `StreamPriority.default` if `s` has invalid SF syntax.
+pub fn parsePriorityFieldIncremental(base: StreamPriority, s: []const u8) StreamPriority {
+    return tryParsePriorityFieldIncremental(base, s) orelse .default;
 }
 
 /// Formats `StreamPriority` as a canonical RFC 9218 `Priority` field value.
@@ -696,7 +706,12 @@ test "RFC 9218 Priority parser, formatter, PRIORITY_UPDATE validator, and Slidin
     try testing.expectEqual(StreamPriority{ .urgency = 3, .incremental = true }, parsePriorityField("u=2.5, i"));
     // Quoted commas in unknown keys do not confuse member splitting.
     try testing.expectEqual(StreamPriority{ .urgency = 5, .incremental = false }, parsePriorityField("ext=\"a, u=0, i\", u=5"));
-    // Malformed top-level SF syntax falls back to default (u=3, i=false).
+    // Malformed top-level SF syntax falls back to default in `parsePriorityField`,
+    // while `tryParsePriorityField` returns `null` so `PRIORITY_UPDATE` can ignore it.
+    try testing.expectEqual(@as(?StreamPriority, null), tryParsePriorityField("u=0, \"unclosed"));
+    try testing.expectEqual(@as(?StreamPriority, null), tryParsePriorityField("u=0, "));
+    try testing.expectEqual(@as(?StreamPriority, StreamPriority.default), tryParsePriorityField(""));
+    try testing.expectEqual(@as(?StreamPriority, StreamPriority.default), tryParsePriorityField("u=3"));
     try testing.expectEqual(StreamPriority.default, parsePriorityField("u=0, \"unclosed"));
     try testing.expectEqual(StreamPriority.default, parsePriorityField("u=0, "));
 

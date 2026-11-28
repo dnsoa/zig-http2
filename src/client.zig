@@ -2373,7 +2373,8 @@ pub const Client = struct {
                     self.peer_enable_connect_protocol.store(val == 1, .release);
                 },
                 p2.set_no_rfc7540_priorities => {
-                    if (val > 1) {
+                    // RFC 9218 §5.1: must be 0 or 1, and MUST NOT transition from 1 back to 0.
+                    if (val > 1 or (val == 0 and self.peer_no_rfc7540_priorities.load(.acquire))) {
                         self.sendGoaway(.protocol_error);
                         return error.ProtocolError;
                     }
@@ -7544,5 +7545,61 @@ test "client FloodGuard cuts off hostile origin floods and tryOpenStream enables
             }
         }
         try testing.expectEqual(@as(u32, 0), client.availableStreams());
+    }
+
+    // 3. [P3] Illegal RFC 9218 §5.1 downgrade `SETTINGS_NO_RFC7540_PRIORITIES = 0` after `1` -> PROTOCOL_ERROR.
+    {
+        const addr = try net.IpAddress.parse("127.0.0.1", 0);
+        var srv = try addr.listen(io, .{ .mode = .stream, .reuse_address = true });
+        defer srv.deinit(io);
+        const port = srv.socket.address.ip4.port;
+        const caddr = try net.IpAddress.parse("127.0.0.1", port);
+        const cstream = try caddr.connect(io, .{ .mode = .stream });
+        defer cstream.close(io);
+        var accepted = try srv.accept(io);
+        defer accepted.close(io);
+
+        var crbuf: [4096]u8 = undefined;
+        var cwbuf: [4096]u8 = undefined;
+        var csr = cstream.reader(io, &crbuf);
+        var csw = cstream.writer(io, &cwbuf);
+        var client: Client = undefined;
+        try client.init(io, testing.allocator, &csr.interface, &csw.interface);
+        defer client.deinit();
+
+        var arbuf: [4096]u8 = undefined;
+        var awbuf: [4096]u8 = undefined;
+        var asr = accepted.reader(io, &arbuf);
+        var asw = accepted.writer(io, &awbuf);
+
+        var pf: [p2.preface.len]u8 = undefined;
+        try asr.interface.readSliceAll(&pf);
+        var cs = try ctRead(testing.allocator, &asr.interface);
+        cs.deinit(testing.allocator);
+
+        var st_on: [6]u8 = undefined;
+        p2.putSetting(&st_on, p2.set_no_rfc7540_priorities, 1);
+        try ctWrite(&asw.interface, .settings, 0, 0, &st_on);
+        try ctWrite(&asw.interface, .settings, p2.flag_ack, 0, "");
+        while (true) {
+            var f = try ctRead(testing.allocator, &asr.interface);
+            const ack = f.hdr.ftype == .settings and (f.hdr.flags & p2.flag_ack != 0);
+            f.deinit(testing.allocator);
+            if (ack) break;
+        }
+        try testing.expect(client.peerDisablesRfc7540Priorities());
+
+        var st_off: [6]u8 = undefined;
+        p2.putSetting(&st_off, p2.set_no_rfc7540_priorities, 0);
+        try ctWrite(&asw.interface, .settings, 0, 0, &st_off);
+        while (true) {
+            var f = try ctRead(testing.allocator, &asr.interface);
+            defer f.deinit(testing.allocator);
+            if (f.hdr.ftype == .goaway) {
+                const code = std.mem.readInt(u32, f.payload[4..8], .big);
+                try testing.expectEqual(@backingInt(p2.ErrorCode.protocol_error), code);
+                break;
+            }
+        }
     }
 }

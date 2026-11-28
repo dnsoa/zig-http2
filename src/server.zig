@@ -71,6 +71,10 @@ const Settings = struct {
     /// and read by worker threads sizing DATA/HEADERS frames, so it is atomic
     /// rather than a plain field shared across threads.
     max_frame_size: std.atomic.Value(u32) = .init(16384),
+    /// Sticky peer boolean SETTINGS flags (reader-thread-only): once set to `1`,
+    /// a subsequent transition back to `0` is a `PROTOCOL_ERROR` (RFC 8441 §3 / RFC 9218 §5.1).
+    enable_connect_protocol: bool = false,
+    no_rfc7540_priorities: bool = false,
 };
 
 /// Timeouts and limits for a server connection.
@@ -2090,12 +2094,28 @@ fn handleSettings(conn: *Connection, fh: ParsedHeader, payload: []const u8) bool
                 }
                 conn.peer.max_frame_size.store(val, .release);
             },
-            set_enable_push, set_enable_connect_protocol, set_no_rfc7540_priorities => {
-                // Boolean SETTINGS must be 0 or 1; any other value is PROTOCOL_ERROR.
+            set_enable_push => {
+                // RFC 9113 §6.5.2: SETTINGS_ENABLE_PUSH must be 0 or 1.
                 if (val > 1) {
                     sendGoaway(conn, .protocol_error);
                     return false;
                 }
+            },
+            set_enable_connect_protocol => {
+                // RFC 8441 §3: must be 0 or 1, and MUST NOT transition from 1 back to 0.
+                if (val > 1 or (val == 0 and conn.peer.enable_connect_protocol)) {
+                    sendGoaway(conn, .protocol_error);
+                    return false;
+                }
+                conn.peer.enable_connect_protocol = (val == 1);
+            },
+            set_no_rfc7540_priorities => {
+                // RFC 9218 §5.1: must be 0 or 1, and MUST NOT transition from 1 back to 0.
+                if (val > 1 or (val == 0 and conn.peer.no_rfc7540_priorities)) {
+                    sendGoaway(conn, .protocol_error);
+                    return false;
+                }
+                conn.peer.no_rfc7540_priorities = (val == 1);
             },
             else => {}, // max_concurrent_streams: we do not initiate streams
         }
@@ -2254,7 +2274,7 @@ fn handlePriorityUpdate(conn: *Connection, payload: []const u8) bool {
 
     const field_val = payload[4..];
     if (!proto2.isValidFieldValue(field_val)) return true; // RFC 9218 §7.1: ignore invalid field value
-    const new_prio = proto2.parsePriorityField(field_val);
+    const new_prio = proto2.tryParsePriorityField(field_val) orelse return true; // ignore malformed SF syntax
 
     conn.streams_mu.lockUncancelable(conn.io);
     if (conn.streams.get(prio_sid)) |st| {
@@ -2651,8 +2671,9 @@ fn handleHeaders(conn: *Connection, r: *Io.Reader, fh: ParsedHeader, first: []co
     if (fh.sid <= conn.highest_stream_id) {
         var was_early_closed = false;
         conn.streams_mu.lockUncancelable(conn.io);
-        for (conn.early_closed) |esid| {
-            if (esid == fh.sid) {
+        for (&conn.early_closed) |*slot| {
+            if (slot.* == fh.sid) {
+                slot.* = 0; // one-shot exemption for a single late trailer block; clear so floods on `sid` are counted
                 was_early_closed = true;
                 break;
             }
@@ -2670,9 +2691,17 @@ fn handleHeaders(conn: *Connection, r: *Io.Reader, fh: ParsedHeader, first: []co
     conn.highest_stream_id = fh.sid;
 
     // Graceful shutdown: stop accepting new streams once the server is stopping
-    // or the peer sent a graceful GOAWAY. Refuse this one while in-flight
-    // streams keep draining (without advancing last_stream_id).
-    if (conn.srv.stop.load(.acquire) or conn.draining) return refuseStream(conn, fh.sid, hdr_block, .refused_stream);
+    // or the peer sent a graceful GOAWAY. Still charge `recordReset` so a peer
+    // that triggered `draining` via `GOAWAY(NO_ERROR)` cannot flood unbounded
+    // `HEADERS` frames while an in-flight stream drains.
+    if (conn.srv.stop.load(.acquire) or conn.draining) {
+        const now_ns = Io.Timestamp.now(conn.io, .awake).nanoseconds;
+        if (conn.flood.recordReset(now_ns, conn.srv.config)) {
+            sendGoaway(conn, .enhance_your_calm);
+            return error.ProtocolError;
+        }
+        return refuseStream(conn, fh.sid, hdr_block, .refused_stream);
+    }
 
     // Concurrency cap: also rate-limit overloaded REFUSED_STREAM bursts so a
     // peer pinning `max_concurrent_streams` slots cannot flood `HEADERS` unboundedly.
@@ -8080,8 +8109,14 @@ test "server stateful HPACK EncoderContext compresses repeated headers and skips
     {
         const NoopSink = struct {
             writer: Io.Writer,
-            fn drain(_: *Io.Writer, data: []const []const u8, _: usize) Io.Writer.Error!usize {
-                return data[0].len;
+            fn drain(w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
+                w.end = 0;
+                var total: usize = 0;
+                if (data.len > 0) {
+                    for (data[0 .. data.len - 1]) |s| total += s.len;
+                    total += data[data.len - 1].len * splat;
+                }
+                return total;
             }
         };
         var ns: NoopSink = .{ .writer = .{ .buffer = &.{}, .vtable = &.{ .drain = NoopSink.drain } } };
@@ -8260,8 +8295,14 @@ test "server per-stream send_cond wakes target stream and RST unblocks conn-wind
     {
         const NoopSink = struct {
             writer: Io.Writer,
-            fn drain(_: *Io.Writer, data: []const []const u8, _: usize) Io.Writer.Error!usize {
-                return data[0].len;
+            fn drain(w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
+                w.end = 0;
+                var total: usize = 0;
+                if (data.len > 0) {
+                    for (data[0 .. data.len - 1]) |s| total += s.len;
+                    total += data[data.len - 1].len * splat;
+                }
+                return total;
             }
         };
         var ns: NoopSink = .{ .writer = .{ .buffer = &.{}, .vtable = &.{ .drain = NoopSink.drain } } };
@@ -8709,4 +8750,163 @@ test "server RFC 9218 extensible priority scheduler preempts low-urgency streams
     try testing.expect(order[3] != order[2] and (order[3] == 5 or order[3] == 7));
     try testing.expectEqual(@as(u31, 3), order[6]);
     try testing.expectEqual(@as(u31, 3), order[7]);
+}
+
+test "PR 51 review regressions: early_closed HEADERS one-shot, draining HEADERS flood, malformed PRIORITY_UPDATE, and NO_RFC7540_PRIORITIES downgrade" {
+    // 1. [P2] Repeated HEADERS on an `early_closed` stream: first late trailer is excused
+    // and clears the slot; subsequent HEADERS on the same `sid` count toward `recordReset`
+    // and trip `GOAWAY(ENHANCE_YOUR_CALM)`.
+    {
+        const fds = try newSocketPair();
+        errdefer _ = c.close(fds[1]);
+        var srv: Server = .{
+            .io = testing.io,
+            .gpa = testing.allocator,
+            .handler = earlyRespondHandler,
+            .config = .{
+                .max_stream_resets_per_window = 3,
+                .stream_reset_window_ms = 10_000,
+            },
+        };
+        const t = try std.Thread.spawn(.{}, serveRawH2OnFd, .{ &srv, fds[0] });
+        defer t.join();
+        defer _ = c.close(fds[1]);
+
+        var rbuf: [4096]u8 = undefined;
+        var wbuf: [4096]u8 = undefined;
+        var reader = peerStream(fds[1]).reader(testing.io, &rbuf);
+        var writer = peerStream(fds[1]).writer(testing.io, &wbuf);
+        try rawHandshake(&reader.interface, &writer.interface);
+
+        // Stream 1 opened without END_STREAM -> earlyRespondHandler finishes early -> `sid=1` enters `early_closed`.
+        try writeFrame(&writer.interface, .headers, flag_end_headers, 1, &trailers_req_block);
+        while (true) {
+            var f = try readFrameAlloc(testing.allocator, &reader.interface);
+            const es = f.header.sid == 1 and (f.header.flags & flag_end_stream != 0);
+            f.deinit(testing.allocator);
+            if (es) break;
+        }
+        Io.sleep(testing.io, .{ .nanoseconds = 15 * std.time.ns_per_ms }, .awake) catch {};
+
+        // Send 5 closed-stream HEADERS on `sid=1`: 1st is excused (clears slot), next 4 hit `recordReset` (> 3) -> GOAWAY!
+        const t_block = [_]u8{ 0x00, 3, 'x', '-', 't', 1, '1' };
+        for (0..5) |_| {
+            writeFrame(&writer.interface, .headers, flag_end_headers | flag_end_stream, 1, &t_block) catch break;
+        }
+        var ga = try readFrameOfType(testing.allocator, &reader.interface, .goaway);
+        defer ga.deinit(testing.allocator);
+        try testing.expectEqual(@backingInt(ErrorCode.enhance_your_calm), std.mem.readInt(u32, ga.payload[4..8], .big));
+    }
+
+    // 2. Peer-triggered `draining` (`GOAWAY(NO_ERROR)`) while a stream is open still bounds `HEADERS` floods.
+    {
+        const Hold = struct {
+            var entered = std.atomic.Value(bool).init(false);
+            fn handle(ctx: *types.Context) anyerror!void {
+                entered.store(true, .release);
+                var buf: [16]u8 = undefined;
+                if (ctx.body_reader) |br| _ = br.read(&buf) catch {};
+            }
+        };
+        Hold.entered.store(false, .release);
+
+        const fds = try newSocketPair();
+        errdefer _ = c.close(fds[1]);
+        var srv: Server = .{
+            .io = testing.io,
+            .gpa = testing.allocator,
+            .handler = Hold.handle,
+            .config = .{
+                .max_stream_resets_per_window = 3,
+                .stream_reset_window_ms = 10_000,
+            },
+        };
+        const t = try std.Thread.spawn(.{}, serveRawH2OnFd, .{ &srv, fds[0] });
+        defer t.join();
+        defer _ = c.close(fds[1]);
+
+        var rbuf: [4096]u8 = undefined;
+        var wbuf: [4096]u8 = undefined;
+        var reader = peerStream(fds[1]).reader(testing.io, &rbuf);
+        var writer = peerStream(fds[1]).writer(testing.io, &wbuf);
+        try rawHandshake(&reader.interface, &writer.interface);
+
+        try writeFrame(&writer.interface, .headers, flag_end_headers, 1, &trailers_req_block);
+        while (!Hold.entered.load(.acquire)) {
+            Io.sleep(testing.io, .{ .nanoseconds = 1 * std.time.ns_per_ms }, .awake) catch {};
+        }
+        const ga_ok: [8]u8 = @splat(0);
+        try writeFrame(&writer.interface, .goaway, 0, 0, &ga_ok);
+        var sid: u31 = 3;
+        for (0..4) |_| {
+            writeFrame(&writer.interface, .headers, flag_end_headers | flag_end_stream, sid, &trailers_req_block) catch break;
+            sid += 2;
+        }
+        var ga = try readFrameOfType(testing.allocator, &reader.interface, .goaway);
+        defer ga.deinit(testing.allocator);
+        try testing.expectEqual(@backingInt(ErrorCode.enhance_your_calm), std.mem.readInt(u32, ga.payload[4..8], .big));
+    }
+
+    // 3. [P3] Malformed `PRIORITY_UPDATE` is ignored without resetting active or idle stream urgency to 3,
+    // and `SETTINGS_NO_RFC7540_PRIORITIES` `1 -> 0` downgrade is rejected with `GOAWAY(PROTOCOL_ERROR)`.
+    {
+        const NoopSink = struct {
+            writer: Io.Writer,
+            fn drain(w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
+                w.end = 0;
+                var total: usize = 0;
+                if (data.len > 0) {
+                    for (data[0 .. data.len - 1]) |s| total += s.len;
+                    total += data[data.len - 1].len * splat;
+                }
+                return total;
+            }
+        };
+        var ns: NoopSink = .{ .writer = .{ .buffer = &.{}, .vtable = &.{ .drain = NoopSink.drain } } };
+        var w_srv: Server = .{ .io = testing.io, .gpa = testing.allocator, .handler = h2TestHandler };
+        var conn: Connection = .{
+            .srv = &w_srv,
+            .gpa = testing.allocator,
+            .io = testing.io,
+            .cw = .{ .io = testing.io, .w = &ns.writer, .gpa = testing.allocator },
+            .decoder = hpack.Decoder.init(testing.allocator, our_header_table_size),
+            .highest_stream_id = 1,
+        };
+        conn.cw.conn = &conn;
+        defer conn.deinit();
+
+        var st1: H2Stream = .{
+            .conn = &conn,
+            .id = 1,
+            .arena_state = std.heap.ArenaAllocator.init(testing.allocator),
+            .req = undefined,
+            .send_window = 16_384,
+            .priority = .{ .urgency = 0, .incremental = true },
+        };
+        defer st1.arena_state.deinit();
+        try conn.streams.put(testing.allocator, 1, &st1);
+        defer _ = conn.streams.remove(1);
+
+        // Malformed SF syntax ("u=0, " and "u=0, \"unclosed") on open sid=1 MUST keep `u=0, i=true`.
+        var bad_open: [9]u8 = undefined;
+        std.mem.writeInt(u32, bad_open[0..4], 1, .big);
+        @memcpy(bad_open[4..9], "u=0, ");
+        try testing.expect(handlePriorityUpdate(&conn, &bad_open));
+        try testing.expectEqual(StreamPriority{ .urgency = 0, .incremental = true }, st1.priority);
+
+        // Malformed SF syntax on idle sid=5 MUST NOT insert `.default` into `pending_priorities`.
+        var bad_idle: [9]u8 = undefined;
+        std.mem.writeInt(u32, bad_idle[0..4], 5, .big);
+        @memcpy(bad_idle[4..9], "u=0, ");
+        try testing.expect(handlePriorityUpdate(&conn, &bad_idle));
+        try testing.expectEqual(@as(?StreamPriority, null), conn.takePendingPriority(5));
+
+        // SETTINGS_NO_RFC7540_PRIORITIES: 1 -> 0 downgrade on Server is PROTOCOL_ERROR.
+        var set1: [6]u8 = undefined;
+        putSetting(&set1, set_no_rfc7540_priorities, 1);
+        try testing.expect(handleSettings(&conn, .{ .length = 6, .ftype = .settings, .flags = 0, .sid = 0 }, &set1));
+        var set0: [6]u8 = undefined;
+        putSetting(&set0, set_no_rfc7540_priorities, 0);
+        try testing.expect(!handleSettings(&conn, .{ .length = 6, .ftype = .settings, .flags = 0, .sid = 0 }, &set0));
+    }
 }
